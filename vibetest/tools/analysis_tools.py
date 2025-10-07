@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 from typing import Annotated
+
 from inspect_ai.tool import tool
 
 
@@ -28,8 +29,9 @@ def create_plot(
         Status message
     """
     try:
-        import matplotlib.pyplot as plt
         import json
+
+        import matplotlib.pyplot as plt
 
         plot_data = json.loads(data)
 

@@ -1,16 +1,15 @@
 """ReAct agent implementation using Inspect AI."""
 
 import os
-from pathlib import Path
-from typing import Optional, List
 
 from inspect_ai import Task, eval
+from inspect_ai.agent import react
 from inspect_ai.dataset import Sample
-from inspect_ai.agent import react, as_solver
-from inspect_ai.scorer import match, includes
+from inspect_ai.scorer import includes
 from inspect_ai.tool import Tool, bash_session, python, text_editor
 
 from vibetest.testcases.base import TestCase, TestResult
+
 # from vibetest.tools import (
 #     read_file,
 #     list_directory,
@@ -40,9 +39,9 @@ class VibeTestAgent:
 
     def __init__(
         self,
-        model: Optional[str] = None,
+        model: str | None = None,
         max_attempts: int = 20,
-        additional_tools: Optional[list[Tool]] = None,
+        additional_tools: list[Tool] | None = None,
     ):
         """Initialize the agent.
 
@@ -57,7 +56,7 @@ class VibeTestAgent:
         self.max_attempts = max_attempts
         self.tools = self._setup_tools(additional_tools)
 
-    def _setup_tools(self, additional_tools: Optional[list[Tool]] = None) -> list[Tool]:
+    def _setup_tools(self, additional_tools: list[Tool] | None = None) -> list[Tool]:
         """Setup tools available to the agent.
 
         Args:
@@ -105,7 +104,7 @@ class VibeTestAgent:
 Your approach should be:
 1. Understand what needs to be tested
 2. Systematically explore the codebase
-3. Execute necessary code to gather evidence (you must install necessary dependencies and data)
+3. Execute necessary code to gather evidence (you must install necessary dependencies and data if they are missing)
 4. Analyze results objectively
 5. Provide a clear binary verdict (PASS or FAIL) with supporting evidence
 
@@ -114,7 +113,7 @@ Available tools let you:
 - Run Python code and shell commands
 - Create plots and parse logs
 
-Think step-by-step about what information you need, then use tools to gather evidence.
+Think step-by-step about what information you need, then use tools to gather evidence. If there are missing dependencies or data, install or download them as needed. Note that data may be found outside of the repository. Do not give up.
 
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
 
@@ -147,7 +146,7 @@ Remember: You MUST use the submit() tool to report your final answer."""
         prompt = f"""You are a testing agent evaluating a codebase against the following test case:
 
 Test: {test_case.description}
-Repository: {test_case.repo_path}
+Repository: /workspace/repos/{test_case.repo_path}
 
 Your task is to:
 1. Understand the codebase structure
@@ -166,8 +165,8 @@ EVIDENCE: [Description of evidence collected]
         return prompt
 
     def execute_tests(
-        self, test_cases: List[TestCase], sandbox: Optional[str] = None
-    ) -> TestResult:
+        self, test_cases: list[TestCase], sandbox: str | None = None
+    ) -> list[TestResult]:
         """Execute a test case using the agent.
 
         Args:
@@ -201,7 +200,7 @@ EVIDENCE: [Description of evidence collected]
         # Parse results
         return self._parse_results(results, test_cases)
 
-    def _parse_results(self, results, test_cases: List[TestCase]) -> List[TestResult]:
+    def _parse_results(self, results, test_cases: list[TestCase]) -> list[TestResult]:
         """Parse Inspect AI results into TestResults.
 
         Args:
@@ -212,7 +211,7 @@ EVIDENCE: [Description of evidence collected]
             List of parsed TestResults
         """
         test_results = []
-        
+
         # Extract results for each test case
         if results and len(results) > 0:
             eval_result = results[0]
@@ -221,9 +220,9 @@ EVIDENCE: [Description of evidence collected]
                 for idx, sample in enumerate(eval_result.samples):
                     if idx >= len(test_cases):
                         break
-                    
+
                     test_case = test_cases[idx]
-                    
+
                     # Get the submitted answer (from basic_agent's submit tool)
                     output = ""
                     if sample.output and sample.output.completion:
@@ -283,16 +282,3 @@ EVIDENCE: [Description of evidence collected]
             tool: Tool to add
         """
         self.tools.append(tool)
-
-    def remove_tool(self, tool_name: str) -> bool:
-        """Remove a tool by name.
-
-        Args:
-            tool_name: Name of tool to remove
-
-        Returns:
-            True if removed, False if not found
-        """
-        initial_len = len(self.tools)
-        self.tools = [t for t in self.tools if t.name != tool_name]
-        return len(self.tools) < initial_len

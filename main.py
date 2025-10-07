@@ -1,8 +1,6 @@
 """Demo script for vibetest."""
 
 import asyncio
-from pathlib import Path
-from vibetest import TestCase, VibeTestAgent
 
 
 async def demo():

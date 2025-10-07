@@ -1,8 +1,8 @@
 """File system tools for the agent."""
 
 import os
-from pathlib import Path
 from typing import Annotated
+
 from inspect_ai.tool import tool
 
 
@@ -17,7 +17,7 @@ def read_file(path: Annotated[str, "Path to file to read"]) -> str:
         File contents as string
     """
     try:
-        with open(path, "r") as f:
+        with open(path) as f:
             return f.read()
     except Exception as e:
         return f"Error reading file: {str(e)}"

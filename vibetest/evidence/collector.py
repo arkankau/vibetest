@@ -2,9 +2,9 @@
 
 import json
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from datetime import datetime
 
 from vibetest.testcases.base import Evidence, EvidenceType
 

@@ -22,7 +22,9 @@ WORKDIR /workspace
 # Create directories for repos and evidence
 RUN mkdir -p /workspace/repos /workspace/evidence
 
-COPY example_ml_repo /workspace/repos/example_ml_repo
+# COPY example_ml_repo /workspace/repos/example_ml_repo
+COPY abdallahashour7 /workspace/repos/example_ml_repo
+COPY titanic /kaggle/input/titanic
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

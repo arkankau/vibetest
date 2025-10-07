@@ -1,6 +1,7 @@
 """Base classes and utilities for tools."""
 
-from typing import Any, Callable
+from collections.abc import Callable
+
 from inspect_ai.tool import Tool, tool
 
 

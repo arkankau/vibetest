@@ -50,6 +50,76 @@ vibetest/
 - Document all public APIs with docstrings
 - Keep functions focused and modular
 
+### Code Formatting with Ruff
+
+This project uses [Ruff](https://docs.astral.sh/ruff/) for code formatting and linting. Ruff is a fast Python linter and formatter written in Rust.
+
+#### Installation
+
+Install development dependencies including ruff:
+
+```bash
+uv sync --all-extras
+```
+
+#### Running Ruff
+
+**Check code for issues:**
+```bash
+uv run ruff check .
+```
+
+**Auto-fix issues:**
+```bash
+uv run ruff check --fix .
+```
+
+**Format code:**
+```bash
+uv run ruff format .
+```
+
+**Check formatting without changing files:**
+```bash
+uv run ruff format --check .
+```
+
+**Run both linting and formatting:**
+```bash
+uv run ruff check --fix . && uv run ruff format .
+```
+
+#### Pre-commit Hook (Optional)
+
+You can set up a git pre-commit hook to automatically run ruff before commits. Create `.git/hooks/pre-commit`:
+
+```bash
+#!/bin/bash
+# Run ruff linter
+uv run ruff check --fix .
+
+# Run ruff formatter
+uv run ruff format .
+
+# Add any fixed files back to the commit
+git add -u
+
+exit 0
+```
+
+Then make it executable:
+```bash
+chmod +x .git/hooks/pre-commit
+```
+
+#### Configuration
+
+Ruff configuration is in `pyproject.toml` under `[tool.ruff]`. The current settings:
+- Line length: 100 characters
+- Target: Python 3.12+
+- Enabled rules: pycodestyle, Pyflakes, isort, pep8-naming, pyupgrade, flake8-bugbear, flake8-comprehensions, flake8-simplify
+- Auto-fix: Enabled for all rules
+
 ### Adding a New Test Case
 
 1. Create a class in `vibetest/testcases/` (or create a new file for a category)
@@ -167,8 +237,9 @@ uv run pytest
 # Type checking (future)
 uv run mypy vibetest
 
-# Linting (future)
-uv run ruff check .
+# Linting and formatting
+uv run ruff check --fix .
+uv run ruff format .
 ```
 
 For now, please manually test:

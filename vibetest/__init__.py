@@ -2,7 +2,7 @@
 
 __version__ = "0.1.0"
 
-from vibetest.testcases.base import TestCase, TestResult, Evidence
 from vibetest.agent.react_agent import VibeTestAgent
+from vibetest.testcases.base import Evidence, TestCase, TestResult
 
 __all__ = ["TestCase", "TestResult", "Evidence", "VibeTestAgent"]

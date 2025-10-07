@@ -26,18 +26,35 @@ def run_test(
     # Execute test (synchronous - Inspect AI manages its own event loop)
     agent = VibeTestAgent()
     sandbox = "docker" if use_sandbox else None
-    result = agent.execute_test(test_case, sandbox=sandbox)
+    tests = [test_case]
+    results = agent.execute_tests(tests, sandbox=sandbox)
 
-    # Print results
-    print(f"\n{'='*80}")
-    print(f"RESULT: {'✓ PASS' if result.passed else '✗ FAIL'}")
-    print(f"{'='*80}")
-    print(f"\n{result.message}\n")
+    print("\n" + "=" * 80)
+    print("VIBETEST RESULTS")
+    print("=" * 80)
 
-    if result.evidence:
-        print("Evidence collected:")
-        for i, evidence in enumerate(result.evidence, 1):
-            print(f"  {i}. [{evidence.type}] {evidence.description}")
+    passed_count = sum(1 for r in results if r.passed)
+    failed_count = len(results) - passed_count
+
+    for i, result in enumerate(results, 1):
+        status = "PASSED" if result.passed else "FAILED"
+        status_symbol = "." if result.passed else "F"
+        print(f"\n{tests[i-1].description} ... {status}")
+
+        if not result.passed or result.evidence:
+            print(f"  {result.message}")
+
+            if result.evidence:
+                print("  Evidence:")
+                for evidence in result.evidence:
+                    print(f"    - {evidence.description}")
+                    print(f"      Type: {evidence.type}")
+                    if evidence.data:
+                        print(f"      Data: {evidence.data}")
+
+    print("\n" + "=" * 80)
+    print(f"{passed_count} passed, {failed_count} failed")
+    print("=" * 80)
 
     # Save result
     output_dir.mkdir(parents=True, exist_ok=True)
