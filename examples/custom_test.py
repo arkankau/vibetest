@@ -1,12 +1,11 @@
 """Example of creating a custom test case."""
 
-import asyncio
 from pathlib import Path
 
 from vibetest import TestCase, VibeTestAgent
 
 
-async def main():
+def main():
     """Run a custom test."""
     repo_path = Path("./example_ml_repo")
 
@@ -37,11 +36,12 @@ async def main():
 
     print(f"Running custom test: {test.description}\n")
 
-    result = await agent.execute_test(test, sandbox="docker")
+    # Note: execute_test() is synchronous - Inspect AI manages its own event loop
+    result = agent.execute_test(test, sandbox="docker")
 
     print(f"\nResult: {'PASSED' if result.passed else 'FAILED'}")
     print(f"Message: {result.message}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

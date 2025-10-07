@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -7,22 +7,22 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.cargo/bin:$PATH"
-
 # Set working directory
 WORKDIR /workspace
 
-# Copy project files
-COPY pyproject.toml uv.lock ./
-COPY vibetest ./vibetest
+# # Copy project files
+# COPY pyproject.toml uv.lock ./
+# COPY vibetest ./vibetest
+# COPY README.md .
 
-# Install dependencies
-RUN uv sync
+# # Install dependencies
+# COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# RUN uv sync
 
 # Create directories for repos and evidence
 RUN mkdir -p /workspace/repos /workspace/evidence
+
+COPY example_ml_repo /workspace/repos/example_ml_repo
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

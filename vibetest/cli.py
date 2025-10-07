@@ -1,6 +1,5 @@
 """Command-line interface for vibetest."""
 
-import asyncio
 import json
 import sys
 from pathlib import Path
@@ -9,7 +8,7 @@ from vibetest import TestCase, VibeTestAgent
 from vibetest.testcases import ml_tests
 
 
-async def run_test(
+def run_test(
     test_case: TestCase, output_dir: Path, use_sandbox: bool = True
 ) -> None:
     """Run a single test case.
@@ -24,10 +23,10 @@ async def run_test(
     print(f"Repository: {test_case.repo_path}")
     print(f"{'='*80}\n")
 
-    # Execute test
+    # Execute test (synchronous - Inspect AI manages its own event loop)
     agent = VibeTestAgent()
     sandbox = "docker" if use_sandbox else None
-    result = await agent.execute_test(test_case, sandbox=sandbox)
+    result = agent.execute_test(test_case, sandbox=sandbox)
 
     # Print results
     print(f"\n{'='*80}")
@@ -108,7 +107,7 @@ def main():
 
     # Run test
     try:
-        asyncio.run(run_test(test_case, args.output_dir, not args.no_sandbox))
+        run_test(test_case, args.output_dir, not args.no_sandbox)
     except KeyboardInterrupt:
         print("\n\nTest interrupted by user")
         sys.exit(130)
