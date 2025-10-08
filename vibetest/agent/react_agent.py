@@ -1,12 +1,16 @@
 """ReAct agent implementation using Inspect AI."""
 
 import os
+from pathlib import Path
 
 from inspect_ai import Task, eval
 from inspect_ai.agent import react
 from inspect_ai.dataset import Sample
-from inspect_ai.scorer import includes
+from inspect_ai.scorer import includes, scorer, Score
 from inspect_ai.tool import Tool, bash_session, python, text_editor
+from inspect_ai.util import sandbox
+from inspect_ai.scorer import Target, accuracy
+from inspect_ai.solver import TaskState
 
 from vibetest.testcases.base import TestCase, TestResult
 
@@ -20,13 +24,65 @@ from vibetest.testcases.base import TestCase, TestResult
 #     parse_logs,
 # )
 
+@scorer(metrics=[accuracy()])
+def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to_save="/evidence"):
+    """
+    Creates /tmp/evidence-<sample>.tar.gz inside the sandbox, pulls it out,
+    and writes it under out_dir on the host as evidence-<sample>.tar.gz.
+    """
+    async def _score(state: TaskState, target: Target) -> Score:
+        env = sandbox()  # SandboxEnvironment for the current sample
+
+        # Name artifact using sample_id from the TaskState
+        sample_id = state.sample_id if hasattr(state, "sample_id") else "unknown"
+        tar_in_sandbox = f"/tmp/evidence-{sample_id}.tar.gz"
+
+        # Best-effort: tar up the directory if it exists (don't fail if it's missing)
+        # -C / makes the archive paths absolute-looking but rooted properly
+        await env.exec(["bash", "-lc", f"if [ -d '{dir_to_save}' ]; then tar -czf '{tar_in_sandbox}' -C / '{dir_to_save.lstrip('/')}' ; fi || true"])
+
+        # Try to read the tarball back; if it wasn't created, just return a benign score
+        try:
+            blob = await env.read_file(tar_in_sandbox, text=False)  # returns bytes
+        except Exception:
+            return Score(value=True, explanation=f"No evidence found at {dir_to_save}")
+
+        # Write to the host filesystem (e.g., alongside your logs)
+        out_base = Path(out_dir)
+        out_base.mkdir(parents=True, exist_ok=True)
+        out_path = out_base / f"evidence-{sample_id}.tar.gz"
+        out_path.write_bytes(blob)
+        
+        # Set proper permissions (0o644 = rw-r--r--)
+        os.chmod(out_path, 0o644)
+
+        return Score(value=True, explanation=f"Saved evidence to {out_path}")
+    return _score
+
+
+def get_files(test_case: TestCase, sandbox_prefix="/workspace/repos/") -> dict[str, str]:
+    """Get files from the test case repository.
+
+    Args:
+        test_case: Test case containing the repository path
+    Returns:        Dictionary mapping file path in the sandbox to file path
+    """
+    files = {}
+    repo_path = test_case.repo_path
+    if repo_path and os.path.isdir(repo_path):
+        for root, _, filenames in os.walk(repo_path):
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(full_path, repo_path)
+                sandbox_path = os.path.join(sandbox_prefix, repo_path, relative_path)
+                files[sandbox_path] = full_path
+    return files
+
 
 class VibeTestAgent:
     """ReAct agent for executing natural language test cases.
 
-    This agent uses Inspect AI's `react()` agent which implements the ReAct
-    pattern from the paper "ReAct: Synergizing Reasoning and Acting in Language
-    Models" (https://arxiv.org/abs/2210.03629).
+    This agent uses Inspect AI's `react()` agent which implements the ReAct pattern
 
     The agent iteratively:
     1. Reasons about what to do next (thinking step-by-step)
@@ -86,9 +142,7 @@ class VibeTestAgent:
     def _create_solver(self):
         """Create the ReAct solver for the agent.
 
-        Uses Inspect AI's react() agent which implements the ReAct pattern
-        from the paper "ReAct: Synergizing Reasoning and Acting in Language Models"
-        (https://arxiv.org/abs/2210.03629).
+        Uses Inspect AI's react() agent
 
         The agent alternates between:
         1. Reasoning about what to do next
@@ -104,16 +158,16 @@ class VibeTestAgent:
 Your approach should be:
 1. Understand what needs to be tested
 2. Systematically explore the codebase
-3. Execute necessary code to gather evidence (you must install necessary dependencies and data if they are missing)
+3. Execute necessary code to gather evidence (you must install necessary dependencies and data if they are missing, but note that data may already be available outside of the repository).
 4. Analyze results objectively
-5. Provide a clear binary verdict (PASS or FAIL) with supporting evidence
+5. Provide a clear binary verdict (PASS or FAIL) with supporting evidence. Store the evidence in /evidence.
 
 Available tools let you:
 - Read files and explore directories
 - Run Python code and shell commands
 - Create plots and parse logs
 
-Think step-by-step about what information you need, then use tools to gather evidence. If there are missing dependencies or data, install or download them as needed. Note that data may be found outside of the repository. Do not give up.
+Think step-by-step about what information you need, then use tools to gather evidence. If there are missing dependencies or data, install or download them as needed. Note that data may be available already outside of the repository (for example in the /kaggle directory). Do not give up.
 
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
 
@@ -152,10 +206,10 @@ Your task is to:
 1. Understand the codebase structure
 2. Execute necessary code to gather evidence
 3. Analyze the results against the test criteria
-4. Provide a binary pass/fail verdict with supporting evidence
+4. Provide a binary pass/fail verdict with supporting evidence. Store the evidence in /evidence.
 
 Use the available tools to explore the repository, run code, and collect evidence.
-Be thorough and systematic in your analysis.
+Be thorough and systematic in your analysis. If there are missing dependencies or data, install or download them as needed. Note that data may be available already outside of the repository (in /kaggle for instance). Do not give up.
 
 When you reach a conclusion, respond with:
 VERDICT: [PASS/FAIL]
@@ -184,9 +238,14 @@ EVIDENCE: [Description of evidence collected]
         # The scorer is required when using submit() tool in react() agent
         # We use includes() to accept any submission that contains "VERDICT"
         task = Task(
-            dataset=[Sample(input=self._create_prompt(test_case), target="VERDICT") for test_case in test_cases],
+            dataset=[Sample(
+                input=self._create_prompt(test_case), 
+                target="VERDICT", 
+                id=f"{Path(test_case.repo_path).name}_{idx}",
+                files=get_files(test_case)
+            ) for idx, test_case in enumerate(test_cases)],
             solver=self._create_solver(),
-            scorer=includes(),  # Accept any answer containing the target
+            scorer=save_evidence_tar(), #includes(),  # Accept any answer containing the target
             sandbox=sandbox,
         )
 
@@ -251,6 +310,7 @@ EVIDENCE: [Description of evidence collected]
                         execution_log = "\n".join(log_parts)
 
                     test_results.append(TestResult(
+                        test_case=test_case,
                         passed=passed,
                         message=message,
                         execution_log=execution_log,
@@ -265,6 +325,7 @@ EVIDENCE: [Description of evidence collected]
         if not test_results:
             for test_case in test_cases:
                 test_results.append(TestResult(
+                    test_case=test_case,
                     passed=False,
                     message="Failed to execute test or parse results",
                     metadata={

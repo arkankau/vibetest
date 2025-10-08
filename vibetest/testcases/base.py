@@ -30,24 +30,6 @@ class Evidence(BaseModel):
         arbitrary_types_allowed = True
 
 
-class TestResult(BaseModel):
-    """Result of executing a test case."""
-
-    passed: bool
-    message: str
-    evidence: list[Evidence] = Field(default_factory=list)
-    execution_log: str = ""
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    def add_evidence(self, evidence: Evidence) -> None:
-        """Add evidence to the result."""
-        self.evidence.append(evidence)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert result to dictionary."""
-        return self.model_dump()
-
-
 class TestCase(BaseModel):
     """A test case specification.
 
@@ -64,3 +46,22 @@ class TestCase(BaseModel):
 
     def __repr__(self) -> str:
         return f"TestCase(description='{self.description}')"
+
+
+class TestResult(BaseModel):
+    """Result of executing a test case."""
+
+    passed: bool
+    test_case: TestCase
+    message: str
+    evidence: list[Evidence] = Field(default_factory=list)
+    execution_log: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def add_evidence(self, evidence: Evidence) -> None:
+        """Add evidence to the result."""
+        self.evidence.append(evidence)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert result to dictionary."""
+        return self.model_dump()

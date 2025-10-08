@@ -8,25 +8,25 @@ from vibetest import TestCase, VibeTestAgent
 def main():
     """Run a simple test example."""
     # Path to the repository you want to test
-    repo_path = Path("./example_ml_repo")
+    repo_path = Path("./data/kaggle/abdallahashour7")
 
     test1 = TestCase(
-        description="Training loss is logged and generally decreases",
+        description="Training loss generally decreases during training (if no loss is logged, then add logging to check this)",
         repo_path=repo_path
     )
-    test2 = TestCase(
-        description="The model can overfit a single (or tiny) batch to near-zero loss.",
-        repo_path=repo_path
-    )
-    test3 = TestCase(
-        description="No leakage from test to train/val; model selection and hyperparameter tuning uses val only (if at all) and then testing happens once at the end.",
-        repo_path=repo_path
-    )
-    test4 = TestCase(
-        description="Test accuracy should be deterministic (same value) when running the test function multiple times without retraining.",
-        repo_path=repo_path
-    )
-    tests = [test1, test2, test3, test4]
+    # test2 = TestCase(
+    #     description="The model can overfit a single (or tiny) batch to near-zero loss.",
+    #     repo_path=repo_path
+    # )
+    # test3 = TestCase(
+    #     description="No leakage from test to train/val; model selection and hyperparameter tuning uses val only (if at all) and then testing happens once at the end.",
+    #     repo_path=repo_path
+    # )
+    # test4 = TestCase(
+    #     description="Test accuracy should be deterministic (same value) when running the test function multiple times without retraining.",
+    #     repo_path=repo_path
+    # )
+    tests = [test1]
     # tests = [TestCase(description="Take a look at the repository and tell me if there are any bugs.", repo_path=repo_path)]
 
     # Create agent and run test
