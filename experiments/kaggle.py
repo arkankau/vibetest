@@ -13,12 +13,12 @@ def get_tests():
         "Training loss generally decreases during training and plateaus within the number of epochs used (if no loss is logged, then add logging to check this).",
         "The model can overfit a single (or tiny) batch to near-zero loss.",
         "Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.",
-        "No leakage from test to train/val; model selection and hyperparameter tuning uses val only (if at all) and then testing happens once at the end.",
-        "Test accuracy should be deterministic (same value) when running the test function multiple times without retraining. If no seed is set, then add a seed to check this.",
+        "No leakage from test to train/val. If there is any model selection or hyperparameter tuning, then it uses val only.",
+        "Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining. If no seed is set, then add a seed to check this.",
         "All model parameters are updated during training (no frozen layers unless explicitly intended).",
-        "No model parameters or gradients are NaN or Inf.",
-        "The trained model outperforms a simple baseline (e.g., random or majority class) on the test set.",
-        "Visualizing the input to the model (i.e. the x in `y_hat = model(x)`) shows that the data is being loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters).",
+        "No model parameters or gradients are NaN or Inf during training.",
+        "The model after the full training procedure outperforms a simple baseline (e.g., random or majority class) on the evaluation set.",
+        "Visualizing the input to the model (i.e. the x in `y_hat = model(x)`) shows that the data is being loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).",
     ]
     return tests
 
@@ -138,7 +138,7 @@ def run_vibetest():
     print(f"{'=' * 80}\n")
     
     # Step 3: Group results by repository and write to file
-    with jsonlines.open("results/kaggle_results.jsonl", mode="w") as writer:
+    with jsonlines.open(f"results/kaggle_results_{agent.model_name.split('/')[1]}.jsonl", mode="w") as writer:
         # Group results by repository
         for repo_idx, repo_path in enumerate(repo_paths):
             print(f"\n{'=' * 80}")

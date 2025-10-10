@@ -76,6 +76,7 @@ class BaselineAgent:
         """
         instructions = """You are an agent that examines repositories to determine if there are any bugs.
 
+Carefully analyze the code and use the available tools to explore and verify your findings. For example, you might run code snippets, inspect files, or modify code to test hypotheses.
 When you have completed your examination, call the submit() tool with your findings in this format:
 
 VERDICT: [BUGS FOUND/NO BUGS FOUND]
@@ -120,14 +121,24 @@ Repository: /workspace/repos/{test_case.repo_path}"""
             This is a synchronous function even though it runs async operations internally.
             Inspect AI's eval() manages its own event loop, so we don't use async/await.
         """
+        # Create a mapping from sample ID to test case to maintain order
+        # Since samples may be executed in parallel and returned out of order
+        id_to_test_case = {}
+        
         # Create Inspect task with a simple scorer that accepts any submission with VERDICT
-        task = Task(
-            dataset=[Sample(
+        samples = []
+        for idx, test_case in enumerate(test_cases):
+            sample_id = f"{Path(test_case.repo_path).name}_{idx}"
+            id_to_test_case[sample_id] = test_case
+            samples.append(Sample(
                 input=self._create_prompt(test_case), 
                 target="VERDICT", 
-                id=f"{Path(test_case.repo_path).name}_{idx % 9}",
+                id=sample_id,
                 files=get_files(test_case)
-            ) for idx, test_case in enumerate(test_cases)],
+            ))
+        
+        task = Task(
+            dataset=samples,
             solver=self._create_solver(),
             scorer=includes(),  # Accept any submission containing the target
             sandbox=sandbox,
@@ -143,30 +154,34 @@ Repository: /workspace/repos/{test_case.repo_path}"""
         )
 
         # Parse results
-        return self._parse_results(results, test_cases)
+        return self._parse_results(results, id_to_test_case)
 
-    def _parse_results(self, results, test_cases: list[TestCase]) -> list[TestResult]:
+    def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
         """Parse Inspect AI results into TestResults.
 
         Args:
             results: Results from Inspect eval
-            test_cases: Original test cases
+            id_to_test_case: Mapping from sample ID to test case
 
         Returns:
-            List of parsed TestResults
+            List of parsed TestResults in the original test case order
         """
-        test_results = []
+        # Create a mapping from sample ID to parsed result
+        sample_id_to_result = {}
 
-        # Extract results for each test case
+        # Extract results for each sample
         if results and len(results) > 0:
             eval_result = results[0]
             if eval_result.samples:
-                # Iterate through samples and corresponding test cases
-                for idx, sample in enumerate(eval_result.samples):
-                    if idx >= len(test_cases):
-                        break
-
-                    test_case = test_cases[idx]
+                # Iterate through samples and match to test cases using IDs
+                for sample in eval_result.samples:
+                    sample_id = sample.id
+                    
+                    # Skip if we don't have a matching test case
+                    if sample_id not in id_to_test_case:
+                        continue
+                    
+                    test_case = id_to_test_case[sample_id]
 
                     # Get the submitted answer
                     output = ""
@@ -196,7 +211,7 @@ Repository: /workspace/repos/{test_case.repo_path}"""
                                 log_parts.append(f"[{role}] {content[:200]}...")
                         execution_log = "\n".join(log_parts)
 
-                    test_results.append(TestResult(
+                    sample_id_to_result[sample_id] = TestResult(
                         test_case=test_case,
                         passed=passed,
                         message=message,
@@ -206,11 +221,15 @@ Repository: /workspace/repos/{test_case.repo_path}"""
                             "test_description": test_case.description,
                             "score": sample.score.value if sample.score else None,
                         },
-                    ))
+                    )
 
-        # If no results were parsed, add fallback results for each test case
-        if not test_results:
-            for test_case in test_cases:
+        # Build final results list in the original test case order
+        test_results = []
+        for sample_id, test_case in id_to_test_case.items():
+            if sample_id in sample_id_to_result:
+                test_results.append(sample_id_to_result[sample_id])
+            else:
+                # Add fallback result for missing test case
                 test_results.append(TestResult(
                     test_case=test_case,
                     passed=False,

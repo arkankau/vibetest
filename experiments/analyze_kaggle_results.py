@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Any
 import jsonlines
 from collections import defaultdict, Counter
+import csv
 
 
 def load_results(filepath: str) -> List[Dict[str, Any]]:
@@ -49,38 +50,6 @@ def analyze_test_performance(results: List[Dict[str, Any]]) -> Dict[str, Dict[st
             test_desc = test.get('description', '')
             # Try to extract the test type from metadata or description
             test_type = test.get('metadata', {}).get('test_description', '')
-            
-            if not test_type and test_desc:
-                # If no metadata, try to extract from description
-                lines = test_desc.split('\n')
-                for line in lines:
-                    if line.startswith('REASON:'):
-                        # Try to find the test description in nearby lines
-                        continue
-                    if 'Training loss' in line or 'loss generally decreases' in test_desc:
-                        test_type = 'Training loss decreases'
-                        break
-                    elif 'overfit' in line.lower():
-                        test_type = 'Can overfit tiny batch'
-                        break
-                    elif 'randomiz' in line.lower() and 'label' in line.lower():
-                        test_type = 'Randomized labels reduce accuracy'
-                        break
-                    elif 'leakage' in line.lower() or 'test to train' in line.lower():
-                        test_type = 'No test/train leakage'
-                        break
-                    elif 'deterministic' in line.lower():
-                        test_type = 'Deterministic test accuracy'
-                        break
-                    elif 'frozen layer' in line.lower() or 'parameters are updated' in line.lower():
-                        test_type = 'All parameters updated'
-                        break
-                    elif 'NaN' in line or 'Inf' in line:
-                        test_type = 'No NaN/Inf in parameters'
-                        break
-                    elif 'baseline' in line.lower() and 'outperform' in line.lower():
-                        test_type = 'Outperforms baseline'
-                        break
             
             # Use the extracted test_type or fall back to a short description
             if not test_type:
@@ -220,9 +189,51 @@ def print_analysis(results: List[Dict[str, Any]]):
     print("=" * 80)
 
 
+def create_test_results_csv(results: List[Dict[str, Any]], output_file: Path):
+    """Create a CSV file with repo names and pass/fail results for each test."""
+    # Collect all test descriptions to use as column headers
+    all_test_descriptions = set()
+    
+    # First pass: collect all unique test descriptions
+    for repo_result in results:
+        for test in repo_result.get('tests', []):
+            test_desc = test.get('metadata', {}).get('test_description', '')
+            if test_desc:
+                all_test_descriptions.add(test_desc)
+    
+    # Sort test descriptions for consistent column ordering
+    test_descriptions = sorted(all_test_descriptions)
+    
+    # Create CSV
+    with open(output_file, 'w', newline='') as csvfile:
+        fieldnames = ['repo_name'] + test_descriptions
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        writer.writeheader()
+        
+        for repo_result in results:
+            repo_name = repo_result.get('repo_name', repo_result.get('repo', 'Unknown'))
+            
+            # Build a mapping of test_description -> pass/fail
+            test_results = {}
+            for test in repo_result.get('tests', []):
+                test_desc = test.get('metadata', {}).get('test_description', '')
+                if test_desc:
+                    test_results[test_desc] = 'PASS' if test.get('passed', False) else 'FAIL'
+            
+            # Create row with repo name and all test results
+            row = {'repo_name': repo_name}
+            for test_desc in test_descriptions:
+                row[test_desc] = test_results.get(test_desc, 'N/A')
+            
+            writer.writerow(row)
+    
+    print(f"Test results CSV created at {output_file}")
+
+
 def main():
     """Main analysis function."""
-    results_file = Path(__file__).parent.parent / "results" / "kaggle_results.jsonl"
+    results_file = Path(__file__).parent.parent / "results" / "kaggle_results_gpt-5-mini.jsonl"
     
     if not results_file.exists():
         print(f"Error: Results file not found at {results_file}")
@@ -239,6 +250,10 @@ def main():
     print()
     
     print_analysis(results)
+    
+    # Create CSV with test results
+    csv_output_file = results_file.with_suffix('.csv')
+    create_test_results_csv(results, csv_output_file)
 
 
 if __name__ == "__main__":

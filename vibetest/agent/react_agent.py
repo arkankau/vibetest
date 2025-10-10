@@ -154,15 +154,18 @@ class VibeTestAgent:
             Solver configured with ReAct pattern
         """
         instructions = """You are an expert testing agent that evaluates codebases against natural language test criteria.
+Your goal is to determine if the codebase passes or fails the specified test case.
 
 Your approach should be:
-1. Understand what needs to be tested
+1. Understand what part of the code needs to be tested
 2. Systematically explore the codebase
 3. Execute necessary code to gather evidence (you must install necessary dependencies and data if they are missing, but note that data may already be available outside of the repository).
 4. Analyze results objectively
 5. Provide a clear binary verdict (PASS or FAIL) with supporting evidence. Store the evidence in /evidence.
 
 Think step-by-step about what information you need, then use tools to gather evidence. If there are missing dependencies or data, install or download them as needed. Note that data may be available already outside of the repository (for example in the /kaggle directory). Avoid writing any substantial new code and instead try to just instrument or augment the existing code if necessary. If you need to execute jupyter notebooks, you can convert them to Python scripts with `nbconvert --to script <notebook_name>.ipynb`.
+You can directly edit files using the text_editor tool rather than creating new files.
+Remember you are evaluating the existing code, not rewriting it or evaluating your own code.
 Keep going until you can confidently provide a verdict on the test case. Do not give up.
 
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
@@ -214,16 +217,26 @@ Repository: /workspace/repos/{test_case.repo_path}"""
             This is a synchronous function even though it runs async operations internally.
             Inspect AI's eval() manages its own event loop, so we don't use async/await.
         """
+        # Create a mapping from sample ID to test case to maintain order
+        # Since samples may be executed in parallel and returned out of order
+        id_to_test_case = {}
+        
         # Create Inspect task with a scorer
         # The scorer is required when using submit() tool in react() agent
         # We use includes() to accept any submission that contains "VERDICT"
-        task = Task(
-            dataset=[Sample(
+        samples = []
+        for idx, test_case in enumerate(test_cases):
+            sample_id = f"{Path(test_case.repo_path).name}_{idx}"
+            id_to_test_case[sample_id] = test_case
+            samples.append(Sample(
                 input=self._create_prompt(test_case), 
                 target="VERDICT", 
-                id=f"{Path(test_case.repo_path).name}_{idx % 9}",
+                id=sample_id,
                 files=get_files(test_case)
-            ) for idx, test_case in enumerate(test_cases)],
+            ))
+        
+        task = Task(
+            dataset=samples,
             solver=self._create_solver(),
             scorer=save_evidence_tar(f"./evidence-dumps/{self.model_name.split('/')[1]}"), #includes(),  # Accept any answer containing the target
             sandbox=sandbox,
@@ -239,30 +252,34 @@ Repository: /workspace/repos/{test_case.repo_path}"""
         )
 
         # Parse results
-        return self._parse_results(results, test_cases)
+        return self._parse_results(results, id_to_test_case)
 
-    def _parse_results(self, results, test_cases: list[TestCase]) -> list[TestResult]:
+    def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
         """Parse Inspect AI results into TestResults.
 
         Args:
             results: Results from Inspect eval
-            test_cases: Original test cases
+            id_to_test_case: Mapping from sample ID to test case
 
         Returns:
-            List of parsed TestResults
+            List of parsed TestResults in the original test case order
         """
-        test_results = []
+        # Create a mapping from sample ID to parsed result
+        sample_id_to_result = {}
 
-        # Extract results for each test case
+        # Extract results for each sample
         if results and len(results) > 0:
             eval_result = results[0]
             if eval_result.samples:
-                # Iterate through samples and corresponding test cases
-                for idx, sample in enumerate(eval_result.samples):
-                    if idx >= len(test_cases):
-                        break
-
-                    test_case = test_cases[idx]
+                # Iterate through samples and match to test cases using IDs
+                for sample in eval_result.samples:
+                    sample_id = sample.id
+                    
+                    # Skip if we don't have a matching test case
+                    if sample_id not in id_to_test_case:
+                        continue
+                    
+                    test_case = id_to_test_case[sample_id]
 
                     # Get the submitted answer (from basic_agent's submit tool)
                     output = ""
@@ -291,7 +308,7 @@ Repository: /workspace/repos/{test_case.repo_path}"""
                                 log_parts.append(f"[{role}] {content[:200]}...")
                         execution_log = "\n".join(log_parts)
 
-                    test_results.append(TestResult(
+                    sample_id_to_result[sample_id] = TestResult(
                         test_case=test_case,
                         passed=passed,
                         message=message,
@@ -301,11 +318,15 @@ Repository: /workspace/repos/{test_case.repo_path}"""
                             "test_description": test_case.description,
                             "score": sample.score.value if sample.score else None,
                         },
-                    ))
+                    )
 
-        # If no results were parsed, add fallback results for each test case
-        if not test_results:
-            for test_case in test_cases:
+        # Build final results list in the original test case order
+        test_results = []
+        for sample_id, test_case in id_to_test_case.items():
+            if sample_id in sample_id_to_result:
+                test_results.append(sample_id_to_result[sample_id])
+            else:
+                # Add fallback result for missing test case
                 test_results.append(TestResult(
                     test_case=test_case,
                     passed=False,
