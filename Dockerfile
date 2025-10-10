@@ -7,6 +7,19 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Install basic ML requirements
+RUN pip install --no-cache-dir \
+    jupyter \
+    jupyterlab \
+    pandas \
+    numpy \
+    matplotlib \
+    seaborn \
+    scikit-learn \
+    scipy \
+    plotly \
+    ipywidgets
+
 # Set working directory
 WORKDIR /workspace
 
