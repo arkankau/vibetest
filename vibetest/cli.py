@@ -1,11 +1,11 @@
 """Command-line interface for vibetest."""
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
 from vibetest import TestCase, VibeTestAgent
-from vibetest.testcases import ml_tests
 
 
 def run_test(
@@ -63,20 +63,72 @@ def run_test(
     print(f"\nFull results saved to: {result_file}")
 
 
+def load_tests_from_file(file_path: Path) -> list[TestCase]:
+    """Load test cases from a vibetest.py file.
+
+    Args:
+        file_path: Path to vibetest.py file
+
+    Returns:
+        List of TestCase objects
+
+    The file should define a variable named 'tests' which is a list of TestCase objects.
+    """
+    spec = importlib.util.spec_from_file_location("vibetest_config", file_path)
+    if spec is None or spec.loader is None:
+        print(f"Error: Could not load {file_path}")
+        sys.exit(1)
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    if not hasattr(module, "tests"):
+        print(f"Error: {file_path} must define a 'tests' variable containing a list of TestCase objects")
+        sys.exit(1)
+
+    tests = module.tests
+    if not isinstance(tests, list):
+        print(f"Error: 'tests' must be a list of TestCase objects")
+        sys.exit(1)
+
+    return tests
+
+
 def main():
     """Main CLI entry point."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Vibetest: AI agent for natural language test execution"
+        description="Vibetest: AI agent for natural language test execution",
+        epilog="""
+Examples:
+  # Run a test with a natural language description
+  vibetest --test "Training loss decreases during training"
+
+  # Run tests defined in vibetest.py
+  vibetest
+
+  # Specify repo path (defaults to current directory)
+  vibetest --repo /path/to/repo --test "Model saves checkpoints"
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "repo_path", type=Path, help="Path to repository to test"
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="Path to repository to test (default: current directory)",
     )
     parser.add_argument(
         "--test",
         type=str,
-        help="Test description or preset name (training_loss, hyperparams, etc.)",
+        help="Natural language test description",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("vibetest.py"),
+        help="Path to test configuration file (default: ./vibetest.py)",
     )
     parser.add_argument(
         "--output-dir",
@@ -89,42 +141,41 @@ def main():
         action="store_true",
         help="Disable Docker sandbox",
     )
-    parser.add_argument(
-        "--logging-interval",
-        type=int,
-        default=100,
-        help="Expected logging interval (for training_loss test)",
-    )
 
     args = parser.parse_args()
 
-    # Create test case based on preset or custom description
-    if args.test in ["training_loss", "loss"]:
-        test_case = ml_tests.training_loss_test(
-            repo_path=args.repo_path,
-            logging_interval=args.logging_interval,
-        )
-    elif args.test in ["hyperparams", "hyperparameters"]:
-        test_case = ml_tests.hyperparameter_logging_test(repo_path=args.repo_path)
-    elif args.test in ["checkpointing", "checkpoint"]:
-        test_case = ml_tests.model_checkpointing_test(repo_path=args.repo_path)
-    elif args.test in ["gradient_clipping", "grad_clip"]:
-        test_case = ml_tests.gradient_clipping_test(repo_path=args.repo_path)
-    elif args.test:
-        # Treat as custom description
-        test_case = TestCase(
+    # Determine test cases to run
+    test_cases = []
+
+    if args.test:
+        # Use test description from command line
+        test_cases = [TestCase(
             description=args.test,
-            repo_path=args.repo_path,
-        )
+            repo_path=args.repo,
+        )]
+    elif args.config.exists():
+        # Load tests from config file
+        print(f"Loading tests from {args.config}")
+        test_cases = load_tests_from_file(args.config)
     else:
-        print("Error: --test is required")
-        print("\nPreset tests: training_loss, hyperparams, checkpointing, gradient_clipping")
-        print("Or provide any custom test description in quotes")
+        print(f"Error: No test specified and {args.config} not found")
+        print("\nUsage:")
+        print("  1. Provide --test with a natural language description")
+        print("  2. Create a vibetest.py file with test definitions")
+        print("\nExample vibetest.py:")
+        print("  from pathlib import Path")
+        print("  from vibetest import TestCase")
+        print("")
+        print("  tests = [")
+        print('      TestCase(description="Training loss decreases", repo_path=Path(".")),')
+        print('      TestCase(description="Model saves checkpoints", repo_path=Path(".")),')
+        print("  ]")
         sys.exit(1)
 
-    # Run test
+    # Run tests
     try:
-        run_test(test_case, args.output_dir, not args.no_sandbox)
+        for test_case in test_cases:
+            run_test(test_case, args.output_dir, not args.no_sandbox)
     except KeyboardInterrupt:
         print("\n\nTest interrupted by user")
         sys.exit(130)

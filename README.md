@@ -35,16 +35,44 @@ docker build -t vibetest .
 
 ### CLI Usage
 
-```bash
-# Run a training loss test
-uv run vibetest /path/to/ml/repo --test training_loss --logging-interval 100
+The CLI provides two ways to define tests:
 
-# Run hyperparameter logging test
-uv run vibetest /path/to/ml/repo --test hyperparams
+**1. Quick test with natural language description:**
+```bash
+# Run a single test on the current directory
+vibetest --test "Training loss decreases during training"
+
+# Test a specific repository
+vibetest --repo /path/to/repo --test "Model saves checkpoints every epoch"
 
 # Run without Docker sandbox (for testing)
-uv run vibetest /path/to/ml/repo --test training_loss --no-sandbox
+vibetest --test "Hyperparameters are logged" --no-sandbox
 ```
+
+**2. Define tests in `vibetest.py` (like pytest):**
+```python
+# vibetest.py
+from pathlib import Path
+from vibetest import TestCase
+
+tests = [
+    TestCase(
+        description="Training loss is logged and generally decreases",
+        repo_path=Path("."),
+    ),
+    TestCase(
+        description="Model saves checkpoints periodically",
+        repo_path=Path("."),
+    ),
+]
+```
+
+Then simply run:
+```bash
+vibetest
+```
+
+See `vibetest.py.example` for a complete example.
 
 ### Programmatic Usage
 
@@ -60,7 +88,8 @@ test = TestCase(
 
 # Run with agent (synchronous - Inspect AI manages async internally)
 agent = VibeTestAgent(model="anthropic/claude-3-5-sonnet-20241022")
-result = agent.execute_test(test, sandbox="docker")
+results = agent.execute_tests([test], sandbox="docker")
+result = results[0]
 
 # Check results
 print(f"Passed: {result.passed}")
@@ -83,13 +112,9 @@ test = TestCase(
     repo_path=Path("./my_repo")
 )
 
-# Or use helper functions for common ML tests
-from vibetest.testcases.ml_tests import training_loss_test
-test = training_loss_test(Path("./my_repo"), logging_interval=100)
-
 agent = VibeTestAgent()
-result = agent.execute_test(test, sandbox="docker")
-print(f"Result: {result.passed}")
+results = agent.execute_tests([test], sandbox="docker")
+print(f"Result: {results[0].passed}")
 ```
 
 ## Architecture
@@ -108,73 +133,6 @@ vibetest/
   evidence/        # Evidence collection system
     collector.py
   cli.py           # Command-line interface
-```
-
-## Built-in Test Helpers
-
-Helper functions for common ML test cases:
-
-```python
-from pathlib import Path
-from vibetest.testcases.ml_tests import (
-    training_loss_test,
-    hyperparameter_logging_test,
-    model_checkpointing_test,
-    gradient_clipping_test,
-)
-
-# Training loss validation
-test = training_loss_test(Path("./repo"), logging_interval=100)
-
-# Hyperparameter logging
-test = hyperparameter_logging_test(
-    Path("./repo"),
-    required_params=["learning_rate", "batch_size"]
-)
-
-# Model checkpointing
-test = model_checkpointing_test(Path("./repo"), checkpoint_interval=1000)
-
-# Gradient clipping
-test = gradient_clipping_test(Path("./repo"))
-```
-
-## Extending the Agent
-
-### Adding Custom Tools
-
-```python
-from inspect_ai.tool import tool
-from vibetest.agent.react_agent import VibeTestAgent
-
-@tool
-def my_custom_tool(param: str) -> str:
-    """My custom tool description."""
-    # Tool implementation
-    return f"Result: {param}"
-
-agent = VibeTestAgent()
-agent.add_tool(my_custom_tool)
-```
-
-### Configuring the Agent
-
-```python
-# Use Anthropic Claude
-agent = VibeTestAgent(
-    model="anthropic/claude-3-5-sonnet-20241022",
-    max_attempts=20,
-    additional_tools=[custom_tool1, custom_tool2]
-)
-
-# Use OpenAI GPT-4
-agent = VibeTestAgent(
-    model="openai/gpt-4",
-    max_attempts=20,
-)
-
-# Use default model from .env
-agent = VibeTestAgent()  # Uses VIBETEST_MODEL from .env
 ```
 
 ## Environment Variables
@@ -231,17 +189,3 @@ uv run ruff format .
 # Type checking
 uv run mypy vibetest
 ```
-
-## Future Extensions
-
-The architecture is designed to support:
-- Custom evidence types and collectors
-- Additional ML-specific tests (convergence, reproducibility, etc.)
-- Integration with CI/CD pipelines
-- Batch test execution and reporting
-- Custom sandboxing strategies
-- Multi-model agent evaluation
-
-## License
-
-MIT
