@@ -7,8 +7,17 @@ from typing import Any
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-# Load .env file if it exists
-load_dotenv()
+# Load .env file from current working directory only
+load_dotenv(Path.cwd() / ".env")
+
+
+def get_package_root() -> Path:
+    """Get the root directory of the vibetest package.
+
+    Returns:
+        Path to the vibetest package directory
+    """
+    return Path(__file__).parent.parent
 
 
 class VibeTestConfig(BaseModel):

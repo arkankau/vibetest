@@ -8,11 +8,12 @@ from inspect_ai.agent import react
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import includes, scorer, Score
 from inspect_ai.tool import Tool, bash_session, python, text_editor
-from inspect_ai.util import sandbox
+from inspect_ai.util import sandbox, SandboxEnvironmentSpec
 from inspect_ai.scorer import Target, accuracy
 from inspect_ai.solver import TaskState
 
 from vibetest.testcases.base import TestCase, TestResult
+from vibetest.config import get_package_root
 
 # from vibetest.tools import (
 #     read_file,
@@ -77,6 +78,27 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/repos/") -> dict[s
                 sandbox_path = os.path.join(sandbox_prefix, repo_path, relative_path)
                 files[sandbox_path] = full_path
     return files
+
+
+def setup_docker_sandbox() -> str | SandboxEnvironmentSpec:
+    """Setup Docker sandbox configuration to use vibetest's Dockerfile.
+
+    Returns:
+        SandboxEnvironmentSpec configured to use vibetest's Dockerfile,
+        or string path to the directory containing the Dockerfile
+    """
+    package_root = get_package_root()
+    dockerfile_path = package_root / "Dockerfile"
+
+    if not dockerfile_path.exists():
+        raise FileNotFoundError(
+            f"Dockerfile not found at {dockerfile_path}. "
+            "Please ensure vibetest is properly installed."
+        )
+
+    # Return the package root directory as the config
+    # Inspect AI will look for Dockerfile in this directory
+    return SandboxEnvironmentSpec(type="docker", config=str(package_root))
 
 
 class VibeTestAgent:
@@ -208,7 +230,8 @@ Repository: /workspace/repos/{test_case.repo_path}"""
 
         Args:
             test_case: Test case to execute
-            sandbox: Sandbox environment type (e.g., "docker")
+            sandbox: Sandbox environment type (e.g., "docker"). If "docker" is specified,
+                    vibetest will automatically use its packaged Dockerfile.
 
         Returns:
             TestResult with verdict and evidence
@@ -220,7 +243,14 @@ Repository: /workspace/repos/{test_case.repo_path}"""
         # Create a mapping from sample ID to test case to maintain order
         # Since samples may be executed in parallel and returned out of order
         id_to_test_case = {}
-        
+
+        # Setup sandbox configuration
+        sandbox_config = None
+        if sandbox == "docker":
+            sandbox_config = setup_docker_sandbox()
+        elif sandbox is not None:
+            sandbox_config = sandbox
+
         # Create Inspect task with a scorer
         # The scorer is required when using submit() tool in react() agent
         # We use includes() to accept any submission that contains "VERDICT"
@@ -229,17 +259,16 @@ Repository: /workspace/repos/{test_case.repo_path}"""
             sample_id = f"{Path(test_case.repo_path).name}_{idx}"
             id_to_test_case[sample_id] = test_case
             samples.append(Sample(
-                input=self._create_prompt(test_case), 
-                target="VERDICT", 
+                input=self._create_prompt(test_case),
                 id=sample_id,
                 files=get_files(test_case)
             ))
-        
+
         task = Task(
             dataset=samples,
             solver=self._create_solver(),
             scorer=save_evidence_tar(f"./evidence-dumps/{self.model_name.split('/')[1]}"), #includes(),  # Accept any answer containing the target
-            sandbox=sandbox,
+            sandbox=sandbox_config,
         )
 
         # Run evaluation
