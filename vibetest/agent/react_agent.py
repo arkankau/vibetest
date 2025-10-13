@@ -80,15 +80,30 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/repos/") -> dict[s
     return files
 
 
+def cleanup_docker_sandbox() -> None:
+    """Clean up temporary Docker configuration files."""
+    temp_dir = Path.cwd() / ".vibetest_tmp"
+    if temp_dir.exists():
+        import shutil
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass  # Best effort cleanup
+
+
 def setup_docker_sandbox() -> str | SandboxEnvironmentSpec:
-    """Setup Docker sandbox configuration to use vibetest's Dockerfile.
+    """Setup Docker sandbox configuration to use vibetest's Dockerfile and compose.yaml.
 
     Returns:
-        SandboxEnvironmentSpec configured to use vibetest's Dockerfile,
-        or string path to the directory containing the Dockerfile
+        SandboxEnvironmentSpec configured to use vibetest's Docker configuration.
+        Creates a temporary compose.yaml in the current directory with correct paths.
     """
+    import tempfile
+    import yaml
+
     package_root = get_package_root()
     dockerfile_path = package_root / "Dockerfile"
+    source_compose_path = package_root / "compose.yaml"
 
     if not dockerfile_path.exists():
         raise FileNotFoundError(
@@ -96,9 +111,62 @@ def setup_docker_sandbox() -> str | SandboxEnvironmentSpec:
             "Please ensure vibetest is properly installed."
         )
 
-    # Return the package root directory as the config
-    # Inspect AI will look for Dockerfile in this directory
-    return SandboxEnvironmentSpec(type="docker", config=str(package_root))
+    # Create a temporary compose.yaml in the current directory with correct build context
+    # Inspect AI will look for compose.yaml in the config directory
+    temp_dir = Path.cwd() / ".vibetest_tmp"
+    temp_dir.mkdir(exist_ok=True)
+    temp_compose_path = temp_dir / "compose.yaml"
+
+    # Read the source compose.yaml and update the build context
+    if source_compose_path.exists():
+        with open(source_compose_path, 'r') as f:
+            compose_config = yaml.safe_load(f)
+
+        # Update build context to point to package root
+        if 'services' in compose_config and 'default' in compose_config['services']:
+            if isinstance(compose_config['services']['default'].get('build'), dict):
+                compose_config['services']['default']['build']['context'] = str(package_root)
+                compose_config['services']['default']['build']['dockerfile'] = "Dockerfile"
+            elif compose_config['services']['default'].get('build') == '.':
+                compose_config['services']['default']['build'] = {
+                    'context': str(package_root),
+                    'dockerfile': 'Dockerfile'
+                }
+
+        # Write temporary compose.yaml
+        with open(temp_compose_path, 'w') as f:
+            yaml.dump(compose_config, f)
+    else:
+        # Create a basic compose.yaml if source doesn't exist
+        compose_config = {
+            'services': {
+                'default': {
+                    'build': {
+                        'context': str(package_root),
+                        'dockerfile': 'Dockerfile'
+                    },
+                    'init': True,
+                    'command': 'tail -f /dev/null',
+                    'deploy': {
+                        'resources': {
+                            'reservations': {
+                                'devices': [{
+                                    'driver': 'nvidia',
+                                    'count': 1,
+                                    'capabilities': ['gpu']
+                                }]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        with open(temp_compose_path, 'w') as f:
+            yaml.dump(compose_config, f)
+
+    # Return the path to the temporary compose.yaml file
+    # Inspect AI expects the file path, not the directory
+    return SandboxEnvironmentSpec(type="docker", config=str(temp_compose_path))
 
 
 class VibeTestAgent:
@@ -272,16 +340,21 @@ Repository: /workspace/repos/{test_case.repo_path}"""
         )
 
         # Run evaluation
-        results = eval(
-            tasks=task,
-            model=self.model_name,
-            log_dir="./logs",  # Must be string, not Path
-            retry_on_error=2,
-            fail_on_error=False,
-        )
+        try:
+            results = eval(
+                tasks=task,
+                model=self.model_name,
+                log_dir="./logs",  # Must be string, not Path
+                retry_on_error=2,
+                fail_on_error=False,
+            )
 
-        # Parse results
-        return self._parse_results(results, id_to_test_case)
+            # Parse results
+            return self._parse_results(results, id_to_test_case)
+        finally:
+            # Clean up temporary Docker configuration
+            if sandbox == "docker":
+                cleanup_docker_sandbox()
 
     def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
         """Parse Inspect AI results into TestResults.
