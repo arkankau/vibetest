@@ -72,6 +72,8 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/repos/") -> dict[s
     repo_path = test_case.repo_path
     if repo_path and os.path.isdir(repo_path):
         for root, _, filenames in os.walk(repo_path):
+            if ".venv" in root or "__pycache__" in root:
+                continue  # Skip virtual environments and cache directories
             for filename in filenames:
                 full_path = os.path.join(root, filename)
                 relative_path = os.path.relpath(full_path, repo_path)
