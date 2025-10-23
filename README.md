@@ -8,12 +8,9 @@ Vibetest uses a ReAct agent (powered by Inspect AI) to understand, execute, and 
 
 ## Features
 
-- **Natural language test cases**: Express tests like "training loss is logged every K steps and generally decreases"
-- **ReAct agent**: Iterative reasoning and action using Inspect AI
+- **Natural language test cases**: Express tests like "training loss generally decreases for any trained model"
 - **Docker sandboxing**: Safe execution in isolated containers
 - **Evidence collection**: Automatic gathering of plots, logs, metrics, and code snippets
-- **Extensible architecture**: Easy to add custom test cases and tools
-- **Built for ML**: Pre-built test cases for common ML validation scenarios
 
 ## Installation
 
@@ -26,9 +23,6 @@ uv sync
 # Set up environment variables
 cp .env.example .env
 # Edit .env and add your API keys (ANTHROPIC_API_KEY or OPENAI_API_KEY)
-
-# Build Docker image for sandboxed execution
-docker build -t vibetest .
 ```
 
 ## Quick Start
@@ -45,7 +39,7 @@ vibetest --test "Training loss decreases during training"
 # Test a specific repository
 vibetest --repo /path/to/repo --test "Model saves checkpoints every epoch"
 
-# Run without Docker sandbox (for testing)
+# Run without Docker sandbox (for testing, but not usually advised)
 vibetest --test "Hyperparameters are logged" --no-sandbox
 ```
 
@@ -128,10 +122,6 @@ vibetest/
     ml_tests.py    # ML-specific test cases
   tools/           # Tools available to the agent
     file_tools.py      # File system operations
-    exec_tools.py      # Code execution
-    analysis_tools.py  # Plotting and analysis
-  evidence/        # Evidence collection system
-    collector.py
   cli.py           # Command-line interface
 ```
 
@@ -142,37 +132,22 @@ Configure via `.env` file or environment variables:
 ### API Keys (at least one required)
 - `ANTHROPIC_API_KEY`: API key for Claude models
 - `OPENAI_API_KEY`: API key for OpenAI models
+- `GOOGLE_API_KEY`: API key for Google models
 
 ### Model Configuration
 - `VIBETEST_MODEL`: Model to use (default: `anthropic/claude-3-5-sonnet-20241022`)
   - Anthropic: `anthropic/claude-3-5-sonnet-20241022`, `anthropic/claude-3-opus-20240229`
   - OpenAI: `openai/gpt-4`, `openai/gpt-4-turbo-preview`, `openai/gpt-3.5-turbo`
+  - Google: `gemini-2.0-flash-lite` ,`gemini-2.5-flash-lite`, `gemini-2.5-flash`, `gemini-2.5-pro`
 
 ### Storage
 - `VIBETEST_EVIDENCE_DIR`: Directory for evidence storage (default: `./evidence`)
 - `VIBETEST_LOG_DIR`: Directory for logs (default: `./logs`)
 
-## Docker Sandbox
-
-The Docker sandbox provides isolation for safe code execution:
-
-```dockerfile
-# Build the image
-docker build -t vibetest .
-
-# Run tests in sandbox
-docker run --rm \
-  -v /path/to/repo:/workspace/repos/target \
-  -v /path/to/output:/workspace/evidence \
-  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-  vibetest
-```
-
 ## Examples
 
 See the `examples/` directory for:
 - `simple_example.py`: Basic usage
-- `custom_test.py`: Creating custom test cases
 
 ## Development
 

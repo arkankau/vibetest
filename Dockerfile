@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     build-essential \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install basic ML requirements
@@ -19,6 +20,9 @@ RUN pip install --no-cache-dir \
     scipy \
     plotly \
     ipywidgets
+
+# install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Set working directory
 WORKDIR /workspace
@@ -37,7 +41,7 @@ WORKDIR /workspace
 
 # COPY example_ml_repo /workspace/repos/example_ml_repo
 # COPY abdallahashour7 /workspace/repos/example_ml_repo
-COPY titanic /kaggle/input/titanic
+# COPY titanic /kaggle/input/titanic
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

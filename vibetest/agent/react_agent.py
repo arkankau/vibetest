@@ -7,7 +7,7 @@ from inspect_ai import Task, eval
 from inspect_ai.agent import react
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import includes, scorer, Score
-from inspect_ai.tool import Tool, bash_session, python, text_editor
+from inspect_ai.tool import Tool, bash_session, python, text_editor, bash, web_search
 from inspect_ai.util import sandbox, SandboxEnvironmentSpec
 from inspect_ai.scorer import Target, accuracy
 from inspect_ai.solver import TaskState
@@ -15,15 +15,6 @@ from inspect_ai.solver import TaskState
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.config import get_package_root
 
-# from vibetest.tools import (
-#     read_file,
-#     list_directory,
-#     find_files,
-#     run_python,
-#     run_command,
-#     create_plot,
-#     parse_logs,
-# )
 
 @scorer(metrics=[accuracy()])
 def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to_save="/evidence"):
@@ -187,7 +178,7 @@ class VibeTestAgent:
 
     def __init__(
         self,
-        model: str = "openai/gpt-5-mini",
+        model=None,
         max_attempts: int = 20,
         additional_tools: list[Tool] | None = None,
     ):
@@ -214,16 +205,11 @@ class VibeTestAgent:
             List of all tools
         """
         base_tools = [
-            bash_session(),
+            # bash_session(),
+            bash(),
             python(),
             text_editor(),
-            # read_file,
-            # list_directory,
-            # find_files,
-            # run_python,
-            # run_command,
-            # create_plot,
-            # parse_logs,
+            web_search(),
         ]
 
         if additional_tools:
@@ -259,7 +245,9 @@ Determine whether the repository PASSes or FAILs the specified test case, and pr
 1. Evaluate, don't rewrite. Avoid substantial new code. Prefer instrumentation (logging, flags, CLI args, small patches ≤ ~50 lines total). Record all edits as diffs.
 2. Evidence over opinion. Prefer runtime traces, logs, metrics, file hashes, config snapshots, git SHAs, and small data extracts.
 3. Data availability. Check for required datasets locally (e.g., /kaggle, mounted volumes) before downloading. If data is missing, look for directions for downloading it.
-4. Determinism where possible. Capture python -V, CUDA/cuDNN, pip freeze/conda list, git rev-parse HEAD, and relevant seeds.
+4. Environment setup. Set up an environment (uv is installed) and install any necessary dependencies.
+5. Determinism where possible. Capture python -V, CUDA/cuDNN, pip freeze/conda list, git rev-parse HEAD, and relevant seeds.
+6. Use default parameters. Run code with default settings unless the test case requires otherwise.
 
 # PASS/FAIL Rubric
 - PASS: You found direct evidence satisfying the TEST_CASE in the target repo (e.g., successful run producing expected metrics/logs/behaviors) without violating the rules above.
@@ -275,12 +263,12 @@ Determine whether the repository PASSes or FAILs the specified test case, and pr
 - Locate data locally before downloading.
 
 ## Phase 2 — Setup
-- Create isolated environment and install dependencies.  
+- Create isolated environment and install dependencies. Make sure to use the correct python version which can be configured with uv or conda. (uv is pre-installed)
 - Convert notebooks via `jupyter nbconvert --to script`.  
 - Apply minimal patches if necessary.
 
 ## Phase 3 — Execute & Instrument
-- Run the **minimal** reproducible command(s) to demonstrate or refute the property.  
+- Run the **minimal** reproducible command(s) to demonstrate or refute the property. Do not change default hyperparameters such as epochs, batch size, or learning rate unless the test case explicitly requires it.
 - Capture logs, metrics, and outputs in `/evidence/artifacts/`.
 
 ## Phase 4 — Corroborate

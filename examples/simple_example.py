@@ -8,7 +8,7 @@ from vibetest import TestCase, VibeTestAgent
 def main():
     """Run a simple test example."""
     # Path to the repository you want to test
-    repo_path = Path("./data/kaggle/abdallahashour7")
+    repo_path = Path("./examples/example_ml_repo")
 
     test1 = TestCase(
         description="Training loss generally decreases during training (if no loss is logged, then add logging to check this)",
