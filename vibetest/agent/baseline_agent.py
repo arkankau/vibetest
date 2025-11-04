@@ -32,6 +32,7 @@ class BaselineAgent:
         model: str = "openai/gpt-5-mini",
         max_attempts: int = 20,
         additional_tools: list[Tool] | None = None,
+        static: bool = False,
     ):
         """Initialize the baseline agent.
 
@@ -44,6 +45,7 @@ class BaselineAgent:
             "VIBETEST_MODEL", "openai/gpt-5-mini"
         )
         self.max_attempts = max_attempts
+        self.static = static
         self.tools = self._setup_tools(additional_tools)
 
     def _setup_tools(self, additional_tools: list[Tool] | None = None) -> list[Tool]:
@@ -55,11 +57,14 @@ class BaselineAgent:
         Returns:
             List of all tools
         """
-        base_tools = [
-            bash_session(),
-            python(),
-            text_editor(),
-        ]
+        if self.static:
+            base_tools = [bash_session(), text_editor()]
+        else:
+            base_tools = [
+                bash_session(),
+                python(),
+                text_editor(),
+            ]
 
         if additional_tools:
             base_tools.extend(additional_tools)
@@ -74,9 +79,10 @@ class BaselineAgent:
         Returns:
             Solver configured with ReAct pattern
         """
-        instructions = """You are an agent that examines repositories to determine if there are any bugs.
+        instructions = f"""You are an agent that examines repositories to determine if there are any bugs.
 
-Carefully analyze the code and use the available tools to explore and verify your findings. For example, you might run code snippets, inspect files, or modify code to test hypotheses.
+Carefully analyze the code and use the available tools to explore and verify your findings.
+{'For example, you might run code snippets, inspect files, or modify code to test hypotheses.' if not self.static else 'You cannot run code, but you should carefully examine relevant code.'}
 When you have completed your examination, call the submit() tool with your findings in this format:
 
 VERDICT: [BUGS FOUND/NO BUGS FOUND]

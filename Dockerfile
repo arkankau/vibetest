@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
     unzip \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install basic ML requirements

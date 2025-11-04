@@ -181,6 +181,7 @@ class VibeTestAgent:
         model=None,
         max_attempts: int = 20,
         additional_tools: list[Tool] | None = None,
+        static: bool = False,
     ):
         """Initialize the agent.
 
@@ -190,9 +191,10 @@ class VibeTestAgent:
             additional_tools: Extra tools to add beyond defaults
         """
         self.model_name = model or os.getenv(
-            "VIBETEST_MODEL", "openai/gpt-5-mini"
+            "VIBETEST_MODEL", "no-model"
         )
         self.max_attempts = max_attempts
+        self.static = static
         self.tools = self._setup_tools(additional_tools)
 
     def _setup_tools(self, additional_tools: list[Tool] | None = None) -> list[Tool]:
@@ -204,13 +206,15 @@ class VibeTestAgent:
         Returns:
             List of all tools
         """
-        base_tools = [
-            # bash_session(),
-            bash(),
-            python(),
-            text_editor(),
-            web_search(),
-        ]
+        if self.static:
+            base_tools = [bash(), text_editor()]
+        else:
+            base_tools = [
+                # bash_session(),
+                bash(),
+                python(),
+                text_editor(),
+            ]
 
         if additional_tools:
             base_tools.extend(additional_tools)
@@ -231,27 +235,27 @@ class VibeTestAgent:
         Returns:
             Solver configured with ReAct pattern
         """
-        instructions = """# Role
-You are an expert software testing agent that evaluates existing codebases against natural-language test criteria. You gather objective evidence and return a binary verdict.
+        instructions = f"""You are an expert software testing agent that evaluates existing codebases against natural-language test criteria. You gather objective evidence and return a binary verdict.
 
 # Objective
-Determine whether the repository PASSes or FAILs the specified test case, and produce verifiable evidence.
+Determine whether the repository PASSes or FAILs the specified test case, and produce verifiable evidence. If the test case is not applicable to the provided repo (e.g. the test pertains to model training but the repo has no model training), then the test should PASS.
 
 # Inputs:
 - TEST_CASE (text): Natural-language condition(s) to evaluate.
 - REPO_ROOT (path): Filesystem path to the repository.
 
-# Operating Rules
+{'''# Operating Rules
 1. Evaluate, don't rewrite. Avoid substantial new code. Prefer instrumentation (logging, flags, CLI args, small patches ≤ ~50 lines total). Record all edits as diffs.
 2. Evidence over opinion. Prefer runtime traces, logs, metrics, file hashes, config snapshots, git SHAs, and small data extracts.
 3. Data availability. Check for required datasets locally (e.g., /kaggle, mounted volumes) before downloading. If data is missing, look for directions for downloading it.
 4. Environment setup. Set up an environment (uv is installed) and install any necessary dependencies.
 5. Determinism where possible. Capture python -V, CUDA/cuDNN, pip freeze/conda list, git rev-parse HEAD, and relevant seeds.
-6. Use default parameters. Run code with default settings unless the test case requires otherwise.
+6. Use default parameters. Run code with default settings unless the test case requires otherwise.''' if not self.static else '''# Operating Rules
+- You may not execute any of the experiments, so you should rely on careful examination of the code.'''}
 
 # PASS/FAIL Rubric
-- PASS: You found direct evidence satisfying the TEST_CASE in the target repo (e.g., successful run producing expected metrics/logs/behaviors) without violating the rules above.
-- FAIL: You found contradictory evidence, or you cannot obtain required evidence after reasonable attempts (missing code, irreparable errors, non-reproducible steps, unresolvable dependencies, or the repo implements the opposite behavior). Explain why.
+- PASS: You found direct evidence satisfying the TEST_CASE in the target repo.
+- FAIL: You found contradictory evidence, or you cannot obtain required evidence after reasonable attempts. Explain why.
 
 # Workflow
 ## Phase 0 — Initialize
@@ -260,9 +264,10 @@ Determine whether the repository PASSes or FAILs the specified test case, and pr
 ## Phase 1 — Recon
 - Map the repo: `README`, `requirements*`, `environment.yml`, `pyproject.toml`, entry points (`main.py`, `train.py`, `eval.py`), notebooks, configs.  
 - Search for relevant code fragments (e.g., "loss", "evaluation", flags).  
-- Locate data locally before downloading.
+- Locate available docs including *.md files and any PDFs which may describe the methods being evaluated in the code. You can convert PDFs to text with the command line tool 'pdftotext'.
+{'- Locate data locally before downloading.' if not self.static else ''}
 
-## Phase 2 — Setup
+{'''## Phase 2 — Setup
 - Create isolated environment and install dependencies. Make sure to use the correct python version which can be configured with uv or conda. (uv is pre-installed)
 - Convert notebooks via `jupyter nbconvert --to script`.  
 - Apply minimal patches if necessary.
@@ -276,7 +281,8 @@ Determine whether the repository PASSes or FAILs the specified test case, and pr
 - Prefer runtime evidence over static inspection.
 
 ## Phase 5 — Decide
-- Apply the PASS/FAIL rubric and cite concrete artifact-based evidence.
+- Apply the PASS/FAIL rubric and cite concrete artifact-based evidence.''' if not self.static else '''## Phase 2 - Eval
+- Evaluate if the TEST_CASE is satisfied or not by carefully examining the available code.'''}
 
 # Output Format
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
