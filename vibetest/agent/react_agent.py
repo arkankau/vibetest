@@ -63,9 +63,11 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/repos/") -> dict[s
     repo_path = test_case.repo_path
     if repo_path and os.path.isdir(repo_path):
         for root, _, filenames in os.walk(repo_path):
-            if ".venv" in root or "__pycache__" in root:
+            if ".venv" in root or "__pycache__" in root or ".git" in root:
                 continue  # Skip virtual environments and cache directories
             for filename in filenames:
+                if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename:
+                    continue # TODO: we shouldn't in general exclude all non python and non md/txt/pdf files.
                 full_path = os.path.join(root, filename)
                 relative_path = os.path.relpath(full_path, repo_path)
                 sandbox_path = os.path.join(sandbox_prefix, repo_path, relative_path)
@@ -207,7 +209,7 @@ class VibeTestAgent:
             List of all tools
         """
         if self.static:
-            base_tools = [bash(), text_editor()]
+            base_tools = [bash(timeout=120), text_editor()]
         else:
             base_tools = [
                 # bash_session(),
@@ -238,7 +240,7 @@ class VibeTestAgent:
         instructions = f"""You are an expert software testing agent that evaluates existing codebases against natural-language test criteria. You gather objective evidence and return a binary verdict.
 
 # Objective
-Determine whether the repository PASSes or FAILs the specified test case, and produce verifiable evidence. If the test case is not applicable to the provided repo (e.g. the test pertains to model training but the repo has no model training), then the test should PASS.
+Determine whether the repository PASSes or FAILs the specified test case (or if the test is NOT APPLICABLE or the analysis is INCONCLUSIVE), and produce verifiable evidence. If the test case is not applicable to the provided repo (e.g. the test pertains to model training but the repo has no model training), then the test should be marked as NOT APPLICABLE. If additional information (e.g. run logs, extra data, or the ability to execute the code) is necessary to determine if the test PASSes or FAILs, then mark the test as INCONCLUSIVE and describe exactly what additional information is needed.
 
 # Inputs:
 - TEST_CASE (text): Natural-language condition(s) to evaluate.
@@ -253,9 +255,11 @@ Determine whether the repository PASSes or FAILs the specified test case, and pr
 6. Use default parameters. Run code with default settings unless the test case requires otherwise.''' if not self.static else '''# Operating Rules
 - You may not execute any of the experiments, so you should rely on careful examination of the code.'''}
 
-# PASS/FAIL Rubric
+# PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE Rubric
 - PASS: You found direct evidence satisfying the TEST_CASE in the target repo.
-- FAIL: You found contradictory evidence, or you cannot obtain required evidence after reasonable attempts. Explain why.
+- FAIL: You found contradictory evidence
+- INCONCLUSIVE: You cannot obtain the required evidence to determine if the test PASSes or FAILs after reasonable attempts. Explain why and what additional information is needed.
+- NOT APPLICABLE: The test case is not applicable to the code.
 
 # Workflow
 ## Phase 0 — Initialize
@@ -281,13 +285,13 @@ Determine whether the repository PASSes or FAILs the specified test case, and pr
 - Prefer runtime evidence over static inspection.
 
 ## Phase 5 — Decide
-- Apply the PASS/FAIL rubric and cite concrete artifact-based evidence.''' if not self.static else '''## Phase 2 - Eval
-- Evaluate if the TEST_CASE is satisfied or not by carefully examining the available code.'''}
+- Apply the PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE rubric and cite concrete artifact-based evidence.''' if not self.static else '''## Phase 2 - Eval
+- Evaluate the TEST_CASE by carefully examining the available code.'''}
 
 # Output Format
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
 
-VERDICT: [PASS/FAIL]
+VERDICT: [PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE]
 REASON: [Brief explanation of why]
 EVIDENCE: [Description of evidence collected]
 

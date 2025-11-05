@@ -58,7 +58,7 @@ class BaselineAgent:
             List of all tools
         """
         if self.static:
-            base_tools = [bash_session(), text_editor()]
+            base_tools = [bash_session(timeout=120), text_editor()]
         else:
             base_tools = [
                 bash_session(),
@@ -79,13 +79,14 @@ class BaselineAgent:
         Returns:
             Solver configured with ReAct pattern
         """
-        instructions = f"""You are an agent that examines repositories to determine if there are any bugs.
+        instructions = f"""You are a code review agent that examines repositories to determine if there are any bugs affecting the code's correctness.
 
 Carefully analyze the code and use the available tools to explore and verify your findings.
 {'For example, you might run code snippets, inspect files, or modify code to test hypotheses.' if not self.static else 'You cannot run code, but you should carefully examine relevant code.'}
+After examining the code, make a final verdict based on if any bugs were found. The verdict should be PASS if there are no bugs impacting correctness, FAIL if there is at least one bug impacting code correctness, or INCONCLUSIVE if additional information is required to conclusively determine the code's correctness.
 When you have completed your examination, call the submit() tool with your findings in this format:
 
-VERDICT: [BUGS FOUND/NO BUGS FOUND]
+VERDICT: [PASS/FAIL/INCONCLUSIVE]
 EXPLANATION: [Your explanation of what you found]"""
 
         # Create the ReAct agent with built-in submit() tool
