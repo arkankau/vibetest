@@ -10,15 +10,23 @@ from vibetest.agent import BaselineAgent
 
 def get_tests():
     tests = [
-        "Training loss generally decreases during training and plateaus within the number of epochs used (if no loss is logged, then add logging to check this).",
-        "The model can overfit a single (or tiny) batch to near-zero loss.",
-        "Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.",
+        # Hard requirements
         "No leakage from test to train/val. If there is any model selection or hyperparameter tuning, then it uses val only.",
-        "Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining. If no seed is set, then add a seed to check this.",
         "All model parameters are updated during training (no frozen layers unless explicitly intended).",
-        "No model parameters or gradients are NaN or Inf during training.",
+        "The data is loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).",
+        "Augmentations only performed on training dataset; val/test dataset use deterministic preprocessing.",
+        "Any class-imbalance handling (weighted loss / sampler) applies only to training.",
+        # "No path/filename text is fed as a feature unless explicitly intended.",
+        "Reported metrics use the correct split(s) and the exact definitions claimed (e.g., micro vs macro, top-k).",
+        "Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.",
         "The model after the full training procedure outperforms a simple baseline (e.g., random or majority class) on the evaluation set.",
-        "Visualizing the input to the model (i.e. the x in `y_hat = model(x)`) shows that the data is being loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).",
+        "The model can overfit a single (or tiny) batch to near-zero loss.",
+        "Training loss generally decreases during training and plateaus within the number of epochs used (if no loss is logged, then add logging to check this).",
+        # Recommended
+        "Training dataloader shuffles or training dataset is shuffled for training; val/test do not shuffle.",
+        "Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining.",
+        "Model and inputs are consistently moved to one device; no implicit CPU<->GPU transfers; dtype policy (e.g., fp32/bf16) is applied consistently.",
+        # "Code does not include any secrets (API keys, passwords, etc.)."
     ]
     return tests
 
@@ -37,16 +45,18 @@ def run_baseline():
     repo_paths = []
     
     total_repos = 0
-    for repo_path in Path("./data/kaggle").iterdir():
+    for repo_path in Path("./data/kaggle/kaggle-titanic").iterdir():
         if total_repos >= 50:
             break
 
         if repo_path.is_dir():
+            # the code repo is the only directory inside each repo_path
+            code_repo_path = next(repo_path.iterdir())
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             
             # Create ONE test case per repo (baseline doesn't use test descriptions)
-            all_test_cases.append(TestCase(description="", repo_path=repo_path))
+            all_test_cases.append(TestCase(description="", repo_path=code_repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input/titanic"}))
             
             total_repos += 1
     
@@ -109,17 +119,18 @@ def run_vibetest():
     tests_per_repo = len(test_strs)
     
     total_repos = 0
-    for repo_path in Path("./data/kaggle").iterdir():
+    for repo_path in Path("./data/kaggle/kaggle-titanic").iterdir():
         if total_repos >= 50:
             break
 
         if repo_path.is_dir():
+            code_repo_path = next(repo_path.iterdir())
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             
             # Create test cases for this repo
             for desc in test_strs:
-                all_test_cases.append(TestCase(description=desc, repo_path=repo_path))
+                all_test_cases.append(TestCase(description=desc, repo_path=code_repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input"}))
             
             total_repos += 1
     
@@ -156,9 +167,13 @@ def run_vibetest():
             repo_total = len(repo_results)
             
             for r in repo_results:
-                if r.passed:
+                if "PASS" in r.message:
                     repo_passed += 1
                     status = "✓ PASSED"
+                elif "INCONCLUSIVE" in r.message:
+                    status = "⚠ INCONCLUSIVE"
+                elif "NOT APPLICABLE" in r.message:
+                    status = "ℹ NOT APPLICABLE"
                 else:
                     status = "✗ FAILED"
                 

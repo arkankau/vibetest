@@ -39,6 +39,13 @@ class TestCase(BaseModel):
 
     description: str = Field(..., description="Natural language description of what to test")
     repo_path: Path = Field(..., description="Path to the repository to test")
+    sandbox_path: str = Field(
+        default="/workspace", description="Path inside the sandbox where the repo will be placed"
+    )
+    # key is the path to the additional data file/directory and the value is the path to be used inside the sandbox
+    additional_data: dict[str, str] = Field(
+        default_factory=dict, description="Additional data files to include in the sandbox"
+    )
     metadata: dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the test")
 
     class Config:

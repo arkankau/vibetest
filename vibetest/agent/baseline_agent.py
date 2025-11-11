@@ -109,7 +109,7 @@ EXPLANATION: [Your explanation of what you found]"""
             Formatted prompt string - simply the repo name with the query
         """
         prompt = f"""Examine the repository and determine if there are any bugs.
-Repository: /workspace/repos/{test_case.repo_path}"""
+Repository: /workspace"""
         return prompt
 
     def execute_tests(

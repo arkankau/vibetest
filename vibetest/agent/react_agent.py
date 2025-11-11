@@ -52,7 +52,7 @@ def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to
     return _score
 
 
-def get_files(test_case: TestCase, sandbox_prefix="/workspace/repos/") -> dict[str, str]:
+def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, str]:
     """Get files from the test case repository.
 
     Args:
@@ -66,12 +66,25 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/repos/") -> dict[s
             if ".venv" in root or "__pycache__" in root or ".git" in root:
                 continue  # Skip virtual environments and cache directories
             for filename in filenames:
-                if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename:
-                    continue # TODO: we shouldn't in general exclude all non python and non md/txt/pdf files.
+                if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename and ".ipynb" not in filename:
+                    continue # TODO: we shouldn't in general exclude all non python and non md/txt/pdf/ipynb files.
                 full_path = os.path.join(root, filename)
                 relative_path = os.path.relpath(full_path, repo_path)
-                sandbox_path = os.path.join(sandbox_prefix, repo_path, relative_path)
+                sandbox_path = os.path.join(sandbox_prefix, repo_path.name, relative_path)
                 files[sandbox_path] = full_path
+
+    for additional_src, additional_dst in test_case.additional_data.items():
+        additional_src_path = Path(additional_src)
+        if additional_src_path.is_file():
+            files[additional_dst] = str(additional_src_path)
+        elif additional_src_path.is_dir():
+            for root, _, filenames in os.walk(additional_src_path):
+                for filename in filenames:
+                    full_path = os.path.join(root, filename)
+                    relative_path = os.path.relpath(full_path, additional_src_path)
+                    sandbox_path = os.path.join(additional_dst, additional_src_path.name, relative_path)
+                    files[sandbox_path] = full_path
+    print("Files:", files)
     return files
 
 
@@ -213,8 +226,8 @@ class VibeTestAgent:
         else:
             base_tools = [
                 # bash_session(),
-                bash(),
-                python(),
+                bash(timeout=240),
+                python(timeout=240),
                 text_editor(),
             ]
 
@@ -247,7 +260,7 @@ Determine whether the repository PASSes or FAILs the specified test case (or if 
 - REPO_ROOT (path): Filesystem path to the repository.
 
 {'''# Operating Rules
-1. Evaluate, don't rewrite. Avoid substantial new code. Prefer instrumentation (logging, flags, CLI args, small patches ≤ ~50 lines total). Record all edits as diffs.
+1. Evaluate, don't rewrite. Avoid writing substantial new code and instead try to instrument existing code (adding logging, commenting parts out, adding asserts, etc.). Prefer instrumentation (logging, flags, CLI args, small patches). Record all edits as diffs.
 2. Evidence over opinion. Prefer runtime traces, logs, metrics, file hashes, config snapshots, git SHAs, and small data extracts.
 3. Data availability. Check for required datasets locally (e.g., /kaggle, mounted volumes) before downloading. If data is missing, look for directions for downloading it.
 4. Environment setup. Set up an environment (uv is installed) and install any necessary dependencies.
@@ -257,7 +270,7 @@ Determine whether the repository PASSes or FAILs the specified test case (or if 
 
 # PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE Rubric
 - PASS: You found direct evidence satisfying the TEST_CASE in the target repo.
-- FAIL: You found contradictory evidence
+- FAIL: You found evidence refuting the TEST_CASE in the target repo.
 - INCONCLUSIVE: You cannot obtain the required evidence to determine if the test PASSes or FAILs after reasonable attempts. Explain why and what additional information is needed.
 - NOT APPLICABLE: The test case is not applicable to the code.
 
@@ -269,7 +282,7 @@ Determine whether the repository PASSes or FAILs the specified test case (or if 
 - Map the repo: `README`, `requirements*`, `environment.yml`, `pyproject.toml`, entry points (`main.py`, `train.py`, `eval.py`), notebooks, configs.  
 - Search for relevant code fragments (e.g., "loss", "evaluation", flags).  
 - Locate available docs including *.md files and any PDFs which may describe the methods being evaluated in the code. You can convert PDFs to text with the command line tool 'pdftotext'.
-{'- Locate data locally before downloading.' if not self.static else ''}
+{'- Assume data is available in the environment, but if it is not found, then try to download it.' if not self.static else ''}
 
 {'''## Phase 2 — Setup
 - Create isolated environment and install dependencies. Make sure to use the correct python version which can be configured with uv or conda. (uv is pre-installed)
@@ -293,7 +306,9 @@ When you have enough evidence to make a determination, call the submit() tool wi
 
 VERDICT: [PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE]
 REASON: [Brief explanation of why]
-EVIDENCE: [Description of evidence collected]
+EVIDENCE: [Description of evidence collected. If referencing specific files, then cite the path and line number range using the format [/path/to/file.py:10-25] and be sure to use square brackets to denote the file citation. When citing any files which were created (they did not exist in the repo before), then you must cite a path under /evidence/artifacts/ (so first store the file there and then cite it), but try to prefer existing files in the repo.]
+
+Be sure that all evidence you cite in the EVIDENCE section either exists in the original repo or was saved under /evidence/artifacts/ and is referred to using a path starting with /evidence/artifacts/.
 
 Remember: You MUST use the submit() tool to report your final answer."""
 
@@ -319,7 +334,7 @@ Remember: You MUST use the submit() tool to report your final answer."""
         """
         prompt = f"""Here is the test case and the repository to evaluate:
 Test: {test_case.description}
-Repository: /workspace/repos/{test_case.repo_path}"""
+Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
         return prompt
 
     def execute_tests(
@@ -360,7 +375,7 @@ Repository: /workspace/repos/{test_case.repo_path}"""
             samples.append(Sample(
                 input=self._create_prompt(test_case),
                 id=sample_id,
-                files=get_files(test_case)
+                files=get_files(test_case, sandbox_prefix=test_case.sandbox_path)
             ))
 
         task = Task(
