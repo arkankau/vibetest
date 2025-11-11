@@ -149,6 +149,16 @@ Configure via `.env` file or environment variables:
 See the `examples/` directory for:
 - `simple_example.py`: Basic usage
 
+## Results Viewer
+
+Need a quick way to inspect recent agent runs? A minimal client lives in `viewer/index.html`:
+
+1. From the repo root run `python -m http.server 8000`.
+2. Open `http://localhost:8000/viewer/` in a browser.
+3. Click a repository on the left, then drill into any test to read the GPT-5 markdown verdict pulled directly from `results/kaggle_results_gpt-5.jsonl`.
+
+The UI is intentionally simple—no build tooling required.
+
 ## Development
 
 ```bash
