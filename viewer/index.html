@@ -198,6 +198,64 @@
         margin-top: 0.5rem;
       }
 
+      .citation-button {
+        border: 1px solid #d0d7e3;
+        background: #fff;
+        border-radius: 999px;
+        padding: 0.1rem 0.55rem;
+        font-size: 0.8rem;
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        cursor: pointer;
+        margin: 0 0.2rem;
+        transition: border-color 120ms ease, background 120ms ease;
+      }
+
+      .citation-button:hover {
+        border-color: #2563eb;
+        background: #eef2ff;
+      }
+
+      .citation-button.loading {
+        opacity: 0.6;
+        cursor: progress;
+      }
+
+      .citation-snippet {
+        border: 1px solid #dbe1ec;
+        border-radius: 10px;
+        background: #f8fafc;
+        margin-top: 0.6rem;
+        padding: 0.75rem;
+        font-size: 0.85rem;
+      }
+
+      .citation-snippet pre {
+        margin: 0.4rem 0 0;
+        background: #0f172a;
+        color: #f8fafc;
+        border-radius: 8px;
+        padding: 0.75rem;
+        overflow-x: auto;
+        font-size: 0.8rem;
+      }
+
+      .citation-snippet code {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .snippet-meta {
+        font-size: 0.75rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #475569;
+      }
+
+      .citation-snippet.error {
+        border-color: #fecaca;
+        background: #fff1f2;
+        color: #b91c1c;
+      }
+
       #empty-state {
         color: #6c7280;
         font-size: 0.9rem;
@@ -245,16 +303,30 @@
         </div>
       </section>
     </main>
-    <footer>Data source: results/kaggle_results_gpt-5.jsonl</footer>
+    <footer>Data source: logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval</footer>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
     <script>
+      const EVAL_DATA_URL = "eval-results.json";
+      const REPO_PATHS_URL = "repo-paths.json";
+
       const repoList = document.getElementById("repo-list");
       const testList = document.getElementById("test-list");
       const emptyState = document.getElementById("empty-state");
       const selectedTestName = document.getElementById("selected-test-name");
       const testSummary = document.getElementById("test-summary");
 
+      const sanitizeOptions = {
+        ADD_TAGS: ["button"],
+        ADD_ATTR: ["data-path", "data-start", "data-end", "data-section", "type"],
+      };
+
+      const citationCache = new Map();
+      const bundleCache = new Map();
+      const textDecoder = new TextDecoder();
+
+      let repoPaths = {};
       let repos = [];
       let selectedRepoIndex = null;
       let selectedTestIndex = null;
@@ -377,7 +449,7 @@
           : "This repository has no recorded tests.";
 
         repo.tests.forEach((test, index) => {
-          const structured = parseDescriptionSections(test.description);
+          const structured = getStructuredSections(test);
           const status = determineStatus(structured, test.passed);
           const button = document.createElement("button");
           button.className = "list-item" + (selectedTestIndex === index ? " active" : "");
@@ -403,7 +475,18 @@
         }
       }
 
-      function renderSummary(structured) {
+      function decorateEvidenceMarkdown(text) {
+        if (!text) {
+          return "";
+        }
+        return text.replace(/\[(\/[^\]:]+):(\d+)(?:-(\d+))?\]/g, (_, refPath, start, end) => {
+          const displayRange = end ? `${start}-${end}` : start;
+          const closing = end ? end : start;
+          return `<button type="button" class="citation-button" data-path="${refPath}" data-start="${start}" data-end="${closing}">[${refPath}:${displayRange}]</button>`;
+        });
+      }
+
+      function renderSummary(structured, repo, test) {
         const segments = [
           { key: "verdict", label: "Verdict" },
           { key: "reason", label: "Reason" },
@@ -421,15 +504,220 @@
         testSummary.hidden = false;
         testSummary.innerHTML = available
           .map((segment) => {
-            const html = DOMPurify.sanitize(marked.parse(structured[segment.key]));
+            const source =
+              segment.key === "evidence"
+                ? decorateEvidenceMarkdown(structured[segment.key])
+                : structured[segment.key];
+            const html = DOMPurify.sanitize(marked.parse(source), sanitizeOptions);
             return `
-              <div class="summary-card">
+              <div class="summary-card" data-section="${segment.key}">
                 <div class="summary-label">${segment.label}</div>
                 <div class="summary-body">${html}</div>
               </div>
             `;
           })
           .join("");
+
+        attachEvidenceInteractions(repo, test);
+      }
+
+      function attachEvidenceInteractions(repo, test) {
+        const evidenceCard = testSummary.querySelector('.summary-card[data-section="evidence"]');
+        if (!evidenceCard) {
+          return;
+        }
+        evidenceCard.querySelectorAll(".citation-button").forEach((button) => {
+          button.addEventListener("click", (event) => handleCitationClick(event, repo, test));
+        });
+      }
+
+      async function handleCitationClick(event, repo, test) {
+        const button = event.currentTarget;
+        if (button._snippetEl && button._snippetEl.isConnected) {
+          button._snippetEl.remove();
+          button._snippetEl = null;
+          button.dataset.open = "false";
+          return;
+        }
+
+        button.classList.add("loading");
+        try {
+          const path = button.dataset.path;
+          const start = Number(button.dataset.start);
+          const end = Number(button.dataset.end);
+          const snippet = await loadCitationSnippet(repo, test, path, start, end);
+          const snippetElement = document.createElement("div");
+          snippetElement.className = "citation-snippet";
+          const rangeLabel = start === end ? `${start}` : `${start}-${end}`;
+          snippetElement.innerHTML = `
+            <div class="snippet-meta">${path}:${rangeLabel}</div>
+            <pre><code>${escapeHTML(snippet)}</code></pre>
+          `;
+          button.insertAdjacentElement("afterend", snippetElement);
+          button._snippetEl = snippetElement;
+          button.dataset.open = "true";
+        } catch (error) {
+          const snippetElement = document.createElement("div");
+          snippetElement.className = "citation-snippet error";
+          snippetElement.textContent = error.message || "Unable to load code snippet.";
+          button.insertAdjacentElement("afterend", snippetElement);
+          button._snippetEl = snippetElement;
+          button.dataset.open = "true";
+        } finally {
+          button.classList.remove("loading");
+        }
+      }
+
+      async function loadCitationSnippet(repo, test, path, start, end) {
+        const cacheKey = `${repo.repo}|${test?.metadata?.sample_id || ""}|${path}|${start}|${end}`;
+        if (citationCache.has(cacheKey)) {
+          return citationCache.get(cacheKey);
+        }
+        const fileContent = await fetchCitationContent(test, path);
+        const snippet = extractSnippet(fileContent, start, end);
+        citationCache.set(cacheKey, snippet);
+        return snippet;
+      }
+
+      async function fetchCitationContent(test, citationPath) {
+        if (citationPath.startsWith("/evidence/")) {
+          return fetchEvidenceContent(test, citationPath);
+        }
+        if (citationPath.startsWith("/kaggle/")) {
+          return fetchKaggleFile(citationPath);
+        }
+        throw new Error(`Unsupported citation path: ${citationPath}`);
+      }
+
+      async function fetchKaggleFile(citationPath) {
+        const normalized = citationPath.replace(/^\/+/, "").replace(/^kaggle\//, "");
+        const [repoFolder, ...rest] = normalized.split("/");
+        if (!repoFolder) {
+          throw new Error("Malformed Kaggle citation path.");
+        }
+        const candidates = repoPaths[repoFolder] || [];
+        if (!candidates.length) {
+          throw new Error(`No local checkout found for ${repoFolder}.`);
+        }
+        let lastError = null;
+        for (const root of candidates) {
+          const candidatePath = rest.length ? `${root}/${rest.join("/")}` : root;
+          try {
+            return await fetchTextAsset(candidatePath);
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error("Unable to load Kaggle file from local checkout.");
+      }
+
+      async function fetchEvidenceContent(test, citationPath) {
+        const bundles = test.evidenceBundles || [];
+        if (!bundles.length) {
+          throw new Error("No evidence archive recorded for this test.");
+        }
+        const normalized = citationPath.replace(/^\/+/, "");
+        for (const bundlePath of bundles) {
+          const files = await loadBundleFiles(bundlePath);
+          if (files.has(normalized)) {
+            return files.get(normalized);
+          }
+        }
+        throw new Error("Citation not found inside evidence archives.");
+      }
+
+      async function loadBundleFiles(bundlePath) {
+        if (bundleCache.has(bundlePath)) {
+          return bundleCache.get(bundlePath);
+        }
+        if (!window.fflate) {
+          throw new Error("Compression utilities are unavailable.");
+        }
+        const response = await fetch(buildAssetURL(bundlePath));
+        if (!response.ok) {
+          throw new Error(`Unable to load ${bundlePath}`);
+        }
+        const buffer = new Uint8Array(await response.arrayBuffer());
+        const decompressed = window.fflate.gunzipSync(buffer);
+        const files = parseTarArchive(decompressed);
+        bundleCache.set(bundlePath, files);
+        return files;
+      }
+
+      async function fetchTextAsset(relativePath) {
+        const response = await fetch(buildAssetURL(relativePath));
+        if (!response.ok) {
+          throw new Error(`Unable to read ${relativePath}`);
+        }
+        return response.text();
+      }
+
+      function buildAssetURL(relativePath) {
+        const encoded = relativePath
+          .split("/")
+          .filter(Boolean)
+          .map((segment) => encodeURIComponent(segment))
+          .join("/");
+        return `../${encoded}`;
+      }
+
+      function parseTarArchive(data) {
+        const files = new Map();
+        const BLOCK = 512;
+        let offset = 0;
+        while (offset + BLOCK <= data.length) {
+          const name = readTarString(data, offset, 100);
+          if (!name) {
+            break;
+          }
+          const sizeOctal = readTarString(data, offset + 124, 12);
+          const size = parseInt(sizeOctal || "0", 8) || 0;
+          offset += BLOCK;
+          const fileBytes = data.subarray(offset, offset + size);
+          files.set(name, textDecoder.decode(fileBytes));
+          offset += Math.ceil(size / BLOCK) * BLOCK;
+        }
+        return files;
+      }
+
+      function readTarString(data, start, length) {
+        let result = "";
+        for (let i = 0; i < length; i += 1) {
+          const code = data[start + i];
+          if (!code) {
+            break;
+          }
+          result += String.fromCharCode(code);
+        }
+        return result.trim();
+      }
+
+      function getStructuredSections(test) {
+        if (test.sections && (test.sections.verdict || test.sections.reason || test.sections.evidence)) {
+          return test.sections;
+        }
+        return parseDescriptionSections(test.description || "");
+      }
+
+      function extractSnippet(content, startLine, endLine) {
+        const lines = content.split(/\r?\n/);
+        const start = Math.max(1, Number.isFinite(startLine) ? startLine : 1);
+        const end = Math.max(start, Number.isFinite(endLine) ? endLine : start);
+        const slice = lines.slice(start - 1, end);
+        if (!slice.length) {
+          throw new Error("Requested line range is empty in this file.");
+        }
+        const digits = String(end).length;
+        return slice
+          .map((line, index) => `${String(start + index).padStart(digits)} | ${line}`)
+          .join("\n");
+      }
+
+      function escapeHTML(value) {
+        return value
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
       }
 
       function renderDetails() {
@@ -437,37 +725,43 @@
           return;
         }
 
-        const test = repos[selectedRepoIndex].tests[selectedTestIndex];
+        const repo = repos[selectedRepoIndex];
+        const test = repo.tests[selectedTestIndex];
         selectedTestName.textContent = formatTestName(test, selectedTestIndex);
-        const structured = parseDescriptionSections(test.description);
-        renderSummary(structured);
+        const structured = getStructuredSections(test);
+        renderSummary(structured, repo, test);
       }
 
       async function loadData() {
         try {
-          const response = await fetch("../results/kaggle_results_gpt-5.jsonl");
+          await loadRepoPaths();
+          const response = await fetch(EVAL_DATA_URL);
           if (!response.ok) {
-            throw new Error(`Failed to load data (${response.status})`);
+            throw new Error(`Failed to load eval data (${response.status}).`);
           }
-          const text = await response.text();
-          repos = text
-            .split("\n")
-            .map((line) => line.trim())
-            .filter(Boolean)
-            .map((line) => {
-              try {
-                return JSON.parse(line);
-              } catch (error) {
-                console.error("Could not parse line:", line, error);
-                return null;
-              }
-            })
-            .filter(Boolean);
+          const payload = await response.json();
+          repos = (payload?.repos || []).map((repo) => ({
+            ...repo,
+            tests: (repo.tests || []).map((test) => ({
+              ...test,
+              sections: test.sections || null,
+            })),
+          }));
           renderRepos();
           renderTests();
         } catch (error) {
           emptyState.textContent = "Unable to load results. Check the console for more details.";
           console.error(error);
+        }
+      }
+
+      async function loadRepoPaths() {
+        try {
+          const response = await fetch(REPO_PATHS_URL);
+          repoPaths = response.ok ? await response.json() : {};
+        } catch (error) {
+          repoPaths = {};
+          console.warn("Failed to load repo path manifest.", error);
         }
       }
 

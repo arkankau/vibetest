@@ -155,7 +155,39 @@ Need a quick way to inspect recent agent runs? A minimal client lives in `viewer
 
 1. From the repo root run `python -m http.server 8000`.
 2. Open `http://localhost:8000/viewer/` in a browser.
-3. Click a repository on the left, then drill into any test to read the GPT-5 markdown verdict pulled directly from `results/kaggle_results_gpt-5.jsonl`.
+3. The UI reads the preprocessed `viewer/eval-results.json`, which is generated from `logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval`, so every repo/test shown is backed directly by the `.eval` trace (including the correct evidence tarballs). Code snippets that reference `/kaggle/...` paths use `viewer/repo-paths.json` to locate the checked-out repo under `data/kaggle/`.
+
+If you sync new logs or repos locally:
+
+1. Rebuild the viewer payload (pulls directly from the `.eval` log):
+
+   ```bash
+   python scripts/build_viewer_data.py \
+       --eval logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval \
+       --output viewer/eval-results.json
+   ```
+
+2. Refresh the repo-path manifest (maps `/kaggle/...` citations to local checkouts):
+
+   ```bash
+   python - <<'PY'
+   import json
+   from pathlib import Path
+
+   root = Path("data/kaggle")
+   repo_map = {}
+   for dataset in root.iterdir():
+       if not dataset.is_dir():
+           continue
+       for owner in dataset.iterdir():
+           if not owner.is_dir():
+               continue
+           for repo_dir in owner.iterdir():
+               if repo_dir.is_dir():
+                   repo_map.setdefault(repo_dir.name, []).append(str(repo_dir))
+   Path("viewer/repo-paths.json").write_text(json.dumps(repo_map, indent=2))
+   PY
+   ```
 
 The UI is intentionally simple—no build tooling required.
 
