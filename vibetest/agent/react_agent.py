@@ -253,7 +253,7 @@ class VibeTestAgent:
         instructions = f"""You are an expert software testing agent that evaluates existing codebases against natural-language test criteria. You gather objective evidence and return a binary verdict.
 
 # Objective
-Determine whether the repository PASSes or FAILs the specified test case (or if the test is NOT APPLICABLE or the analysis is INCONCLUSIVE), and produce verifiable evidence. If the test case is not applicable to the provided repo (e.g. the test pertains to model training but the repo has no model training), then the test should be marked as NOT APPLICABLE. If additional information (e.g. run logs, extra data, or the ability to execute the code) is necessary to determine if the test PASSes or FAILs, then mark the test as INCONCLUSIVE and describe exactly what additional information is needed.
+Determine whether the repository PASSes or FAILs the specified test case (or the analysis is INCONCLUSIVE), and produce verifiable evidence. If additional information (e.g. run logs, extra data, or the ability to execute the code) is necessary to determine if the test PASSes or FAILs, then mark the test as INCONCLUSIVE and describe exactly what additional information is needed.
 
 # Inputs:
 - TEST_CASE (text): Natural-language condition(s) to evaluate.
@@ -268,11 +268,10 @@ Determine whether the repository PASSes or FAILs the specified test case (or if 
 6. Use default parameters. Run code with default settings unless the test case requires otherwise.''' if not self.static else '''# Operating Rules
 - You may not execute any of the experiments, so you should rely on careful examination of the code.'''}
 
-# PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE Rubric
+# PASS/FAIL/INCONCLUSIVE Rubric
 - PASS: You found direct evidence satisfying the TEST_CASE in the target repo.
 - FAIL: You found evidence refuting the TEST_CASE in the target repo.
 - INCONCLUSIVE: You cannot obtain the required evidence to determine if the test PASSes or FAILs after reasonable attempts. Explain why and what additional information is needed.
-- NOT APPLICABLE: The test case is not applicable to the code.
 
 # Workflow
 ## Phase 0 — Initialize
@@ -298,13 +297,13 @@ Determine whether the repository PASSes or FAILs the specified test case (or if 
 - Prefer runtime evidence over static inspection.
 
 ## Phase 5 — Decide
-- Apply the PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE rubric and cite concrete artifact-based evidence.''' if not self.static else '''## Phase 2 - Eval
+- Apply the PASS/FAIL/INCONCLUSIVE rubric and cite concrete artifact-based evidence.''' if not self.static else '''## Phase 2 - Eval
 - Evaluate the TEST_CASE by carefully examining the available code.'''}
 
 # Output Format
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
 
-VERDICT: [PASS/FAIL/INCONCLUSIVE/NOT APPLICABLE]
+VERDICT: [PASS/FAIL/INCONCLUSIVE]
 REASON: [Brief explanation of why]
 EVIDENCE: [Description of evidence collected. If referencing specific files, then cite the path and line number range using the format [/path/to/file.py:10-25] and be sure to use square brackets to denote the file citation. When citing any files which were created (they did not exist in the repo before), then you must cite a path under /evidence/artifacts/ (so first store the file there and then cite it), but try to prefer existing files in the repo.]
 
