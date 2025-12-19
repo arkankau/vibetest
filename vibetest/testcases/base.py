@@ -2,7 +2,7 @@
 
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -42,8 +42,11 @@ class TestCase(BaseModel):
     sandbox_path: str = Field(
         default="/workspace", description="Path inside the sandbox where the repo will be placed"
     )
+    target: Optional[str] = Field(
+        default=None, description="Ground truth to compare model outputs against"
+    )
     # key is the path to the additional data file/directory and the value is the path to be used inside the sandbox
-    additional_data: dict[str, str] = Field(
+    additional_data: Optional[dict[str, str]] = Field(
         default_factory=dict, description="Additional data files to include in the sandbox"
     )
     metadata: dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the test")

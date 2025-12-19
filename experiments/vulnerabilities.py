@@ -3,33 +3,13 @@
 import argparse
 from pathlib import Path
 import jsonlines
+import csv
+import sys
 
 from vibetest import TestCase, VibeTestAgent
 from vibetest.agent import BaselineAgent
 
-
-def get_tests():
-    tests = [
-        # Hard requirements
-        "No leakage from test to train/val. If there is any model selection or hyperparameter tuning, then it uses val only.",
-        "All model parameters are updated during training (no frozen layers unless explicitly intended).",
-        "The data is loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).",
-        "Augmentations only performed on training dataset; val/test dataset use deterministic preprocessing.",
-        "Any class-imbalance handling (weighted loss / sampler) applies only to training.",
-        "No path/filename text is fed as a feature unless explicitly intended.",
-        "Reported metrics use the correct split(s) and the exact definitions claimed (e.g., micro vs macro, top-k).",
-        # "Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.",
-        # "The model after the full training procedure outperforms a simple baseline (e.g., random or majority class) on the evaluation set.",
-        # "The model can overfit a single (or tiny) batch to near-zero loss.",
-        # "Training loss generally decreases during training and plateaus within the number of epochs used (if no loss is logged, then add logging to check this).",
-        # Recommended
-        "Training dataloader shuffles or training dataset is shuffled for training; val/test do not shuffle.",
-        "Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining.",
-        "Model and inputs are consistently moved to one device; no implicit CPU<->GPU transfers; dtype policy (e.g., fp32/bf16) is applied consistently.",
-        "No use of explicit loops or python control flow when matrix operations could have been used to implement the operation much more efficiently.",
-        # "Code does not include any secrets (API keys, passwords, etc.)."
-    ]
-    return tests
+csv.field_size_limit(sys.maxsize)
 
 def run_baseline():
     """Run baseline agent once per repository (no test cases).
@@ -38,26 +18,19 @@ def run_baseline():
     specific test criteria.
     """
     print("=" * 80)
-    print("Starting ICLR Repository Tests - Baseline Method")
+    print("Starting Vulnerability Tests - Baseline Method")
     print("=" * 80)
     
     # Step 1: Collect all repositories and create one test case per repo
     all_test_cases = []
     repo_paths = []
     
-    total_repos = 0
-    for repo_path in Path("./data/iclr-26/iclr2026_filter2").iterdir():
-        if total_repos >= 50:
-            break
-
+    for repo_path in Path("./data/vuln/repos/").iterdir():
         if repo_path.is_dir():
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             
-            # Create ONE test case per repo (baseline doesn't use test descriptions)
             all_test_cases.append(TestCase(description="", repo_path=repo_path))
-            
-            total_repos += 1
     
     print(f"\nTotal repositories: {len(repo_paths)}")
     print(f"Total test cases: {len(all_test_cases)} (1 per repo)")
@@ -66,7 +39,7 @@ def run_baseline():
     print(f"{'=' * 80}\n")
     
     # Step 2: Execute baseline agent once per repository
-    agent = BaselineAgent(max_attempts=20, static=True, model="openai/gpt-5")
+    agent = BaselineAgent(static=True, model="openai/gpt-5")
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     
     print(f"\n{'=' * 80}")
@@ -74,7 +47,7 @@ def run_baseline():
     print(f"{'=' * 80}\n")
     
     # Step 3: Write results to file (one result per repo)
-    with jsonlines.open(f"results/iclr_results_{agent.model_name.split('/')[1]}_baseline.jsonl", mode="w") as writer:
+    with jsonlines.open(f"results/vuln_results_{agent.model_name.split('/')[1]}_baseline.jsonl", mode="w") as writer:
         for idx, (repo_path, result) in enumerate(zip(repo_paths, all_results)):
             print(f"\n{'=' * 80}")
             print(f"Repository: {repo_path.name}")
@@ -101,36 +74,50 @@ def run_baseline():
     print(f"\n{'=' * 80}")
     print("SUMMARY")
     print(f"{'=' * 80}")
-    print(f"\nResults saved to: results/iclr_results_{agent.model_name.split('/')[1]}_baseline.jsonl")
+    print(f"\nResults saved to: results/vuln_results_{agent.model_name.split('/')[1]}_baseline.jsonl")
     print(f"{'=' * 80}")
 
 
 def run_vibetest():
     """Run vibetest with specific test cases across all repositories."""
     print("=" * 80)
-    print("Starting ICLR Repository Tests - VibeTest Method")
+    print("Starting Vulnerability Tests - VibeTest Method")
     print("=" * 80)
-    
+
+    # load vuln metadata csv
+    vuln_metadata = {}
+    with open("./data/vuln/cwe-bench/vulnerability_patches.csv", mode="r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            repo_name = row["project_slug"]
+            cwe_id = row["cwe_id"]
+            cwe_name = row["cwe_name"]
+            patch = row["patch"]
+            vuln_metadata[repo_name] = (cwe_id, cwe_name, patch)
+
     # Step 1: Collect all repositories and create test cases
-    test_strs = get_tests()
     all_test_cases = []
     repo_paths = []
-    tests_per_repo = len(test_strs)
-    
-    total_repos = 0
-    for repo_path in Path("./data/iclr-26/iclr2026_filter2").iterdir():
-        if total_repos >= 25:
+    tests_per_repo = 1
+
+    i = 0
+    for repo_path in Path("./data/vuln/cwe-bench/repos/").iterdir():
+        if i >= 10:
             break
+        i += 1
         if repo_path.is_dir():
+            if "_".join(str(repo_path.name).split("_")[1:]) not in vuln_metadata:
+                continue
+
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             
             # Create test cases for this repo
-            for desc in test_strs:
-                all_test_cases.append(TestCase(description=desc, repo_path=repo_path))
-            
-            total_repos += 1
-    
+            test_description = vuln_metadata["_".join(str(repo_path.name).split("_")[1:])]
+            desc = f"No violations of {test_description[0]}: {test_description[1]}."
+            target = f"The prediction should describe the bug (as given in the reason and evidence) and should match the bug fixed by the following patch which removes the bug from the code:\n{test_description[2]}\n\nNote that the prediction corresponds to the buggy version of the code which the patch is fixing. The evidence in the prediction should correspond to the same bug as fixed by the patch. One way to determine if the evidence is correct is to see if any of the patched methods are mentioned in the evidence. If so, then the prediction should be treated as correct."
+            all_test_cases.append(TestCase(description=desc, repo_path=repo_path, sandbox_path="/workdir", target=target))
+
     print(f"\nTotal repositories: {len(repo_paths)}")
     print(f"Total test cases: {len(all_test_cases)} ({tests_per_repo} tests × {len(repo_paths)} repos)")
     print(f"\n{'=' * 80}")
@@ -138,7 +125,7 @@ def run_vibetest():
     print(f"{'=' * 80}\n")
     
     # Step 2: Execute ALL tests in parallel across all repositories
-    agent = VibeTestAgent(max_attempts=20, static=True, model="openai/gpt-5")
+    agent = VibeTestAgent(static=True, model="openai/gpt-5")
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     
     print(f"\n{'=' * 80}")
@@ -146,7 +133,7 @@ def run_vibetest():
     print(f"{'=' * 80}\n")
     
     # Step 3: Group results by repository and write to file
-    with jsonlines.open(f"results/iclr_results_{agent.model_name.split('/')[1]}.jsonl", mode="w") as writer:
+    with jsonlines.open(f"results/vuln_results_{agent.model_name.split('/')[1]}.jsonl", mode="w") as writer:
         # Group results by repository
         for repo_idx, repo_path in enumerate(repo_paths):
             print(f"\n{'=' * 80}")
@@ -197,12 +184,12 @@ def run_vibetest():
     print(f"\n{'=' * 80}")
     print("SUMMARY")
     print(f"{'=' * 80}")
-    print(f"\nResults saved to: results/iclr_results_{agent.model_name.split('/')[1]}.jsonl")
+    print(f"\nResults saved to: results/vuln_results_{agent.model_name.split('/')[1]}.jsonl")
     print(f"{'=' * 80}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run vibetest on ICLR repositories")
+    parser = argparse.ArgumentParser(description="Run vibetest on Vulnerability repositories")
     parser.add_argument(
         "--method",
         type=str,

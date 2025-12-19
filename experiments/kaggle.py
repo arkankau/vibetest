@@ -15,8 +15,7 @@ def get_tests():
         "All model parameters are updated during training (no frozen layers unless explicitly intended).",
         "The data is loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).",
         "Augmentations only performed on training dataset; val/test dataset use deterministic preprocessing.",
-        "Any class-imbalance handling (weighted loss / sampler) applies only to training.",
-        # "No path/filename text is fed as a feature unless explicitly intended.",
+        "Any class-imbalance handling (weighted loss / sampler) applies only to training data.",
         "Reported metrics use the correct split(s) and the exact definitions claimed (e.g., micro vs macro, top-k).",
         "Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.",
         "The model after the full training procedure outperforms a simple baseline (e.g., random or majority class) on the evaluation set.",
@@ -27,10 +26,11 @@ def get_tests():
         "Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining.",
         "Model and inputs are consistently moved to one device; no implicit CPU<->GPU transfers; dtype policy (e.g., fp32/bf16) is applied consistently.",
         # "Code does not include any secrets (API keys, passwords, etc.)."
+        # "Does not use explicit loops or Python control flow when matrix operations could have been used to implement the exact same operation much more efficiently. If this property is not satisfied, show the matrix operations which should replace the raw Python logic."
     ]
     return tests
 
-def run_baseline():
+def run_baseline(subset: str, model: str, static: bool):
     """Run baseline agent once per repository (no test cases).
     
     The baseline agent simply examines each repository for bugs without
@@ -45,18 +45,20 @@ def run_baseline():
     repo_paths = []
     
     total_repos = 0
-    for repo_path in Path("./data/kaggle/kaggle-titanic").iterdir():
+    for repo_path in Path(f"./data/kaggle/kaggle-{subset}").iterdir():
         if total_repos >= 50:
             break
 
         if repo_path.is_dir():
             # the code repo is the only directory inside each repo_path
-            code_repo_path = next(repo_path.iterdir())
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             
             # Create ONE test case per repo (baseline doesn't use test descriptions)
-            all_test_cases.append(TestCase(description="", repo_path=code_repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input/titanic"}))
+            if "titanic" in subset:
+                all_test_cases.append(TestCase(description="", repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input/titanic"}))
+            else:
+                all_test_cases.append(TestCase(description="", repo_path=repo_path, sandbox_path="/kaggle"))
             
             total_repos += 1
     
@@ -67,7 +69,7 @@ def run_baseline():
     print(f"{'=' * 80}\n")
     
     # Step 2: Execute baseline agent once per repository
-    agent = BaselineAgent(max_attempts=20)
+    agent = BaselineAgent(model=model, static=static)
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     
     print(f"\n{'=' * 80}")
@@ -75,7 +77,7 @@ def run_baseline():
     print(f"{'=' * 80}\n")
     
     # Step 3: Write results to file (one result per repo)
-    with jsonlines.open(f"results/kaggle_results_{agent.model_name.split('/')[1]}_baseline.jsonl", mode="w") as writer:
+    with jsonlines.open(f"results/kaggle_{subset}_results_{agent.model_name.split('/')[1]}_baseline.jsonl", mode="w") as writer:
         for idx, (repo_path, result) in enumerate(zip(repo_paths, all_results)):
             print(f"\n{'=' * 80}")
             print(f"Repository: {repo_path.name}")
@@ -102,11 +104,11 @@ def run_baseline():
     print(f"\n{'=' * 80}")
     print("SUMMARY")
     print(f"{'=' * 80}")
-    print(f"\nResults saved to: results/kaggle_results_{agent.model_name.split('/')[1]}_baseline.jsonl")
+    print(f"\nResults saved to: results/kaggle_{subset}_results_{agent.model_name.split('/')[1]}{'_static' if static else ''}_baseline.jsonl")
     print(f"{'=' * 80}")
 
 
-def run_vibetest():
+def run_vibetest(subset: str, model: str, static: bool):
     """Run vibetest with specific test cases across all repositories."""
     print("=" * 80)
     print("Starting Kaggle Repository Tests - VibeTest Method")
@@ -119,18 +121,20 @@ def run_vibetest():
     tests_per_repo = len(test_strs)
     
     total_repos = 0
-    for repo_path in Path("./data/kaggle/kaggle-titanic").iterdir():
+    for repo_path in Path(f"./data/kaggle/kaggle-{subset}").iterdir():
         if total_repos >= 50:
             break
 
         if repo_path.is_dir():
-            code_repo_path = next(repo_path.iterdir())
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             
             # Create test cases for this repo
             for desc in test_strs:
-                all_test_cases.append(TestCase(description=desc, repo_path=code_repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input"}))
+                if "titanic" in subset:
+                    all_test_cases.append(TestCase(description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input"}))
+                else:
+                    all_test_cases.append(TestCase(description=desc, repo_path=repo_path, sandbox_path="/kaggle"))
             
             total_repos += 1
     
@@ -141,7 +145,7 @@ def run_vibetest():
     print(f"{'=' * 80}\n")
     
     # Step 2: Execute ALL tests in parallel across all repositories
-    agent = VibeTestAgent(max_attempts=20)
+    agent = VibeTestAgent(model=model, static=static)
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     
     print(f"\n{'=' * 80}")
@@ -149,7 +153,7 @@ def run_vibetest():
     print(f"{'=' * 80}\n")
     
     # Step 3: Group results by repository and write to file
-    with jsonlines.open(f"results/kaggle_results_{agent.model_name.split('/')[1]}.jsonl", mode="w") as writer:
+    with jsonlines.open(f"results/kaggle_{subset}_results_{agent.model_name.split('/')[1]}{'_static' if static else ''}.jsonl", mode="w") as writer:
         # Group results by repository
         for repo_idx, repo_path in enumerate(repo_paths):
             print(f"\n{'=' * 80}")
@@ -204,7 +208,7 @@ def run_vibetest():
     print(f"\n{'=' * 80}")
     print("SUMMARY")
     print(f"{'=' * 80}")
-    print(f"\nResults saved to: results/kaggle_results_{agent.model_name.split('/')[1]}.jsonl")
+    print(f"\nResults saved to: results/kaggle_{subset}_results_{agent.model_name.split('/')[1]}.jsonl")
     print(f"{'=' * 80}")
 
 
@@ -217,9 +221,26 @@ if __name__ == "__main__":
         default="vibetest",
         help="Method to use: 'vibetest' for VibeTestAgent or 'baseline' for BaselineAgent"
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Model name to use for the VibeTestAgent (e.g., 'openai/gpt-5')"
+    )
+    parser.add_argument(
+        "--static",
+        action="store_true",
+        help="Use static (non-execution) mode"
+    )
+    parser.add_argument(
+        "--subset",
+        type=str,
+        choices=["titanic", "diabetic", "nlp"],
+        default="titanic",
+        help="Subset of Kaggle repositories to test"
+    )
     args = parser.parse_args()
     
     if args.method == "baseline":
-        run_baseline()
+        run_baseline(args.subset, args.model, args.static)
     else:
-        run_vibetest()
+        run_vibetest(args.subset, args.model, args.static)

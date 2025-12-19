@@ -89,11 +89,9 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
             
             # Extract repo name and test info from the sample
             sample_id = sample_data.get('id', '')
-            # Extract repo name (everything before the underscore and number)
+            # Extract repo name (everything before the final underscore and number)
             repo_parts = sample_id.rsplit('_', 1)
-            repo_num = repo_parts[1] if len(repo_parts) > 1 else ''
             repo_name = repo_parts[0] if repo_parts else 'Unknown'
-            repo_name = f"{repo_name}_{int(repo_num) // 13}" if repo_num else repo_name
             
             # Extract test description from input
             input_text = sample_data.get('input', '')

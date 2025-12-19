@@ -1,6 +1,7 @@
 """ReAct agent implementation using Inspect AI."""
 
 import os
+import uuid
 from pathlib import Path
 
 from inspect_ai import Task, eval
@@ -9,21 +10,23 @@ from inspect_ai.dataset import Sample
 from inspect_ai.scorer import includes, scorer, Score
 from inspect_ai.tool import Tool, bash_session, python, text_editor, bash, web_search
 from inspect_ai.util import sandbox, SandboxEnvironmentSpec
-from inspect_ai.scorer import Target, accuracy
+from inspect_ai.scorer import Target, accuracy, model_graded_qa, multi_scorer, max_score, Scorer
 from inspect_ai.solver import TaskState
+import re
 
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.config import get_package_root
 
 
 @scorer(metrics=[accuracy()])
-def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to_save="/evidence"):
+def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to_save="/evidence", returns_false=False):
     """
     Creates /tmp/evidence-<sample>.tar.gz inside the sandbox, pulls it out,
     and writes it under out_dir on the host as evidence-<sample>.tar.gz.
     """
     async def _score(state: TaskState, target: Target) -> Score:
         env = sandbox()  # SandboxEnvironment for the current sample
+        retval = True if not returns_false else False
 
         # Name artifact using sample_id from the TaskState
         sample_id = state.sample_id if hasattr(state, "sample_id") else "unknown"
@@ -37,7 +40,7 @@ def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to
         try:
             blob = await env.read_file(tar_in_sandbox, text=False)  # returns bytes
         except Exception:
-            return Score(value=True, explanation=f"No evidence found at {dir_to_save}")
+            return Score(value=retval, explanation=f"No evidence found at {dir_to_save}")
 
         # Write to the host filesystem (e.g., alongside your logs)
         out_base = Path(out_dir)
@@ -48,8 +51,34 @@ def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to
         # Set proper permissions (0o644 = rw-r--r--)
         os.chmod(out_path, 0o644)
 
-        return Score(value=True, explanation=f"Saved evidence to {out_path}")
+        return Score(value=retval, explanation=f"Saved evidence to {out_path}")
     return _score
+
+
+@scorer(metrics=[accuracy()])
+def eval_patch(out_dir: str | os.PathLike = "./evidence-dumps/patch-eval", *, dir_to_save="/evidence"):
+    qa_scorer = model_graded_qa(model="openai/gpt-5")
+    save_evidence_scorer = save_evidence_tar(out_dir=out_dir, dir_to_save=dir_to_save)
+
+    async def _score(state: TaskState, target: Target) -> Score:
+        # check state.output for a "FAIL" verdict, and then run the model_graded_qa_scorer
+        score = await save_evidence_scorer(state, target)
+
+        verdict = ""
+        if state.output and state.output.completion:
+            verdict = re.search(r"VERDICT:\s*(\w+)", state.output.completion)
+            if verdict:
+                verdict = verdict.group(1).strip().upper()
+        if verdict == "FAIL":
+            return await qa_scorer(state, target)
+        else:
+            return Score(value="I", explanation=score.explanation + "; Verdict was not FAIL")
+    return _score
+
+
+@scorer(metrics=[accuracy()])
+def my_multi_scorer(scorer) -> Scorer:
+    return scorer
 
 
 def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, str]:
@@ -66,7 +95,7 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, st
             if ".venv" in root or "__pycache__" in root or ".git" in root:
                 continue  # Skip virtual environments and cache directories
             for filename in filenames:
-                if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename and ".ipynb" not in filename:
+                if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename and ".ipynb" not in filename and ".cpp" not in filename and ".java" not in filename and ".c" not in filename:
                     continue # TODO: we shouldn't in general exclude all non python and non md/txt/pdf/ipynb files.
                 full_path = os.path.join(root, filename)
                 relative_path = os.path.relpath(full_path, repo_path)
@@ -88,25 +117,37 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, st
     return files
 
 
-def cleanup_docker_sandbox() -> None:
-    """Clean up temporary Docker configuration files."""
-    temp_dir = Path.cwd() / ".vibetest_tmp"
+def cleanup_docker_sandbox(temp_dir: Path | None = None) -> None:
+    """Clean up temporary Docker configuration files.
+    
+    Args:
+        temp_dir: Specific temporary directory to clean up. If None, cleans up the legacy
+                 .vibetest_tmp directory for backwards compatibility.
+    """
+    import shutil
+    
+    if temp_dir is None:
+        temp_dir = Path.cwd() / ".vibetest_tmp"
+    
     if temp_dir.exists():
-        import shutil
         try:
             shutil.rmtree(temp_dir)
         except Exception:
             pass  # Best effort cleanup
 
 
-def setup_docker_sandbox() -> str | SandboxEnvironmentSpec:
+def setup_docker_sandbox() -> tuple[SandboxEnvironmentSpec, Path]:
     """Setup Docker sandbox configuration to use vibetest's Dockerfile and compose.yaml.
 
     Returns:
-        SandboxEnvironmentSpec configured to use vibetest's Docker configuration.
-        Creates a temporary compose.yaml in the current directory with correct paths.
+        Tuple of (SandboxEnvironmentSpec, temp_dir_path) where:
+        - SandboxEnvironmentSpec is configured to use vibetest's Docker configuration
+        - temp_dir_path is the unique temporary directory that needs to be cleaned up later
+        
+    Note:
+        Uses a unique temporary directory per call to ensure concurrency safety when
+        running multiple agents in parallel.
     """
-    import tempfile
     import yaml
 
     package_root = get_package_root()
@@ -119,10 +160,11 @@ def setup_docker_sandbox() -> str | SandboxEnvironmentSpec:
             "Please ensure vibetest is properly installed."
         )
 
-    # Create a temporary compose.yaml in the current directory with correct build context
-    # Inspect AI will look for compose.yaml in the config directory
-    temp_dir = Path.cwd() / ".vibetest_tmp"
-    temp_dir.mkdir(exist_ok=True)
+    # Create a unique temporary directory for this sandbox instance
+    # This ensures concurrency safety when running multiple agents in parallel
+    unique_id = str(uuid.uuid4())[:8]
+    temp_dir = Path.cwd() / f".vibetest_tmp_{unique_id}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
     temp_compose_path = temp_dir / "compose.yaml"
 
     # Read the source compose.yaml and update the build context
@@ -172,9 +214,9 @@ def setup_docker_sandbox() -> str | SandboxEnvironmentSpec:
         with open(temp_compose_path, 'w') as f:
             yaml.dump(compose_config, f)
 
-    # Return the path to the temporary compose.yaml file
-    # Inspect AI expects the file path, not the directory
-    return SandboxEnvironmentSpec(type="docker", config=str(temp_compose_path))
+    # Return both the SandboxEnvironmentSpec and the temp directory path
+    # The temp directory path is needed for cleanup
+    return SandboxEnvironmentSpec(type="docker", config=str(temp_compose_path)), temp_dir
 
 
 class VibeTestAgent:
@@ -194,7 +236,6 @@ class VibeTestAgent:
     def __init__(
         self,
         model=None,
-        max_attempts: int = 20,
         additional_tools: list[Tool] | None = None,
         static: bool = False,
     ):
@@ -202,13 +243,11 @@ class VibeTestAgent:
 
         Args:
             model: Model to use (e.g., "anthropic/claude-3-5-sonnet-20241022")
-            max_attempts: Maximum reasoning/action attempts
             additional_tools: Extra tools to add beyond defaults
         """
         self.model_name = model or os.getenv(
             "VIBETEST_MODEL", "no-model"
         )
-        self.max_attempts = max_attempts
         self.static = static
         self.tools = self._setup_tools(additional_tools)
 
@@ -250,7 +289,7 @@ class VibeTestAgent:
         Returns:
             Solver configured with ReAct pattern
         """
-        instructions = f"""You are an expert software testing agent that evaluates existing codebases against natural-language test criteria. You gather objective evidence and return a binary verdict.
+        instructions = f"""You are an expert software testing agent that evaluates codebases against natural-language test criteria. You gather objective evidence and return a verdict.
 
 # Objective
 Determine whether the repository PASSes or FAILs the specified test case (or the analysis is INCONCLUSIVE), and produce verifiable evidence. If additional information (e.g. run logs, extra data, or the ability to execute the code) is necessary to determine if the test PASSes or FAILs, then mark the test as INCONCLUSIVE and describe exactly what additional information is needed.
@@ -262,7 +301,7 @@ Determine whether the repository PASSes or FAILs the specified test case (or the
 {'''# Operating Rules
 1. Evaluate, don't rewrite. Avoid writing substantial new code and instead try to instrument existing code (adding logging, commenting parts out, adding asserts, etc.). Prefer instrumentation (logging, flags, CLI args, small patches). Record all edits as diffs.
 2. Evidence over opinion. Prefer runtime traces, logs, metrics, file hashes, config snapshots, git SHAs, and small data extracts.
-3. Data availability. Check for required datasets locally (e.g., /kaggle, mounted volumes) before downloading. If data is missing, look for directions for downloading it.
+3. Data availability. Check for required datasets locally before downloading. If data is missing, look for directions for downloading it.
 4. Environment setup. Set up an environment (uv is installed) and install any necessary dependencies.
 5. Determinism where possible. Capture python -V, CUDA/cuDNN, pip freeze/conda list, git rev-parse HEAD, and relevant seeds.
 6. Use default parameters. Run code with default settings unless the test case requires otherwise.''' if not self.static else '''# Operating Rules
@@ -316,7 +355,6 @@ Remember: You MUST use the submit() tool to report your final answer."""
         agent = react(
             prompt=instructions,
             tools=self.tools,
-            attempts=self.max_attempts,
             submit=True,  # Explicitly enable submit tool (True by default)
         )
 
@@ -359,8 +397,9 @@ Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
 
         # Setup sandbox configuration
         sandbox_config = None
+        temp_dir_to_cleanup = None
         if sandbox == "docker":
-            sandbox_config = setup_docker_sandbox()
+            sandbox_config, temp_dir_to_cleanup = setup_docker_sandbox()
         elif sandbox is not None:
             sandbox_config = sandbox
 
@@ -371,18 +410,34 @@ Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
         for idx, test_case in enumerate(test_cases):
             sample_id = f"{Path(test_case.repo_path).name}_{idx}"
             id_to_test_case[sample_id] = test_case
-            samples.append(Sample(
-                input=self._create_prompt(test_case),
-                id=sample_id,
-                files=get_files(test_case, sandbox_prefix=test_case.sandbox_path)
-            ))
+            if test_case.target:
+                samples.append(Sample(
+                    input=self._create_prompt(test_case),
+                    id=sample_id,
+                    target=test_case.target,
+                    files=get_files(test_case, sandbox_prefix=test_case.sandbox_path)
+                ))
+            else:
+                samples.append(Sample(
+                    input=self._create_prompt(test_case),
+                    id=sample_id,
+                    files=get_files(test_case, sandbox_prefix=test_case.sandbox_path)
+                ))
 
-        task = Task(
-            dataset=samples,
-            solver=self._create_solver(),
-            scorer=save_evidence_tar(f"./evidence-dumps/{self.model_name.split('/')[1]}"), #includes(),  # Accept any answer containing the target
-            sandbox=sandbox_config,
-        )
+        if samples[0].target:
+            task = Task(
+                dataset=samples,
+                solver=self._create_solver(),
+                scorer=eval_patch(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                sandbox=sandbox_config,
+            )
+        else:
+            task = Task(
+                dataset=samples,
+                solver=self._create_solver(),
+                scorer=save_evidence_tar(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                sandbox=sandbox_config,
+            )
 
         # Run evaluation
         try:
@@ -398,8 +453,8 @@ Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
             return self._parse_results(results, id_to_test_case)
         finally:
             # Clean up temporary Docker configuration
-            if sandbox == "docker":
-                cleanup_docker_sandbox()
+            if sandbox == "docker" and temp_dir_to_cleanup is not None:
+                cleanup_docker_sandbox(temp_dir_to_cleanup)
 
     def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
         """Parse Inspect AI results into TestResults.

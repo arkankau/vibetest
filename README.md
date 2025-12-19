@@ -167,27 +167,13 @@ If you sync new logs or repos locally:
        --output viewer/eval-results.json
    ```
 
-2. Refresh the repo-path manifest (maps `/kaggle/...` citations to local checkouts):
+2. Refresh the repo-path manifest so citations under both `/kaggle/...` and `/iclr/...` resolve to your local mirrors (defaults cover `data/kaggle/kaggle-titanic` with depth 2 and `data/iclr-26/iclr2026_filter2` with depth 1):
 
-   ```bash
-   python - <<'PY'
-   import json
-   from pathlib import Path
-
-   root = Path("data/kaggle")
-   repo_map = {}
-   for dataset in root.iterdir():
-       if not dataset.is_dir():
-           continue
-       for owner in dataset.iterdir():
-           if not owner.is_dir():
-               continue
-           for repo_dir in owner.iterdir():
-               if repo_dir.is_dir():
-                   repo_map.setdefault(repo_dir.name, []).append(str(repo_dir))
-   Path("viewer/repo-paths.json").write_text(json.dumps(repo_map, indent=2))
-   PY
-   ```
+```bash
+python scripts/build_repo_paths.py
+# or customize roots/depths:
+# python scripts/build_repo_paths.py --path data/kaggle/kaggle-titanic:2 --path data/iclr-26/iclr2026_filter2:1
+```
 
 The UI is intentionally simple—no build tooling required.
 
