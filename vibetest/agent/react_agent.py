@@ -1,6 +1,9 @@
 """ReAct agent implementation using Inspect AI."""
 
 import os
+import shutil
+import tarfile
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -8,7 +11,7 @@ from inspect_ai import Task, eval
 from inspect_ai.agent import react
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import includes, scorer, Score
-from inspect_ai.tool import Tool, bash_session, python, text_editor, bash, web_search
+from inspect_ai.tool import Tool, bash_session, python, text_editor, bash, web_search, update_plan
 from inspect_ai.util import sandbox, SandboxEnvironmentSpec
 from inspect_ai.scorer import Target, accuracy, model_graded_qa, multi_scorer, max_score, Scorer
 from inspect_ai.solver import TaskState
@@ -81,6 +84,128 @@ def my_multi_scorer(scorer) -> Scorer:
     return scorer
 
 
+# Module-level storage for temporary archive directories that need cleanup
+_temp_archive_dirs: list[Path] = []
+
+# Cache for archives: maps (repo_path, additional_data_tuple, sandbox_prefix) to (files_dict, setup_script)
+_archive_cache: dict[tuple, tuple[dict[str, str], str]] = {}
+
+
+def _make_cache_key(test_case: TestCase, sandbox_prefix: str) -> tuple:
+    """Create a hashable cache key from test case file sources and sandbox prefix."""
+    repo_path_str = str(test_case.repo_path) if test_case.repo_path else ""
+    additional_data_tuple = tuple(sorted(test_case.additional_data.items())) if test_case.additional_data else ()
+    return (repo_path_str, additional_data_tuple, sandbox_prefix)
+
+
+def create_files_archive(test_case: TestCase, sandbox_prefix: str = "/workspace/") -> tuple[dict[str, str], str]:
+    """Create a tar.gz archive of all files from the test case repository.
+
+    If another test case uses the same files (same repo_path, additional_data, and sandbox_prefix),
+    the cached archive will be reused.
+
+    Args:
+        test_case: Test case containing the repository path
+        sandbox_prefix: Prefix path inside the sandbox where files will be extracted
+
+    Returns:
+        Tuple of (files_dict, setup_script) where:
+        - files_dict: Dictionary mapping archive path in sandbox to archive file path on host
+        - setup_script: Bash script to extract the archive on container startup
+    """
+    global _temp_archive_dirs, _archive_cache
+    
+    # Check if we already have a cached archive for these files
+    cache_key = _make_cache_key(test_case, sandbox_prefix)
+    if cache_key in _archive_cache:
+        print(f"Reusing cached archive for {test_case.repo_path}")
+        return _archive_cache[cache_key]
+    
+    # Create a temporary directory to store the archive
+    temp_dir = Path(tempfile.mkdtemp(prefix="vibetest_archive_"))
+    _temp_archive_dirs.append(temp_dir)
+    
+    archive_path = temp_dir / "files.tar.gz"
+    
+    # Create the tar.gz archive
+    with tarfile.open(archive_path, "w:gz") as tar:
+        repo_path = test_case.repo_path
+        if repo_path and os.path.isdir(repo_path):
+            for root, dirs, filenames in os.walk(repo_path):
+                # Skip virtual environments, cache directories, and .git
+                dirs[:] = [d for d in dirs if d not in (".venv", "__pycache__", ".git", "node_modules")]
+                
+                for filename in filenames:
+                    full_path = os.path.join(root, filename)
+                    relative_path = os.path.relpath(full_path, repo_path)
+                    # Archive path will be relative to sandbox_prefix
+                    arcname = os.path.join(sandbox_prefix.lstrip("/"), "repo", relative_path)
+                    try:
+                        tar.add(full_path, arcname=arcname)
+                    except (PermissionError, OSError) as e:
+                        print(f"Warning: Could not add {full_path} to archive: {e}")
+
+        # Add additional data files
+        if test_case.additional_data:
+            for additional_src, additional_dst in test_case.additional_data.items():
+                additional_src_path = Path(additional_src)
+                if additional_src_path.is_file():
+                    arcname = additional_dst.lstrip("/")
+                    try:
+                        tar.add(str(additional_src_path), arcname=arcname)
+                    except (PermissionError, OSError) as e:
+                        print(f"Warning: Could not add {additional_src_path} to archive: {e}")
+                elif additional_src_path.is_dir():
+                    for root, dirs, filenames in os.walk(additional_src_path):
+                        dirs[:] = [d for d in dirs if d not in (".venv", "__pycache__", ".git", "node_modules")]
+                        for filename in filenames:
+                            full_path = os.path.join(root, filename)
+                            relative_path = os.path.relpath(full_path, additional_src_path)
+                            arcname = os.path.join(
+                                additional_dst.lstrip("/"),
+                                additional_src_path.name,
+                                relative_path
+                            )
+                            try:
+                                tar.add(full_path, arcname=arcname)
+                            except (PermissionError, OSError) as e:
+                                print(f"Warning: Could not add {full_path} to archive: {e}")
+
+    # The archive will be copied to /tmp in the sandbox
+    sandbox_archive_path = "/tmp/vibetest_files.tar.gz"
+    
+    # Create the setup script that extracts the archive
+    setup_script = f"""#!/bin/bash
+set -e
+if [ -f "{sandbox_archive_path}" ]; then
+    tar -xzf "{sandbox_archive_path}" -C /
+    rm -f "{sandbox_archive_path}"
+fi
+"""
+    
+    files_dict = {sandbox_archive_path: str(archive_path)}
+    
+    print(f"Created archive at {archive_path} with files to extract to {sandbox_prefix}")
+    
+    # Cache the result for reuse by other samples with the same files
+    _archive_cache[cache_key] = (files_dict, setup_script)
+    
+    return files_dict, setup_script
+
+
+def cleanup_archive_temps() -> None:
+    """Clean up all temporary archive directories and clear the cache."""
+    global _temp_archive_dirs, _archive_cache
+    for temp_dir in _temp_archive_dirs:
+        if temp_dir.exists():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass  # Best effort cleanup
+    _temp_archive_dirs = []
+    _archive_cache = {}
+
+
 def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, str]:
     """Get files from the test case repository.
 
@@ -95,11 +220,11 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, st
             if ".venv" in root or "__pycache__" in root or ".git" in root:
                 continue  # Skip virtual environments and cache directories
             for filename in filenames:
-                if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename and ".ipynb" not in filename and ".cpp" not in filename and ".java" not in filename and ".c" not in filename:
-                    continue # TODO: we shouldn't in general exclude all non python and non md/txt/pdf/ipynb files.
+                # if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename and ".ipynb" not in filename and ".cpp" not in filename and ".java" not in filename and ".c" not in filename:
+                #     continue # TODO: we shouldn't in general exclude all non python and non md/txt/pdf/ipynb files.
                 full_path = os.path.join(root, filename)
                 relative_path = os.path.relpath(full_path, repo_path)
-                sandbox_path = os.path.join(sandbox_prefix, repo_path.name, relative_path)
+                sandbox_path = os.path.join(sandbox_prefix, "repo", relative_path)
                 files[sandbox_path] = full_path
 
     for additional_src, additional_dst in test_case.additional_data.items():
@@ -261,13 +386,14 @@ class VibeTestAgent:
             List of all tools
         """
         if self.static:
-            base_tools = [bash(timeout=120), text_editor()]
+            base_tools = [bash(timeout=120), text_editor(), update_plan()]
         else:
             base_tools = [
                 # bash_session(),
                 bash(timeout=240),
                 python(timeout=240),
                 text_editor(),
+                update_plan(),
             ]
 
         if additional_tools:
@@ -305,7 +431,7 @@ Determine whether the repository PASSes or FAILs the specified test case (or the
 4. Environment setup. Set up an environment (uv is installed) and install any necessary dependencies.
 5. Determinism where possible. Capture python -V, CUDA/cuDNN, pip freeze/conda list, git rev-parse HEAD, and relevant seeds.
 6. Use default parameters. Run code with default settings unless the test case requires otherwise.''' if not self.static else '''# Operating Rules
-- You may not execute any of the experiments, so you should rely on careful examination of the code.'''}
+- You may not execute any of the code, so you should rely on careful examination of the code.'''}
 
 # PASS/FAIL/INCONCLUSIVE Rubric
 - PASS: You found direct evidence satisfying the TEST_CASE in the target repo.
@@ -343,8 +469,8 @@ Determine whether the repository PASSes or FAILs the specified test case (or the
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
 
 VERDICT: [PASS/FAIL/INCONCLUSIVE]
-REASON: [Brief explanation of why]
-EVIDENCE: [Description of evidence collected. If referencing specific files, then cite the path and line number range using the format [/path/to/file.py:10-25] and be sure to use square brackets to denote the file citation. When citing any files which were created (they did not exist in the repo before), then you must cite a path under /evidence/artifacts/ (so first store the file there and then cite it), but try to prefer existing files in the repo.]
+REASON: [Brief explanation of your verdict.]
+EVIDENCE: [Description of evidence collected. If referencing specific files, then cite the path and line number range using the format [/path/to/file.py:10-25] and be sure to use square brackets to denote the file citation. When citing any files which were created (they did not exist in the repo before), then you must cite a path under /evidence/artifacts/ (so first store the file there and then cite it), but try to prefer existing files in the repo. This evidence should be enough to independently verify your verdict.]
 
 Be sure that all evidence you cite in the EVIDENCE section either exists in the original repo or was saved under /evidence/artifacts/ and is referred to using a path starting with /evidence/artifacts/.
 
@@ -371,7 +497,7 @@ Remember: You MUST use the submit() tool to report your final answer."""
         """
         prompt = f"""Here is the test case and the repository to evaluate:
 Test: {test_case.description}
-Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
+Repository: {test_case.sandbox_path}/repo"""
         return prompt
 
     def execute_tests(
@@ -408,20 +534,26 @@ Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
         # We use includes() to accept any submission that contains "VERDICT"
         samples = []
         for idx, test_case in enumerate(test_cases):
-            sample_id = f"{Path(test_case.repo_path).name}_{idx}"
+            sample_id = test_case.name
             id_to_test_case[sample_id] = test_case
+            
+            # Create archive of files and get setup script for extraction
+            files_dict, setup_script = create_files_archive(test_case, sandbox_prefix=test_case.sandbox_path)
+            
             if test_case.target:
                 samples.append(Sample(
                     input=self._create_prompt(test_case),
                     id=sample_id,
                     target=test_case.target,
-                    files=get_files(test_case, sandbox_prefix=test_case.sandbox_path)
+                    files=files_dict,
+                    setup=setup_script,
                 ))
             else:
                 samples.append(Sample(
                     input=self._create_prompt(test_case),
                     id=sample_id,
-                    files=get_files(test_case, sandbox_prefix=test_case.sandbox_path)
+                    files=files_dict,
+                    setup=setup_script,
                 ))
 
         if samples[0].target:
@@ -444,9 +576,12 @@ Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
             results = eval(
                 tasks=task,
                 model=self.model_name,
+                reasoning_effort="medium",
+                reasoning_summary="auto",
                 log_dir="./logs",  # Must be string, not Path
                 retry_on_error=2,
                 fail_on_error=False,
+                max_samples=30,
             )
 
             # Parse results
@@ -455,6 +590,8 @@ Repository: {test_case.sandbox_path}/{Path(test_case.repo_path).name}"""
             # Clean up temporary Docker configuration
             if sandbox == "docker" and temp_dir_to_cleanup is not None:
                 cleanup_docker_sandbox(temp_dir_to_cleanup)
+            # Clean up temporary archive directories
+            cleanup_archive_temps()
 
     def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
         """Parse Inspect AI results into TestResults.

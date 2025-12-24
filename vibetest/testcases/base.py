@@ -37,6 +37,7 @@ class TestCase(BaseModel):
     is handled by the VibeTestAgent.
     """
 
+    name: str = Field(..., description="A unique name for the test case")
     description: str = Field(..., description="Natural language description of what to test")
     repo_path: Path = Field(..., description="Path to the repository to test")
     sandbox_path: str = Field(

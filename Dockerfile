@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Set working directory
-WORKDIR /workspace
+WORKDIR /workdir
 
 # # Copy project files
 # COPY pyproject.toml uv.lock ./
@@ -46,7 +46,7 @@ WORKDIR /workspace
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV VIBETEST_EVIDENCE_DIR=/workspace/evidence
+ENV VIBETEST_EVIDENCE_DIR=/workdir/evidence
 
 # Default command
 CMD ["uv", "run", "python", "-m", "vibetest.cli"]
