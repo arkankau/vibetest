@@ -9,26 +9,11 @@ from vibetest.agent import BaselineAgent
 
 
 def get_tests():
-    tests = [
-        # Hard requirements
-        "No leakage from test to train/val. If there is any model selection or hyperparameter tuning, then it uses val only.",
-        "All model parameters are updated during training (no frozen layers unless explicitly intended).",
-        "The data is loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).",
-        "Augmentations only performed on training dataset; val/test dataset use deterministic preprocessing.",
-        "Any class-imbalance handling (weighted loss / sampler) applies only to training data.",
-        "Reported metrics use the correct split(s) and the exact definitions claimed (e.g., micro vs macro, top-k).",
-        "Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.",
-        "The model after the full training procedure outperforms a simple baseline (e.g., random or majority class) on the evaluation set.",
-        "The model can overfit a single (or tiny) batch to near-zero loss.",
-        "Training loss generally decreases during training and plateaus within the number of epochs used (if no loss is logged, then add logging to check this).",
-        # Recommended
-        "Training dataloader shuffles or training dataset is shuffled for training; val/test do not shuffle.",
-        "Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining.",
-        "Model and inputs are consistently moved to one device; no implicit CPU<->GPU transfers; dtype policy (e.g., fp32/bf16) is applied consistently.",
-        # "Code does not include any secrets (API keys, passwords, etc.)."
-        # "Does not use explicit loops or Python control flow when matrix operations could have been used to implement the exact same operation much more efficiently. If this property is not satisfied, show the matrix operations which should replace the raw Python logic."
-    ]
-    return tests
+    with open(f"./data/kaggle/properties.md", mode="r") as f:
+        properties = f.read().split("- ")[1:]  # Split by headings
+    properties = [p.strip() for p in properties if p.strip()]
+    print(f"Loaded {len(properties)} properties from properties.md")
+    return properties
 
 def run_baseline(subset: str, model: str, static: bool):
     """Run baseline agent once per repository (no test cases).
@@ -56,9 +41,9 @@ def run_baseline(subset: str, model: str, static: bool):
             
             # Create ONE test case per repo (baseline doesn't use test descriptions)
             if "titanic" in subset:
-                all_test_cases.append(TestCase(description="", repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input/titanic"}))
+                all_test_cases.append(TestCase(name=repo_path.name, description="", repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic-kaggle-data": "/kaggle/input/titanic"}))
             else:
-                all_test_cases.append(TestCase(description="", repo_path=repo_path, sandbox_path="/kaggle"))
+                all_test_cases.append(TestCase(name=repo_path.name, description="", repo_path=repo_path, sandbox_path="/kaggle"))
             
             total_repos += 1
     
@@ -130,11 +115,13 @@ def run_vibetest(subset: str, model: str, static: bool):
             repo_paths.append(repo_path)
             
             # Create test cases for this repo
-            for desc in test_strs:
+            for i, desc in enumerate(test_strs):
                 if "titanic" in subset:
-                    all_test_cases.append(TestCase(description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic": "/kaggle/input"}))
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic-kaggle-data": "/kaggle/input"}))
+                elif "nlp" in subset:
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./nlp-kaggle-data": "/kaggle/input"}))
                 else:
-                    all_test_cases.append(TestCase(description=desc, repo_path=repo_path, sandbox_path="/kaggle"))
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle"))
             
             total_repos += 1
     

@@ -155,17 +155,27 @@ Need a quick way to inspect recent agent runs? A minimal client lives in `viewer
 
 1. From the repo root run `python -m http.server 8000`.
 2. Open `http://localhost:8000/viewer/` in a browser.
-3. The UI reads the preprocessed `viewer/eval-results.json`, which is generated from `logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval`, so every repo/test shown is backed directly by the `.eval` trace (including the correct evidence tarballs). Code snippets that reference `/kaggle/...` paths use `viewer/repo-paths.json` to locate the checked-out repo under `data/kaggle/`.
+3. The UI reads the preprocessed `viewer/eval-results.json`, which is generated from one or more `.eval` log archives, so every repo/test shown is backed directly by the `.eval` trace (including the correct evidence tarballs). Code snippets that reference `/kaggle/...` paths use `viewer/repo-paths.json` to locate the checked-out repo under `data/kaggle/`.
+
+### Multi-Log Comparison
+
+The viewer supports loading multiple `.eval` logs side-by-side for comparison. When you select a test in one panel, the same test (matched by description) will be highlighted in other panels, allowing you to compare how different models or runs evaluated the same test case.
 
 If you sync new logs or repos locally:
 
-1. Rebuild the viewer payload (pulls directly from the `.eval` log):
+1. Rebuild the viewer payload (pulls directly from one or more `.eval` logs):
 
    ```bash
+   # Single log:
    python scripts/build_viewer_data.py \
        --eval logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval \
        --output viewer/eval-results.json
-   ```
+   
+   # Multiple logs for comparison:
+   python scripts/build_viewer_data.py \
+       --eval logs/kaggle-diabetic-gpt-5-mini.eval \
+       --eval logs/kaggle-nlp-gpt-5-mini.eval \
+       --eval logs/kaggle-titanic-gpt-5-mini.eval \
 
 2. Refresh the repo-path manifest so citations under both `/kaggle/...` and `/iclr/...` resolve to your local mirrors (defaults cover `data/kaggle/kaggle-titanic` with depth 2 and `data/iclr-26/iclr2026_filter2` with depth 1):
 

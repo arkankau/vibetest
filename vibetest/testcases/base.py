@@ -39,6 +39,9 @@ class TestCase(BaseModel):
 
     name: str = Field(..., description="A unique name for the test case")
     description: str = Field(..., description="Natural language description of what to test")
+    extra_instructions: Optional[str] = Field(
+        default=None, description="Additional instructions for the agent"
+    )
     repo_path: Path = Field(..., description="Path to the repository to test")
     sandbox_path: str = Field(
         default="/workspace", description="Path inside the sandbox where the repo will be placed"
