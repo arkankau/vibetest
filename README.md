@@ -151,41 +151,70 @@ See the `examples/` directory for:
 
 ## Results Viewer
 
-Need a quick way to inspect recent agent runs? A minimal client lives in `viewer/index.html`:
+A minimal browser-based viewer for inspecting agent evaluation results lives in `viewer/index.html`.
 
-1. From the repo root run `python -m http.server 8000`.
-2. Open `http://localhost:8000/viewer/` in a browser.
-3. The UI reads the preprocessed `viewer/eval-results.json`, which is generated from one or more `.eval` log archives, so every repo/test shown is backed directly by the `.eval` trace (including the correct evidence tarballs). Code snippets that reference `/kaggle/...` paths use `viewer/repo-paths.json` to locate the checked-out repo under `data/kaggle/`.
+### Quick Start
 
-### Multi-Log Comparison
-
-The viewer supports loading multiple `.eval` logs side-by-side for comparison. When you select a test in one panel, the same test (matched by description) will be highlighted in other panels, allowing you to compare how different models or runs evaluated the same test case.
-
-If you sync new logs or repos locally:
-
-1. Rebuild the viewer payload (pulls directly from one or more `.eval` logs):
-
+1. Start a local HTTP server from the repo root:
    ```bash
-   # Single log:
-   python scripts/build_viewer_data.py \
-       --eval logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval \
-       --output viewer/eval-results.json
-   
-   # Multiple logs for comparison:
-   python scripts/build_viewer_data.py \
-       --eval logs/kaggle-diabetic-gpt-5-mini.eval \
-       --eval logs/kaggle-nlp-gpt-5-mini.eval \
-       --eval logs/kaggle-titanic-gpt-5-mini.eval \
+   python -m http.server 8080
+   ```
 
-2. Refresh the repo-path manifest so citations under both `/kaggle/...` and `/iclr/...` resolve to your local mirrors (defaults cover `data/kaggle/kaggle-titanic` with depth 2 and `data/iclr-26/iclr2026_filter2` with depth 1):
+2. Open the viewer in one of three ways:
+
+   **Option A: Load .eval files directly via URL parameters (recommended)**
+   ```
+   http://localhost:8080/viewer/?eval=logs/kaggle-diabetic-gpt-5-mini.eval&eval=logs/kaggle-nlp-gpt-5-mini.eval
+   ```
+   The viewer parses the `.eval` ZIP archives directly in the browser—no preprocessing needed.
+
+   **Option B: Use the file picker**
+   Open `http://localhost:8080/viewer/` and click "📂 Open .eval files..." to select one or more `.eval` files from your local machine.
+
+   **Option C: Use precompiled data (legacy)**
+   If `viewer/eval-results.json` exists, the viewer will load it automatically as a fallback.
+
+### Setting Up Citation Lookups
+
+When the agent cites code (e.g., `[/kaggle/repo-name/file.py:10-20]`), the viewer needs to know where those repositories are checked out locally. This is configured via `viewer/repo-paths.json`.
+
+**Build the repo-paths manifest:**
 
 ```bash
+# Use default paths (covers data/kaggle/* and data/iclr-26/*):
 python scripts/build_repo_paths.py
-# or customize roots/depths:
-# python scripts/build_repo_paths.py --path data/kaggle/kaggle-titanic:2 --path data/iclr-26/iclr2026_filter2:1
+
+# Or specify custom paths with depth (how many levels down repos live):
+python scripts/build_repo_paths.py \
+    --path data/kaggle/kaggle-titanic:2 \
+    --path data/kaggle/kaggle-diabetic:2 \
+    --path data/kaggle/kaggle-nlp:2 \
+    --path data/iclr-26/iclr2026_filter2:1
 ```
 
-The UI is intentionally simple—no build tooling required.
+The `depth` parameter indicates the directory structure:
+- **depth 1**: repos are direct children (e.g., `data/iclr-26/iclr2026_filter2/<repo>/`)
+- **depth 2**: repos are nested under owners (e.g., `data/kaggle/kaggle-titanic/<owner>/<repo>/`)
+
+### (Optional) Precompiling Viewer Data
+
+If you prefer precompiled JSON over direct `.eval` parsing, or need to share the viewer without the raw `.eval` files:
+
+```bash
+# Single log:
+python scripts/build_viewer_data.py \
+    --eval logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval \
+    --output viewer/eval-results.json
+
+# Multiple logs:
+python scripts/build_viewer_data.py \
+    --eval logs/kaggle-diabetic-gpt-5-mini.eval \
+    --eval logs/kaggle-nlp-gpt-5-mini.eval \
+    --eval logs/kaggle-titanic-gpt-5-mini.eval \
+    --output viewer/eval-results.json
+```
+
+The viewer is intentionally simple—no build tooling or npm required.
 
 ## Development
 
