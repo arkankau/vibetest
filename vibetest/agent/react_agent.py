@@ -425,18 +425,19 @@ Determine whether the repository PASSes or FAILs the specified test case (or the
 - REPO_ROOT (path): Filesystem path to the repository.
 
 {'''## Operating Rules
-1. Evaluate, don't rewrite. Avoid writing substantial new code and instead try to instrument existing code (adding logging, commenting parts out, adding asserts, etc.). Prefer instrumentation (logging, flags, CLI args, small patches). Record all edits as diffs.
+1. Evaluate, don't rewrite. Avoid writing substantial new code and instead try to instrument existing code (adding logging, commenting parts out, adding asserts, creating unit tests etc.). Prefer instrumentation (logging, flags, CLI args, small patches). Record all edits as diffs.
 2. Evidence over opinion. Prefer runtime traces, logs, metrics, file hashes, config snapshots, git SHAs, and small data extracts.
 3. Data availability. Check for required datasets locally before downloading. If data is missing, look for directions for downloading it.
-4. Environment setup. Set up an environment (uv is installed) and install any necessary dependencies.
+4. Environment setup. Set up an environment (uv is installed) and install any necessary dependencies. You have complete access to the environment and can install packages using `apt-get`, `pip`, or `uv` as necessary. DO NOT give up just because of missing packages since you can just install them.
 5. Determinism where possible. Capture python -V, CUDA/cuDNN, pip freeze/conda list, git rev-parse HEAD, and relevant seeds.
-6. Use default parameters. Run code with default settings unless the test case requires otherwise.''' if not self.static else '''## Operating Rules
+6. Use default parameters. Run code with default settings unless the test case requires otherwise.
+7. Do not report hypothetical or potential issues, only report issues that have direct irrefutable evidence either supporting or refuting the TEST_CASE.''' if not self.static else '''## Operating Rules
 - You may not execute any of the code, so you should rely on careful examination of the code.
-- Do not report hypothetical or potential issues, only report issues that have direct evidence irrefutable evidence either supporting or refuting the TEST_CASE.'''}
+- Do not report hypothetical or potential issues, only report issues that have direct irrefutable evidence either supporting or refuting the TEST_CASE.'''}
 
 ## PASS/FAIL/INCONCLUSIVE Rubric
-- PASS: You found direct evidence satisfying the TEST_CASE in the target repo and are highly confident in your assessment.
-- FAIL: You found evidence refuting the TEST_CASE in the target repo and are highly confident in your assessment.
+- PASS: You found direct evidence satisfying the TEST_CASE in the target repo and are highly confident in your assessment.{' If possible, verify the pass by creating and running a reproducible example/experiment.' if not self.static else ''}
+- FAIL: You found evidence refuting the TEST_CASE in the target repo and are highly confident in your assessment.{' If possible, verify the failure by creating and running a reproducible example/experiment.' if not self.static else ''}
 - INCONCLUSIVE: You cannot obtain the required evidence to determine if the test PASSes or FAILs after reasonable attempts. This can also happen if even with extensive attempts and effort you cannot get enough certainty in your assessment. Explain why and what additional information is needed.
 
 ## Workflow
@@ -447,21 +448,22 @@ Determine whether the repository PASSes or FAILs the specified test case (or the
 - Map the repo: `README`, `requirements*`, `environment.yml`, `pyproject.toml`, entry points (`main.py`, `train.py`, `eval.py`), notebooks, configs.  
 - Search for relevant code fragments (e.g., "loss", "evaluation", flags).  
 - Locate available docs including *.md files and any PDFs which may describe the methods being evaluated in the code. You can convert PDFs to text with the command line tool 'pdftotext'.
-- Understand the repo, its capabilities, and any important assumptions or information by reading any available documentation.
+- Understand the repo, its capabilities, and any important assumptions or information by reading any available documentation. For instance, for security related properties that depend on the threat model, first understand the threat model of the code.
 {'- Assume data is available in the environment, but if it is not found, then try to download it.' if not self.static else ''}
 
 {'''### Phase 2 — Setup
-- Create isolated environment and install dependencies. Make sure to use the correct python version which can be configured with uv or conda. (uv is pre-installed)
-- Convert notebooks via `jupyter nbconvert --to script`.  
+- Create isolated environment and install dependencies. Make sure to use the correct versions (Python can be configured with uv or conda).
+- Convert notebooks via `jupyter nbconvert --to script`.
 - Apply minimal patches if necessary.
 
 ### Phase 3 — Execute & Instrument
-- Run the **minimal** reproducible command(s) to demonstrate or refute the property. Do not change default hyperparameters such as epochs, batch size, or learning rate unless the test case explicitly requires it.
+- Run the **minimal** reproducible command(s) to demonstrate or refute the property (e.g. do not change default hyperparameters such as epochs, batch size, or learning rate unless the test case explicitly requires it).
+- The property may require performing some proof of concept experiments.
 - Capture logs, metrics, and outputs in `/evidence/artifacts/`.
 
 ### Phase 4 — Corroborate
 - Cross-check signals (logs + metrics + artifacts).  
-- Prefer runtime evidence over static inspection.
+- Prefer runtime evidence over static inspection, and ALWAYS VERIFY static findings or beliefs about how the code behaves with dynamic evidence.
 
 ### Phase 5 — Decide
 - Apply the PASS/FAIL/INCONCLUSIVE rubric and cite concrete artifact-based evidence.''' if not self.static else '''## Phase 2 - Eval

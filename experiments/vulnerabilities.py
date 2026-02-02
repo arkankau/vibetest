@@ -93,7 +93,7 @@ def run_baseline(dataset: str):
     print(f"{'=' * 80}")
 
 
-def run_vibetest(dataset: str):
+def run_vibetest(dataset: str, dynamic: bool = False):
     """Run vibetest with specific test cases across all repositories."""
     print("=" * 80)
     print("Starting Vulnerability Tests - VibeTest Method")
@@ -135,7 +135,6 @@ def run_vibetest(dataset: str):
     # select 50 random repos from vuln_metadata for testing
     random.seed(42)
     selected_repos = random.sample(list(vuln_metadata.keys()), min(50, len(vuln_metadata)))
-    selected_repos = selected_repos[5:10]
 
     i = 0
     for repo, meta in vuln_metadata.items():
@@ -182,7 +181,7 @@ def run_vibetest(dataset: str):
     print(f"{'=' * 80}\n")
     
     # Step 2: Execute ALL tests in parallel across all repositories
-    agent = VibeTestAgent(static=True)
+    agent = VibeTestAgent(static=not dynamic)
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     
     print(f"\n{'=' * 80}")
@@ -876,6 +875,11 @@ if __name__ == "__main__":
         type=str,
         help="Path to results file to evaluate (.eval from Inspect AI or .jsonl from codeql baseline)"
     )
+    parser.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="Enable dynamic analysis"
+    )
     args = parser.parse_args()
 
     if args.eval:
@@ -885,4 +889,4 @@ if __name__ == "__main__":
     elif args.method == "codeql":
         run_codeql(args.dataset)
     else:
-        run_vibetest(args.dataset)
+        run_vibetest(args.dataset, dynamic=args.dynamic)
