@@ -34,14 +34,32 @@ def _truncate(text: str, limit: int = 12000) -> str:
 def _extract_json_array(text: str) -> list[dict[str, Any]] | None:
     if not text:
         return None
-    try:
-        parsed = json.loads(text)
+    def _coerce_result(parsed: Any) -> list[dict[str, Any]] | None:
         if isinstance(parsed, list):
             return parsed
-        if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
-            return parsed["results"]
+        if isinstance(parsed, dict):
+            for key in ("results", "items", "output"):
+                if isinstance(parsed.get(key), list):
+                    return parsed[key]
+        return None
+
+    try:
+        parsed = json.loads(text)
+        coerced = _coerce_result(parsed)
+        if coerced is not None:
+            return coerced
     except json.JSONDecodeError:
         pass
+
+    fenced = re.findall(r"```(?:json)?\\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    for block in fenced:
+        try:
+            parsed = json.loads(block)
+            coerced = _coerce_result(parsed)
+            if coerced is not None:
+                return coerced
+        except json.JSONDecodeError:
+            continue
 
     start = text.find("[")
     end = text.rfind("]")
@@ -50,9 +68,20 @@ def _extract_json_array(text: str) -> list[dict[str, Any]] | None:
     snippet = text[start : end + 1]
     try:
         parsed = json.loads(snippet)
-        if isinstance(parsed, list):
-            return parsed
+        coerced = _coerce_result(parsed)
+        if coerced is not None:
+            return coerced
     except json.JSONDecodeError:
+        pass
+    try:
+        import ast
+
+        py_text = snippet.replace("null", "None").replace("true", "True").replace("false", "False")
+        parsed = ast.literal_eval(py_text)
+        coerced = _coerce_result(parsed)
+        if coerced is not None:
+            return coerced
+    except Exception:
         return None
     return None
 
@@ -94,7 +123,7 @@ async def _map_review_async(
         mapper_model,
         config=GenerateConfig(
             temperature=0.0,
-            max_tokens=1200,
+            max_tokens=3000,
         ),
     )
 
@@ -115,7 +144,11 @@ async def _map_review_async(
     prompt = (
         f"{rules}"
         "Return a JSON array with one object per property, with keys:\n"
-        "  property_index (int), verdict (PASS/FAIL/INCONCLUSIVE), reason (string), evidence (string)\n\n"
+        "  property_index (int), verdict (PASS/FAIL/INCONCLUSIVE), reason (string), evidence (string)\n"
+        "Constraints:\n"
+        "- Output only JSON. Do not use markdown or code fences.\n"
+        "- Keep reason <= 30 words and evidence <= 30 words.\n\n"
+        "- Use compact JSON with no extra whitespace.\n\n"
         "Review:\n"
         f"{review_text}\n\n"
         "Properties (JSON list):\n"
