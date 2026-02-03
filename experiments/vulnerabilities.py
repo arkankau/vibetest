@@ -13,10 +13,14 @@ from typing import List, Dict, Any, Set
 from collections import defaultdict
 import random
 
-from vibetest.baselines import analyze_repo_with_codeql
+from vibetest.baselines import (
+    analyze_repo_with_codeql,
+    load_vuln_properties,
+    map_review_to_vuln_tests,
+)
 
 from vibetest import TestCase, VibeTestAgent
-from vibetest.agent import BaselineAgent
+from vibetest.agent import BaselineAgent, CodexReviewAgent
 
 csv.field_size_limit(sys.maxsize)
 
@@ -475,6 +479,125 @@ def run_codeql(dataset: str):
     print(f"{'=' * 80}")
 
 
+def _augment_tests_with_review(
+    tests: list[dict],
+    review_text: str,
+    extra_meta: dict,
+) -> None:
+    excerpt = review_text[:8000] if review_text else ""
+    for t in tests:
+        t["execution_log"] = excerpt
+        t["metadata"].update(extra_meta)
+
+
+def run_review_baseline(
+    dataset: str,
+    *,
+    reviewer: str,
+    codex_cmd: str,
+    codex_model: str | None,
+    codex_prompt: str,
+    codex_timeout_s: int,
+    mapper_model: str | None,
+):
+    print("=" * 80)
+    print(f"Starting Vulnerability Tests - {reviewer} Review Baseline")
+    print("=" * 80)
+
+    properties = load_vuln_properties(dataset)
+
+    vuln_metadata = {}
+    with open(f"./data/vuln/{dataset}/vulnerability_info.csv", mode="r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            repo_name = row["project_slug"] if dataset == "bibifi" else row["vuln_id"] + "_" + row["project_slug"]
+            cwe_id = row["cwe_id"]
+            cwe_name = row["cwe_name"]
+            info = row["patch"] if "patch" in row else row["notes"]
+            vuln_metadata[repo_name] = (cwe_id, cwe_name, info)
+
+    random.seed(42)
+    selected_repos = random.sample(list(vuln_metadata.keys()), min(50, len(vuln_metadata)))
+
+    repo_paths = []
+    for repo in vuln_metadata:
+        if repo not in selected_repos:
+            continue
+        repo_path = Path(f"./data/vuln/{dataset}/repos/{repo}")
+        if not repo_path.is_dir():
+            continue
+        analysis_path = repo_path / "build" if dataset == "bibifi" else repo_path
+        repo_paths.append((repo, repo_path, analysis_path))
+        print(f"Queueing repository: {repo}")
+
+    output_path = Path("results") / f"vuln_results_{dataset}_{reviewer}_baseline.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    codex_repos = [repo for repo, _, _ in repo_paths]
+    all_test_cases = [
+        TestCase(
+            name=repo,
+            description="",
+            repo_path=analysis_path,
+        )
+        for repo, _, analysis_path in repo_paths
+    ]
+    agent = CodexReviewAgent(
+        codex_cmd=codex_cmd,
+        codex_model=codex_model,
+        codex_prompt=codex_prompt,
+        timeout_s=codex_timeout_s,
+    )
+    all_results = agent.execute_tests(all_test_cases, sandbox="docker")
+    review_map: dict[str, str] = {}
+    for repo, result in zip(codex_repos, all_results):
+        review_map[repo] = result.message
+
+    with jsonlines.open(str(output_path), mode="w") as writer:
+        for repo, repo_root, analysis_path in repo_paths:
+            print(f"\n{'=' * 80}")
+            print(f"Repository: {repo}")
+            print(f"{'=' * 80}")
+
+            repo_id_for_eval = repo if dataset == "bibifi" else "_".join(str(repo).split("_")[1:])
+
+            review_text = review_map.get(repo, "")
+            meta = {
+                "codex_ok": bool(review_text),
+                "codex_error": None if review_text else "No review output captured",
+            }
+
+            tests = map_review_to_vuln_tests(
+                review_text,
+                dataset,
+                properties,
+                repo_id_for_eval=repo_id_for_eval,
+                reviewer=reviewer,
+                mapper_model=mapper_model,
+            )
+            _augment_tests_with_review(tests, review_text, meta)
+
+            passed_tests = sum(1 for t in tests if t.get("passed"))
+            total_tests = len(tests)
+
+            writer.write(
+                {
+                    "repo": str(analysis_path),
+                    "repo_name": repo_id_for_eval,
+                    "total_tests": total_tests,
+                    "passed_tests": passed_tests,
+                    "failed_tests": total_tests - passed_tests,
+                    "tests": tests,
+                    "metadata": {
+                        "reviewer": reviewer,
+                        "repo_root": str(repo_root),
+                    },
+                }
+            )
+
+    print(f"\nResults saved to: {output_path}")
+
+
 def extract_verdict_from_sample(sample_data: Dict[str, Any]) -> tuple[str, str, str]:
     """Extract the verdict, reason, and evidence from a sample's messages.
     
@@ -859,9 +982,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--method",
         type=str,
-        choices=["vibetest", "baseline", "codeql"],
+        choices=["vibetest", "baseline", "codeql", "codex"],
         default="vibetest",
-        help="Method to use: 'vibetest' for VibeTestAgent or 'baseline' for BaselineAgent"
+        help="Method to use: vibetest, baseline, codeql, or codex"
     )
     parser.add_argument(
         "--dataset",
@@ -880,6 +1003,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable dynamic analysis"
     )
+    parser.add_argument(
+        "--codex-cmd",
+        "--codex-command",
+        dest="codex_cmd",
+        type=str,
+        default="codex",
+        help="Codex CLI command name available inside the sandbox",
+    )
+    parser.add_argument(
+        "--codex-model",
+        type=str,
+        default="inspect",
+        help="Model name for Codex CLI (e.g., inspect to route via agent bridge)",
+    )
+    parser.add_argument(
+        "--codex-prompt",
+        type=str,
+        default="/review",
+        help="Prompt to send to Codex CLI",
+    )
+    parser.add_argument(
+        "--codex-timeout",
+        type=int,
+        default=1200,
+        help="Timeout seconds for Codex review",
+    )
+    parser.add_argument(
+        "--review-mapper-model",
+        type=str,
+        help="Model name for mapping reviews to test cases",
+    )
     args = parser.parse_args()
 
     if args.eval:
@@ -888,5 +1042,15 @@ if __name__ == "__main__":
         run_baseline(args.dataset)
     elif args.method == "codeql":
         run_codeql(args.dataset)
+    elif args.method == "codex":
+        run_review_baseline(
+            args.dataset,
+            reviewer="codex",
+            codex_cmd=args.codex_cmd,
+            codex_model=args.codex_model,
+            codex_prompt=args.codex_prompt,
+            codex_timeout_s=args.codex_timeout,
+            mapper_model=args.review_mapper_model,
+        )
     else:
         run_vibetest(args.dataset, dynamic=args.dynamic)
