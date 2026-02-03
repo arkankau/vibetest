@@ -649,6 +649,7 @@ if __name__ == "__main__":
             mapper_model=args.review_mapper_model,
             repo_limit=args.repo_limit,
             repo_offset=args.repo_offset,
+            output_path=args.output_path,
         )
     else:
         run_vibetest(args.subset, args.model, args.static)
