@@ -141,6 +141,64 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
     return results
 
 
+def _normalize_test_description(test: Dict[str, Any]) -> str:
+    metadata = test.get("metadata", {}) or {}
+    return (
+        metadata.get("test_description")
+        or metadata.get("property_text")
+        or metadata.get("property_id")
+        or test.get("description")
+        or "No specific test"
+    )
+
+
+def _coerce_reason(test: Dict[str, Any]) -> str:
+    return test.get("description") or test.get("reason") or "None"
+
+
+def _coerce_evidence(test: Dict[str, Any]) -> str:
+    metadata = test.get("metadata", {}) or {}
+    evidence_text = metadata.get("evidence_text")
+    if evidence_text:
+        return evidence_text
+    evidence = test.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        return "; ".join(str(e) for e in evidence)
+    if isinstance(evidence, str) and evidence:
+        return evidence
+    return "None"
+
+
+def load_results_from_jsonl(filepath: str) -> List[Dict[str, Any]]:
+    """Load results from a JSONL file (one repo result per line)."""
+    results: List[Dict[str, Any]] = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            tests = obj.get("tests", [])
+            for test in tests:
+                metadata = test.get("metadata", {}) or {}
+                metadata.setdefault("test_description", _normalize_test_description(test))
+                verdict = metadata.get("verdict")
+                if not verdict:
+                    verdict = "PASS" if test.get("passed") else "FAIL"
+                test["verdict"] = verdict
+                test["reason"] = _coerce_reason(test)
+                test["evidence"] = _coerce_evidence(test)
+                test["metadata"] = metadata
+            if "total_tests" not in obj:
+                obj["total_tests"] = len(tests)
+            if "passed_tests" not in obj:
+                obj["passed_tests"] = sum(1 for t in tests if t.get("passed"))
+            if "failed_tests" not in obj:
+                obj["failed_tests"] = obj["total_tests"] - obj["passed_tests"]
+            results.append(obj)
+    return results
+
+
 def calculate_basic_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Calculate basic statistics across all repositories."""
     total_repos = len(results)
@@ -376,7 +434,10 @@ def main():
         return
     
     print(f"Loading results from {eval_file}...")
-    results = load_results_from_eval(str(eval_file))
+    if eval_file.suffix == ".jsonl":
+        results = load_results_from_jsonl(str(eval_file))
+    else:
+        results = load_results_from_eval(str(eval_file))
     
     if not results:
         print("No results found in file!")

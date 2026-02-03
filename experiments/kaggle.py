@@ -231,6 +231,9 @@ def run_review_baseline(
     codex_prompt: str,
     codex_timeout_s: int,
     mapper_model: str | None,
+    repo_limit: int | None = None,
+    repo_offset: int | None = None,
+    output_path: str | None = None,
 ):
     print("=" * 80)
     print(f"Starting Kaggle Repository Tests - {reviewer} Review Baseline")
@@ -241,10 +244,15 @@ def run_review_baseline(
     results = []
 
     total_repos = 0
+    limit = repo_limit if repo_limit and repo_limit > 0 else 50
+    offset = repo_offset if repo_offset and repo_offset > 0 else 0
     for repo_path in Path(f"./data/kaggle/kaggle-{subset}").iterdir():
-        if total_repos >= 50:
+        if total_repos >= limit:
             break
         if repo_path.is_dir():
+            if offset > 0:
+                offset -= 1
+                continue
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             total_repos += 1
@@ -301,7 +309,7 @@ def run_review_baseline(
             }
         )
 
-    output_path = Path("results") / f"kaggle_{subset}_results_{reviewer}_baseline.jsonl"
+    output_path = Path(output_path) if output_path else Path("results") / f"kaggle_{subset}_results_{reviewer}_baseline.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(str(output_path), mode="w") as writer:
         for entry in results:
@@ -639,6 +647,8 @@ if __name__ == "__main__":
             codex_prompt=args.codex_prompt,
             codex_timeout_s=args.codex_timeout,
             mapper_model=args.review_mapper_model,
+            repo_limit=args.repo_limit,
+            repo_offset=args.repo_offset,
         )
     else:
         run_vibetest(args.subset, args.model, args.static)
