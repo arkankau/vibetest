@@ -376,14 +376,14 @@
   <body>
     <header>
       <h1>Agent Run Viewer</h1>
-      <p>View and inspect agent evaluation results from .eval log files.</p>
+      <p>View and inspect agent evaluation results from .eval and .jsonl files.</p>
       <div class="log-selector">
         <label for="log-select">Eval Log:</label>
         <select id="log-select"></select>
         <span class="log-stats" id="log-stats"></span>
         <div class="file-picker">
-          <input type="file" id="file-input" accept=".eval" multiple />
-          <label for="file-input">📂 Open .eval files...</label>
+          <input type="file" id="file-input" accept=".eval,.jsonl" multiple />
+          <label for="file-input">📂 Open .eval or .jsonl files...</label>
         </div>
       </div>
     </header>
@@ -404,7 +404,7 @@
         </div>
       </section>
     </main>
-    <footer id="footer">Data source: .eval logs</footer>
+    <footer id="footer">Data source: .eval/.jsonl logs</footer>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
@@ -437,7 +437,7 @@
       let selectedRepoIndex = null;
       let selectedTestIndex = null;
 
-      // ========== .eval file parsing functions ==========
+      // ========== .eval/.jsonl file parsing functions ==========
 
       function getModelFolder(modelName) {
         if (modelName.startsWith("gpt-5-mini")) return "gpt-5-mini";
@@ -626,6 +626,106 @@
         return ordered;
       }
 
+      function formatEvidenceField(value) {
+        if (!value) return "";
+        if (Array.isArray(value)) {
+          return value.map(item => (typeof item === "string" ? item : JSON.stringify(item))).join("\n");
+        }
+        if (typeof value === "object") {
+          return JSON.stringify(value, null, 2);
+        }
+        return String(value);
+      }
+
+      function normalizeJsonlTest(test, index, repoName, sourceName) {
+        const metadata = test.metadata || {};
+        const parsed = parseDescriptionSections(test.description || "");
+        const existingSections = test.sections || {};
+        const verdict =
+          existingSections.verdict ||
+          parsed.verdict ||
+          (metadata.verdict || (test.passed === true ? "PASS" : test.passed === false ? "FAIL" : ""));
+        const reason = existingSections.reason || parsed.reason || test.description || "";
+        const evidence =
+          existingSections.evidence ||
+          parsed.evidence ||
+          metadata.evidence_text ||
+          formatEvidenceField(test.evidence);
+
+        const propIndex =
+          metadata.prop_index ??
+          metadata.property_index ??
+          metadata.property_idx ??
+          metadata.property_id ??
+          index;
+
+        const testDescription =
+          metadata.test_description ||
+          metadata.property_text ||
+          metadata.property ||
+          metadata.name ||
+          "Test " + (index + 1);
+
+        return {
+          description: test.description || "",
+          sections: {
+            verdict: verdict || "",
+            reason: reason || "",
+            evidence: evidence || "",
+          },
+          passed: test.passed,
+          metadata: {
+            ...metadata,
+            test_description: testDescription,
+            prop_index: propIndex,
+            sample_id: metadata.sample_id || metadata.test_id || `${repoName}_prop${propIndex}`,
+            eval_source: metadata.eval_source || sourceName,
+          },
+          evidenceBundles: test.evidenceBundles || [],
+        };
+      }
+
+      function normalizeJsonlRepo(repo, sourceName) {
+        const repoName = repo.repo_name || repo.repo || repo.repo_slug || repo.name || "unknown-repo";
+        const tests = (repo.tests || []).map((test, index) =>
+          normalizeJsonlTest(test, index, repoName, sourceName)
+        );
+        tests.sort((a, b) => {
+          const indexA = a.metadata?.prop_index ?? 0;
+          const indexB = b.metadata?.prop_index ?? 0;
+          return indexA - indexB;
+        });
+        const totalTests = tests.length;
+        const passedTests = tests.filter(t => t.passed === true).length;
+        const failedTests = tests.filter(t => t.passed === false).length;
+
+        return {
+          repo: repo.repo || repoName,
+          repo_name: repoName,
+          repo_slug: repo.repo_slug || repoName,
+          tests: tests,
+          total_tests: repo.total_tests ?? totalTests,
+          passed_tests: repo.passed_tests ?? passedTests,
+          failed_tests: repo.failed_tests ?? failedTests,
+        };
+      }
+
+      function parseJsonlText(text, sourceName) {
+        const repos = [];
+        const lines = text.split(/\r?\n/);
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const obj = JSON.parse(trimmed);
+            repos.push(normalizeJsonlRepo(obj, sourceName));
+          } catch (error) {
+            console.warn("Failed to parse JSONL line", error);
+          }
+        }
+        return repos;
+      }
+
       async function parseEvalFile(file) {
         const arrayBuffer = await file.arrayBuffer();
         const data = new Uint8Array(arrayBuffer);
@@ -647,6 +747,17 @@
         const repos = aggregateSamples(samples, evalName);
         return {
           name: evalName,
+          path: file.name,
+          repos: repos,
+        };
+      }
+
+      async function parseJsonlFile(file) {
+        const text = await file.text();
+        const logName = file.name.replace(/\.jsonl$/, "");
+        const repos = parseJsonlText(text, logName);
+        return {
+          name: logName,
           path: file.name,
           repos: repos,
         };
@@ -682,11 +793,40 @@
         };
       }
 
+      async function fetchAndParseJsonlUrl(jsonlPath) {
+        const response = await fetch(buildAssetURL(jsonlPath));
+        if (!response.ok) {
+          throw new Error("Failed to fetch " + jsonlPath + " (" + response.status + ")");
+        }
+        const text = await response.text();
+        const logName = jsonlPath.split("/").pop().replace(/\.jsonl$/, "");
+        const repos = parseJsonlText(text, logName);
+        return {
+          name: logName,
+          path: jsonlPath,
+          repos: repos,
+        };
+      }
+
+      async function parseResultFile(file) {
+        if (file.name.endsWith(".jsonl")) {
+          return parseJsonlFile(file);
+        }
+        return parseEvalFile(file);
+      }
+
+      async function fetchAndParseResultUrl(path) {
+        if (path.endsWith(".jsonl")) {
+          return fetchAndParseJsonlUrl(path);
+        }
+        return fetchAndParseEvalUrl(path);
+      }
+
       // ========== URL parameter handling ==========
 
-      function getEvalPathsFromUrl() {
+      function getResultPathsFromUrl() {
         const params = new URLSearchParams(window.location.search);
-        return params.getAll("eval");
+        return [...params.getAll("eval"), ...params.getAll("jsonl"), ...params.getAll("results")];
       }
 
       // ========== UI helper functions ==========
@@ -1313,21 +1453,21 @@
         try {
           await loadRepoPaths();
 
-          // Check URL params for direct .eval file paths
-          const evalPaths = getEvalPathsFromUrl();
+          // Check URL params for direct result file paths
+          const evalPaths = getResultPathsFromUrl();
 
           if (evalPaths.length > 0) {
-            // Load .eval files directly from URL params
-            emptyState.textContent = "Loading .eval files...";
+            // Load result files directly from URL params
+            emptyState.textContent = "Loading result files...";
             const results = await Promise.all(
-              evalPaths.map(path => fetchAndParseEvalUrl(path).catch(e => {
+              evalPaths.map(path => fetchAndParseResultUrl(path).catch(e => {
                 console.error("Failed to load", path, e);
                 return null;
               }))
             );
             logs = results.filter(Boolean);
             if (!logs.length) {
-              throw new Error("No valid .eval files could be loaded from URL parameters.");
+              throw new Error("No valid result files could be loaded from URL parameters.");
             }
           } else {
             // Try precompiled data first
@@ -1335,7 +1475,7 @@
             if (precompiled) {
               logs = precompiled;
             } else {
-              emptyState.textContent = "No data loaded. Use the file picker to open .eval files, or add ?eval=path/to/file.eval to the URL.";
+              emptyState.textContent = "No data loaded. Use the file picker to open .eval/.jsonl files, or add ?eval=path/to/file.eval or ?jsonl=path/to/file.jsonl to the URL.";
               return;
             }
           }
@@ -1353,12 +1493,12 @@
         const files = Array.from(e.target.files || []);
         if (!files.length) return;
 
-        emptyState.textContent = "Loading " + files.length + " .eval file(s)...";
+        emptyState.textContent = "Loading " + files.length + " file(s)...";
         logStats.textContent = "Loading...";
 
         try {
           const results = await Promise.all(
-            files.map(file => parseEvalFile(file).catch(err => {
+            files.map(file => parseResultFile(file).catch(err => {
               console.error("Failed to parse", file.name, err);
               return null;
             }))
@@ -1366,7 +1506,7 @@
 
           const validLogs = results.filter(Boolean);
           if (!validLogs.length) {
-            emptyState.textContent = "No valid .eval files could be parsed.";
+            emptyState.textContent = "No valid result files could be parsed.";
             return;
           }
 
