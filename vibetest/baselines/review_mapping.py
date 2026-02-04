@@ -200,6 +200,13 @@ def load_kaggle_properties() -> list[str]:
     return properties
 
 
+def load_hallucination_properties() -> list[str]:
+    props_path = _repo_root() / "data" / "hallucination" / "properties.md"
+    content = props_path.read_text(encoding="utf-8")
+    properties = [p.strip() for p in content.split("- ")[1:] if p.strip()]
+    return properties
+
+
 def map_review_to_kaggle_tests(
     review_text: str,
     properties: list[str],
@@ -221,6 +228,53 @@ def map_review_to_kaggle_tests(
             properties=props_payload,
             mapper_model=mapper_model,
             extra_instructions=extra_instructions,
+        )
+    )
+    by_index = {item.property_index: item for item in items}
+
+    tests: list[dict[str, Any]] = []
+    for idx, prop in enumerate(properties):
+        item = by_index.get(idx)
+        verdict = item.verdict if item else "PASS"
+        reason = item.reason if item else "Not mentioned in review."
+        evidence = item.evidence if item else ""
+        passed = verdict != "FAIL"
+        tests.append(
+            {
+                "description": reason,
+                "passed": passed,
+                "evidence": [],
+                "execution_log": "",
+                "metadata": {
+                    "reviewer": reviewer,
+                    "mapper_model": mapper_model,
+                    "property_index": idx,
+                    "property_text": prop,
+                    "verdict": verdict,
+                    "evidence_text": evidence,
+                },
+            }
+        )
+    return tests
+
+
+def map_review_to_hallucination_tests(
+    review_text: str,
+    properties: list[str],
+    *,
+    reviewer: str,
+    mapper_model: str | None = None,
+) -> list[dict[str, Any]]:
+    mapper_model = mapper_model or _default_mapper_model()
+    props_payload = [
+        {"property_index": idx, "text": prop} for idx, prop in enumerate(properties)
+    ]
+
+    items = _run_async(
+        _map_review_async(
+            review_text=review_text,
+            properties=props_payload,
+            mapper_model=mapper_model,
         )
     )
     by_index = {item.property_index: item for item in items}
