@@ -498,7 +498,13 @@ def run_review_baseline(
     codex_model: str | None,
     codex_prompt: str,
     codex_timeout_s: int,
+    codex_max_files: int | None,
+    codex_max_total_mb: int | None,
     mapper_model: str | None,
+    repo_limit: int | None = None,
+    repo_offset: int | None = None,
+    output_path: str | None = None,
+    codex_log_dir: str | None = None,
 ):
     print("=" * 80)
     print(f"Starting Vulnerability Tests - {reviewer} Review Baseline")
@@ -518,11 +524,13 @@ def run_review_baseline(
 
     random.seed(42)
     selected_repos = random.sample(list(vuln_metadata.keys()), min(50, len(vuln_metadata)))
+    if repo_offset and repo_offset > 0:
+        selected_repos = selected_repos[repo_offset:]
+    if repo_limit and repo_limit > 0:
+        selected_repos = selected_repos[:repo_limit]
 
     repo_paths = []
-    for repo in vuln_metadata:
-        if repo not in selected_repos:
-            continue
+    for repo in selected_repos:
         repo_path = Path(f"./data/vuln/{dataset}/repos/{repo}")
         if not repo_path.is_dir():
             continue
@@ -530,8 +538,13 @@ def run_review_baseline(
         repo_paths.append((repo, repo_path, analysis_path))
         print(f"Queueing repository: {repo}")
 
-    output_path = Path("results") / f"vuln_results_{dataset}_{reviewer}_baseline.jsonl"
+    output_path = Path(output_path) if output_path else Path("results") / f"vuln_results_{dataset}_{reviewer}_baseline.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not repo_paths:
+        print("No repositories found for the selected slice; writing empty results.")
+        output_path.write_text("")
+        return
 
     codex_repos = [repo for repo, _, _ in repo_paths]
     all_test_cases = [
@@ -547,6 +560,9 @@ def run_review_baseline(
         codex_model=codex_model,
         codex_prompt=codex_prompt,
         timeout_s=codex_timeout_s,
+        max_files=codex_max_files,
+        max_total_bytes=(codex_max_total_mb * 1024 * 1024) if codex_max_total_mb else None,
+        log_dir=codex_log_dir,
     )
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     review_map: dict[str, str] = {}
@@ -1030,9 +1046,39 @@ if __name__ == "__main__":
         help="Timeout seconds for Codex review",
     )
     parser.add_argument(
+        "--codex-max-files",
+        type=int,
+        help="Optional max files to include in Codex sandbox",
+    )
+    parser.add_argument(
+        "--codex-max-total-mb",
+        type=int,
+        help="Optional max total MB to include in Codex sandbox",
+    )
+    parser.add_argument(
+        "--codex-log-dir",
+        type=str,
+        help="Optional Inspect log dir for Codex reviews",
+    )
+    parser.add_argument(
         "--review-mapper-model",
         type=str,
         help="Model name for mapping reviews to test cases",
+    )
+    parser.add_argument(
+        "--repo-limit",
+        type=int,
+        help="Optional limit on number of repositories to run",
+    )
+    parser.add_argument(
+        "--repo-offset",
+        type=int,
+        help="Optional number of repositories to skip before starting",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        help="Optional output path for Codex baseline results JSONL",
     )
     args = parser.parse_args()
 
@@ -1050,7 +1096,13 @@ if __name__ == "__main__":
             codex_model=args.codex_model,
             codex_prompt=args.codex_prompt,
             codex_timeout_s=args.codex_timeout,
+            codex_max_files=args.codex_max_files,
+            codex_max_total_mb=args.codex_max_total_mb,
             mapper_model=args.review_mapper_model,
+            repo_limit=args.repo_limit,
+            repo_offset=args.repo_offset,
+            output_path=args.output_path,
+            codex_log_dir=args.codex_log_dir,
         )
     else:
         run_vibetest(args.dataset, dynamic=args.dynamic)

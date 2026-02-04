@@ -80,6 +80,9 @@ class CodexReviewAgent:
         codex_prompt: str = "/review",
         timeout_s: int = 1200,
         skip_git_check: bool = True,
+        max_files: int | None = 2000,
+        max_total_bytes: int | None = 10 * 1024 * 1024,
+        log_dir: str = "./logs",
     ):
         self.model_name = model or os.getenv("VIBETEST_MODEL", "openai/gpt-5-mini")
         self.codex_cmd = codex_cmd
@@ -87,6 +90,9 @@ class CodexReviewAgent:
         self.codex_prompt = codex_prompt
         self.timeout_s = timeout_s
         self.skip_git_check = skip_git_check
+        self.max_files = max_files
+        self.max_total_bytes = max_total_bytes
+        self.log_dir = log_dir
 
     def _create_solver(self):
         return codex_review_agent(
@@ -117,7 +123,11 @@ class CodexReviewAgent:
                     input=self._create_prompt(test_case),
                     target="REVIEW",
                     id=sample_id,
-                    files=get_files(test_case),
+                    files=get_files(
+                        test_case,
+                        max_files=self.max_files,
+                        max_total_bytes=self.max_total_bytes,
+                    ),
                 )
             )
 
@@ -131,7 +141,7 @@ class CodexReviewAgent:
         results = eval(
             tasks=task,
             model=self.model_name,
-            log_dir="./logs",
+            log_dir=self.log_dir,
             retry_on_error=1,
             fail_on_error=False,
         )

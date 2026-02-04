@@ -260,10 +260,27 @@ def load_vuln_properties(dataset: str) -> list[Any]:
         properties = [p.strip() for p in content.split("- ")[1:] if p.strip()]
         return properties
 
+    # Prefer section-based properties (e.g., "## CWE-22 ..." headings)
+    heading_re = re.compile(r"^##\s*(CWE-\d+[^\n]*)\s*$", re.MULTILINE)
+    matches = list(heading_re.finditer(content))
+    if matches:
+        cwe_properties: list[tuple[str, str]] = []
+        for idx, match in enumerate(matches):
+            start = match.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            section = content[start:end].strip()
+            m = re.search(r"CWE-(\d+)", match.group(1))
+            if not m:
+                continue
+            cwe = m.group(1).lstrip("0") or "0"
+            cwe_properties.append((cwe, section))
+        return cwe_properties
+
+    # Fallback for bullet-list properties
     properties_raw = [p.strip() for p in content.split("- ")[1:] if p.strip()]
     cwe_properties: list[tuple[str, str]] = []
     for prop_text in properties_raw:
-        m = re.search(r"CWE-(\\d+)", prop_text)
+        m = re.search(r"CWE-(\d+)", prop_text)
         if not m:
             continue
         cwe = m.group(1).lstrip("0") or "0"

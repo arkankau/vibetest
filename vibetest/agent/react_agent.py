@@ -206,7 +206,13 @@ def cleanup_archive_temps() -> None:
     _archive_cache = {}
 
 
-def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, str]:
+def get_files(
+    test_case: TestCase,
+    sandbox_prefix: str = "/workspace/",
+    *,
+    max_files: int | None = None,
+    max_total_bytes: int | None = None,
+) -> dict[str, str]:
     """Get files from the test case repository.
 
     Args:
@@ -215,29 +221,104 @@ def get_files(test_case: TestCase, sandbox_prefix="/workspace/") -> dict[str, st
     """
     files = {}
     repo_path = test_case.repo_path
+    total_bytes = 0
+    limited = max_files is not None or max_total_bytes is not None
+    skip_dirs = {
+        ".git",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "dist",
+        "build",
+        "target",
+        ".gradle",
+        ".mvn",
+        ".idea",
+        ".vscode",
+        "out",
+        "bin",
+        "obj",
+    }
+    skip_exts = {
+        ".class",
+        ".jar",
+        ".war",
+        ".zip",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".pdf",
+        ".exe",
+        ".dll",
+        ".so",
+        ".dylib",
+    }
+    max_file_bytes = 1 * 1024 * 1024 if limited else None
     if repo_path and os.path.isdir(repo_path):
-        for root, _, filenames in os.walk(repo_path):
+        for root, dirs, filenames in os.walk(repo_path):
             if ".venv" in root or "__pycache__" in root or ".git" in root:
                 continue  # Skip virtual environments and cache directories
+            if limited:
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
             for filename in filenames:
                 # if ".py" not in filename and ".md" not in filename and ".txt" not in filename and ".pdf" not in filename and ".ipynb" not in filename and ".cpp" not in filename and ".java" not in filename and ".c" not in filename:
                 #     continue # TODO: we shouldn't in general exclude all non python and non md/txt/pdf/ipynb files.
                 full_path = os.path.join(root, filename)
                 relative_path = os.path.relpath(full_path, repo_path)
                 sandbox_path = os.path.join(sandbox_prefix, "repo", relative_path)
+                if limited and Path(filename).suffix.lower() in skip_exts:
+                    continue
+                if max_files is not None and len(files) >= max_files:
+                    continue
+                try:
+                    file_size = os.path.getsize(full_path)
+                except OSError:
+                    file_size = 0
+                if max_file_bytes is not None and file_size > max_file_bytes:
+                    continue
+                if max_total_bytes is not None and (total_bytes + file_size) > max_total_bytes:
+                    continue
                 files[sandbox_path] = full_path
+                total_bytes += file_size
 
     for additional_src, additional_dst in test_case.additional_data.items():
         additional_src_path = Path(additional_src)
         if additional_src_path.is_file():
+            if max_files is not None and len(files) >= max_files:
+                continue
+            try:
+                file_size = additional_src_path.stat().st_size
+            except OSError:
+                file_size = 0
+            if max_file_bytes is not None and file_size > max_file_bytes:
+                continue
+            if max_total_bytes is not None and (total_bytes + file_size) > max_total_bytes:
+                continue
             files[additional_dst] = str(additional_src_path)
+            total_bytes += file_size
         elif additional_src_path.is_dir():
-            for root, _, filenames in os.walk(additional_src_path):
+            for root, dirs, filenames in os.walk(additional_src_path):
+                if limited:
+                    dirs[:] = [d for d in dirs if d not in skip_dirs]
                 for filename in filenames:
                     full_path = os.path.join(root, filename)
                     relative_path = os.path.relpath(full_path, additional_src_path)
                     sandbox_path = os.path.join(additional_dst, additional_src_path.name, relative_path)
+                    if limited and Path(filename).suffix.lower() in skip_exts:
+                        continue
+                    if max_files is not None and len(files) >= max_files:
+                        continue
+                    try:
+                        file_size = os.path.getsize(full_path)
+                    except OSError:
+                        file_size = 0
+                    if max_file_bytes is not None and file_size > max_file_bytes:
+                        continue
+                    if max_total_bytes is not None and (total_bytes + file_size) > max_total_bytes:
+                        continue
                     files[sandbox_path] = full_path
+                    total_bytes += file_size
     print("Files:", files)
     return files
 
