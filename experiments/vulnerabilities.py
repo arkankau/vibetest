@@ -193,7 +193,7 @@ def run_vibetest(dataset: str, dynamic: bool = False):
     print(f"{'=' * 80}\n")
     
     # Step 3: Group results by repository and write to file
-    with jsonlines.open(f"results/vuln_results_{agent.model_name.split('/')[1]}.jsonl", mode="w") as writer:
+    with jsonlines.open(f"results/vuln_results_{dataset}_AT-{agent.model_name.split('/')[1]}.jsonl", mode="w") as writer:
         # Group results by repository
         for repo_idx, repo_path in enumerate(repo_paths):
             print(f"\n{'=' * 80}")
