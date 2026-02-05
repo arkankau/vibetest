@@ -20,11 +20,25 @@ def _safe_id(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_")
 
 
-def _iter_paper_paths(limit: int, offset: int) -> list[Path]:
+def _iter_paper_paths(limit: int, offset: int, paper_list: Path | None) -> list[Path]:
     root = Path("./data/hallucination/arxiv_downloads")
     if not root.exists():
         raise SystemExit(f"Missing data directory: {root}")
     paths: list[Path] = []
+    if paper_list is not None:
+        if not paper_list.exists():
+            raise SystemExit(f"Missing paper list: {paper_list}")
+        for line in paper_list.read_text(encoding="utf-8").splitlines():
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            candidate = Path(name)
+            if not candidate.is_absolute():
+                candidate = root / name
+            if not candidate.exists():
+                raise SystemExit(f"Paper not found from list entry: {name}")
+            paths.append(candidate)
+        return paths
     for paper_path in sorted(root.iterdir()):
         if not paper_path.is_dir():
             continue
@@ -110,6 +124,7 @@ def run_vibetest(
     dynamic: bool,
     paper_limit: int,
     paper_offset: int,
+    paper_list: str | None,
     output_path: str | None,
 ):
     print("=" * 80)
@@ -119,7 +134,11 @@ def run_vibetest(
     properties = load_hallucination_properties()
     print(f"Loaded {len(properties)} properties from properties.md")
 
-    paper_paths = _iter_paper_paths(paper_limit, paper_offset)
+    paper_paths = _iter_paper_paths(
+        paper_limit,
+        paper_offset,
+        Path(paper_list) if paper_list else None,
+    )
     tests_per_paper = len(properties)
     all_test_cases: list[TestCase] = []
 
@@ -200,6 +219,7 @@ def run_codex_baseline(
     mapper_model: str | None,
     paper_limit: int,
     paper_offset: int,
+    paper_list: str | None,
     output_path: str | None,
 ):
     print("=" * 80)
@@ -207,7 +227,11 @@ def run_codex_baseline(
     print("=" * 80)
 
     properties = load_hallucination_properties()
-    paper_paths = _iter_paper_paths(paper_limit, paper_offset)
+    paper_paths = _iter_paper_paths(
+        paper_limit,
+        paper_offset,
+        Path(paper_list) if paper_list else None,
+    )
     results = []
 
     all_test_cases = [
@@ -279,10 +303,12 @@ def run_refchecker_baseline(
     mapper_model: str | None,
     paper_limit: int,
     paper_offset: int,
+    paper_list: str | None,
     output_path: str | None,
     refchecker_output_root: str | None,
     llm_provider: str | None,
     llm_model: str | None,
+    semantic_scholar_api_key: str | None,
     db_path: str | None,
     workdir: str | None,
 ):
@@ -291,7 +317,11 @@ def run_refchecker_baseline(
     print("=" * 80)
 
     properties = load_hallucination_properties()
-    paper_paths = _iter_paper_paths(paper_limit, paper_offset)
+    paper_paths = _iter_paper_paths(
+        paper_limit,
+        paper_offset,
+        Path(paper_list) if paper_list else None,
+    )
     results = []
 
     output_root = Path(refchecker_output_root) if refchecker_output_root else None
@@ -310,6 +340,7 @@ def run_refchecker_baseline(
             timeout_s=refchecker_timeout_s,
             llm_provider=llm_provider,
             llm_model=llm_model,
+            semantic_scholar_api_key=semantic_scholar_api_key,
             db_path=db_path_obj,
             workdir=workdir_obj,
         )
@@ -384,6 +415,11 @@ def main() -> None:
     parser.add_argument("--dynamic", action="store_true", help="Enable dynamic (non-static) vibetest agent.")
     parser.add_argument("--paper-limit", type=int, default=100, help="Number of papers to run.")
     parser.add_argument("--paper-offset", type=int, default=0, help="Number of papers to skip before starting.")
+    parser.add_argument(
+        "--paper-list",
+        type=str,
+        help="File with one paper folder name or path per line. Overrides --paper-limit/--paper-offset.",
+    )
     parser.add_argument("--output-path", type=str, help="Output JSONL path.")
 
     # Codex options
@@ -398,6 +434,11 @@ def main() -> None:
     parser.add_argument("--refchecker-output-root", type=str, help="Directory to store RefChecker reports.")
     parser.add_argument("--refchecker-llm-provider", type=str, help="RefChecker LLM provider.")
     parser.add_argument("--refchecker-llm-model", type=str, help="RefChecker LLM model.")
+    parser.add_argument(
+        "--refchecker-semantic-scholar-api-key",
+        type=str,
+        help="Semantic Scholar API key override (defaults to SEMANTIC_SCHOLAR_API_KEY env/.env).",
+    )
     parser.add_argument("--refchecker-db-path", type=str, help="Path to RefChecker DB.")
     parser.add_argument("--refchecker-workdir", type=str, help="Working directory for RefChecker command.")
 
@@ -411,6 +452,7 @@ def main() -> None:
             dynamic=args.dynamic,
             paper_limit=args.paper_limit,
             paper_offset=args.paper_offset,
+            paper_list=args.paper_list,
             output_path=args.output_path,
         )
     elif args.method == "codex":
@@ -423,6 +465,7 @@ def main() -> None:
             mapper_model=args.review_mapper_model,
             paper_limit=args.paper_limit,
             paper_offset=args.paper_offset,
+            paper_list=args.paper_list,
             output_path=args.output_path,
         )
     else:
@@ -432,10 +475,12 @@ def main() -> None:
             mapper_model=args.review_mapper_model,
             paper_limit=args.paper_limit,
             paper_offset=args.paper_offset,
+            paper_list=args.paper_list,
             output_path=args.output_path,
             refchecker_output_root=args.refchecker_output_root,
             llm_provider=args.refchecker_llm_provider,
             llm_model=args.refchecker_llm_model,
+            semantic_scholar_api_key=args.refchecker_semantic_scholar_api_key,
             db_path=args.refchecker_db_path,
             workdir=args.refchecker_workdir,
         )
