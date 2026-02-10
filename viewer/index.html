@@ -18,7 +18,8 @@
         margin: 0;
         background: #f6f7f9;
         color: #1f2328;
-        min-height: 100vh;
+        height: 100vh;
+        overflow: hidden;
         display: flex;
         flex-direction: column;
       }
@@ -115,6 +116,7 @@
         padding: 1.5rem 2rem 2rem;
         flex: 1;
         min-height: 0;
+        overflow: hidden;
       }
 
       aside {
@@ -201,6 +203,14 @@
         margin-top: 0.35rem;
         font-size: 0.75rem;
         color: #6c7280;
+      }
+
+      .repo-name {
+        overflow-x: auto;
+        overflow-y: hidden;
+        white-space: nowrap;
+        scrollbar-width: thin;
+        padding-bottom: 0.1rem;
       }
 
       .status-pill {
@@ -550,8 +560,37 @@
         return Array.from(bundles).sort().map(name => "evidence-dumps/" + modelFolder + "/" + name);
       }
 
-      function verdictToBool(verdictText) {
-        return verdictText.toUpperCase().startsWith("PASS");
+      function canonicalVerdict(verdictText, fallbackPassed) {
+        const rawVerdict = String(verdictText || "")
+          .split(/\n/)[0]
+          .trim()
+          .toUpperCase();
+        if (rawVerdict.startsWith("PASS")) return "PASS";
+        if (rawVerdict.startsWith("FAIL")) return "FAIL";
+        if (rawVerdict.startsWith("INCONCLUSIVE")) return "INCONCLUSIVE";
+        if (rawVerdict.startsWith("NA") || rawVerdict.includes("NOT APPLICABLE")) return "NOT APPLICABLE";
+        if (fallbackPassed === true) return "PASS";
+        if (fallbackPassed === false) return "FAIL";
+        return "UNKNOWN";
+      }
+
+      function recomputeRepoCounts(repo) {
+        const tests = repo.tests || [];
+        let passedTests = 0;
+        let failedTests = 0;
+        for (const test of tests) {
+          const structured = getStructuredSections(test);
+          const verdict = canonicalVerdict(structured.verdict, test.passed);
+          if (verdict === "PASS") {
+            passedTests += 1;
+          } else if (verdict === "FAIL") {
+            failedTests += 1;
+          }
+        }
+        repo.total_tests = tests.length;
+        repo.passed_tests = passedTests;
+        repo.failed_tests = failedTests;
+        return repo;
       }
 
       function aggregateSamples(samples, evalSource) {
@@ -564,7 +603,8 @@
           const repoPath = extractRepoPath(sample.input || "");
           const sections = extractSectionsFromMessages(sample.messages || []);
           const verdictLine = sections.verdict || "";
-          const passed = verdictToBool(verdictLine);
+          const verdict = canonicalVerdict(verdictLine, undefined);
+          const passed = verdict === "PASS";
           const modelName = (sample.output || {}).model || "unknown";
           const modelFolder = getModelFolder(modelName);
           const evidenceBundles = extractEvidenceBundles(sample, modelFolder);
@@ -603,12 +643,6 @@
 
           const repoEntry = repos[repoName];
           repoEntry.tests.push(testPayload);
-          repoEntry.total_tests++;
-          if (passed) {
-            repoEntry.passed_tests++;
-          } else {
-            repoEntry.failed_tests++;
-          }
         }
 
         // Sort tests within each repo by prop_index
@@ -618,6 +652,7 @@
             const indexB = b.metadata?.prop_index ?? 0;
             return indexA - indexB;
           });
+          recomputeRepoCounts(repo);
         }
 
         const ordered = Object.values(repos).sort((a, b) =>
@@ -635,6 +670,74 @@
           return JSON.stringify(value, null, 2);
         }
         return String(value);
+      }
+
+      function parseSamplePropIndex(sampleId, row) {
+        const fromSample = extractPropIndexFromSampleId(sampleId || "");
+        if (fromSample) return fromSample;
+        const cweMatch = (sampleId || "").match(/_cwe(\d+)$/i);
+        if (cweMatch) return parseInt(cweMatch[1], 10);
+        const vulnMatch = (sampleId || "").match(/_vuln(\d+)$/i);
+        if (vulnMatch) return parseInt(vulnMatch[1], 10);
+        const fromRow = row?.property_index ?? row?.property_idx ?? row?.property_id;
+        if (typeof fromRow === "number") return fromRow;
+        return 0;
+      }
+
+      function normalizeRecallSampleRows(sampleRows, sourceName) {
+        const repos = {};
+        for (const row of sampleRows) {
+          const sampleId = row.sample_id || "";
+          const repoName = row.repo_slug || row.repo_name || extractRepoNameFromSampleId(sampleId || "unknown-repo");
+          const verdict = String(row.verdict || "").trim().toUpperCase();
+          const reason = row.reason_text || row.reason || "";
+          const evidence = row.evidence_text || row.evidence || "";
+          const canonical = canonicalVerdict(verdict, undefined);
+          const passed = canonical === "PASS";
+          const propIndex = parseSamplePropIndex(sampleId, row);
+          const testDescription = row.test_description || row.property_text || (row.cwe_id ? ("CWE-" + row.cwe_id) : sampleId || ("Test " + (propIndex + 1)));
+
+          if (!repos[repoName]) {
+            repos[repoName] = {
+              repo: repoName,
+              repo_name: repoName,
+              repo_slug: repoName,
+              tests: [],
+              total_tests: 0,
+              passed_tests: 0,
+              failed_tests: 0,
+            };
+          }
+
+          const testPayload = {
+            description: row.description || "",
+            sections: {
+              verdict: verdict,
+              reason: String(reason),
+              evidence: String(evidence),
+            },
+            passed,
+            metadata: {
+              sample_id: sampleId || `${repoName}_prop${propIndex}`,
+              test_description: String(testDescription),
+              prop_index: propIndex,
+              cwe_id: row.cwe_id || "",
+              dataset: row.dataset || "",
+              eval_source: sourceName,
+            },
+            evidenceBundles: [],
+          };
+
+          const repoEntry = repos[repoName];
+          repoEntry.tests.push(testPayload);
+        }
+
+        return Object.values(repos)
+          .map((repo) => {
+            repo.tests.sort((a, b) => (a.metadata?.prop_index ?? 0) - (b.metadata?.prop_index ?? 0));
+            return recomputeRepoCounts(repo);
+          })
+          .sort((a, b) => (a.repo_name || a.repo).localeCompare(b.repo_name || b.repo));
       }
 
       function normalizeJsonlTest(test, index, repoName, sourceName) {
@@ -695,35 +798,49 @@
           const indexB = b.metadata?.prop_index ?? 0;
           return indexA - indexB;
         });
-        const totalTests = tests.length;
-        const passedTests = tests.filter(t => t.passed === true).length;
-        const failedTests = tests.filter(t => t.passed === false).length;
-
-        return {
+        const repoEntry = {
           repo: repo.repo || repoName,
           repo_name: repoName,
           repo_slug: repo.repo_slug || repoName,
           tests: tests,
-          total_tests: repo.total_tests ?? totalTests,
-          passed_tests: repo.passed_tests ?? passedTests,
-          failed_tests: repo.failed_tests ?? failedTests,
+          total_tests: 0,
+          passed_tests: 0,
+          failed_tests: 0,
         };
+        return recomputeRepoCounts(repoEntry);
       }
 
       function parseJsonlText(text, sourceName) {
-        const repos = [];
+        const repoRows = [];
+        const sampleRows = [];
         const lines = text.split(/\r?\n/);
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           try {
             const obj = JSON.parse(trimmed);
-            repos.push(normalizeJsonlRepo(obj, sourceName));
+            const recordType = String(obj.record_type || "").toLowerCase();
+            if (recordType === "summary") {
+              continue;
+            }
+            if (recordType === "sample" || obj.sample_id) {
+              sampleRows.push(obj);
+              continue;
+            }
+            if (Array.isArray(obj.tests) || obj.repo_name || obj.repo || obj.repo_slug) {
+              repoRows.push(obj);
+            }
           } catch (error) {
             console.warn("Failed to parse JSONL line", error);
           }
         }
-        return repos;
+        if (repoRows.length) {
+          return repoRows.map((row) => normalizeJsonlRepo(row, sourceName));
+        }
+        if (sampleRows.length) {
+          return normalizeRecallSampleRows(sampleRows, sourceName);
+        }
+        return [];
       }
 
       async function parseEvalFile(file) {
@@ -960,7 +1077,7 @@
           const button = document.createElement("button");
           button.className = "list-item" + (selectedRepoIndex === index ? " active" : "");
           button.innerHTML =
-            '<div>' + (repo.repo_name || repo.repo) + '</div>' +
+            '<div class="repo-name">' + (repo.repo_name || repo.repo) + '</div>' +
             '<div class="repo-meta">' +
               '<span>' + repo.total_tests + ' tests</span>' +
               '<span>' + repo.passed_tests + '✓ / ' + repo.failed_tests + '✕</span>' +
@@ -1030,18 +1147,32 @@
         if (!text) {
           return "";
         }
-        // Match citations in formats:
-        // [/path/file.py:10-20] - line range
-        // [/path/file.py:10, 20, 30] - comma-separated lines
-        // [/path/file.py:10] - single line
-        // [/path/file.py] - whole file
-        return text.replace(/\[\s*(\/[^\r\n\[\]:]+)(?::(\d+[\d,\s-]*))?\s*\]/g, (match, refPath, lineSpec) => {
-          const trimmedPath = refPath.trim();
+        return text.replace(/\[\s*([^\]\r\n]+?)\s*\]/g, (match, rawRef) => {
+          let refPath = (rawRef || "").trim();
+          let lineSpec = null;
+          const lastColon = refPath.lastIndexOf(":");
+          if (lastColon !== -1) {
+            const maybeLines = refPath.slice(lastColon + 1).trim();
+            if (/^\d+[\d,\s-]*$/.test(maybeLines)) {
+              lineSpec = maybeLines;
+              refPath = refPath.slice(0, lastColon).trim();
+            }
+          }
+
+          const pathLooksLikeFile =
+            refPath.includes("/") &&
+            !/^https?:\/\//i.test(refPath) &&
+            !/^CWE-\d+$/i.test(refPath);
+          if (!pathLooksLikeFile) {
+            return match;
+          }
+
+          const escapedPath = refPath.replace(/"/g, "&quot;");
           if (!lineSpec) {
-            return '<button type="button" class="citation-button" data-path="' + trimmedPath + '" data-lines="all">[' + trimmedPath + ']</button>';
+            return '<button type="button" class="citation-button" data-path="' + escapedPath + '" data-lines="all">[' + refPath + ']</button>';
           }
           const trimmedSpec = lineSpec.trim();
-          return '<button type="button" class="citation-button" data-path="' + trimmedPath + '" data-lines="' + trimmedSpec + '">[' + trimmedPath + ':' + trimmedSpec + ']</button>';
+          return '<button type="button" class="citation-button" data-path="' + escapedPath + '" data-lines="' + trimmedSpec + '">[' + refPath + ':' + trimmedSpec + ']</button>';
         });
       }
 
@@ -1128,24 +1259,108 @@
         if (citationCache.has(cacheKey)) {
           return citationCache.get(cacheKey);
         }
-        const fileContent = await fetchCitationContent(test, path);
+        const fileContent = await fetchCitationContent(repo, test, path);
         const snippet = extractSnippet(fileContent, linesSpec);
         citationCache.set(cacheKey, snippet);
         return snippet;
       }
 
-      async function fetchCitationContent(test, citationPath) {
+      async function fetchCitationContent(repo, test, citationPath) {
         const cleanedPath = citationPath.replace(/\\(.)/g, "$1").trim();
         if (cleanedPath.startsWith("/evidence/")) {
           return fetchEvidenceContent(test, cleanedPath);
+        }
+        if (cleanedPath.startsWith("/workdir/repo/")) {
+          return fetchFromRepoRoots(repo, cleanedPath.replace(/^\/workdir\/repo\//, ""));
+        }
+        if (cleanedPath.startsWith("/workdir/")) {
+          return fetchFromRepoRoots(repo, cleanedPath.replace(/^\/workdir\//, ""));
         }
         if (cleanedPath.startsWith("/kaggle/")) {
           return fetchKaggleFile(cleanedPath);
         }
         if (cleanedPath.startsWith("/workspace/")) {
-          return fetchWorkspaceFile(cleanedPath);
+          return fetchWorkspaceFile(repo, cleanedPath);
         }
-        throw new Error("Unsupported citation path: " + citationPath);
+        if (cleanedPath.startsWith("/")) {
+          return fetchFromRepoRoots(repo, cleanedPath.replace(/^\/+/, ""));
+        }
+        return fetchFromRepoRoots(repo, cleanedPath);
+      }
+
+      function normalizeAssetPath(path) {
+        return String(path || "")
+          .trim()
+          .replace(/\\/g, "/")
+          .replace(/^\/+/, "")
+          .replace(/^workspace\//, "")
+          .replace(/^workdir\//, "")
+          .replace(/^repo\//, "")
+          .replace(/\/+/g, "/");
+      }
+
+      function joinPath(root, rel) {
+        const left = normalizeAssetPath(root).replace(/\/+$/, "");
+        const right = normalizeAssetPath(rel).replace(/^\/+/, "");
+        if (!left) return right;
+        if (!right) return left;
+        return left + "/" + right;
+      }
+
+      function getRepoRootCandidates(repo) {
+        const roots = [];
+        const seen = new Set();
+        const add = (value) => {
+          const normalized = normalizeAssetPath(value);
+          if (!normalized || seen.has(normalized)) return;
+          seen.add(normalized);
+          roots.push(normalized);
+          if (normalized.endsWith("/build")) {
+            const parent = normalized.slice(0, -"/build".length);
+            if (parent && !seen.has(parent)) {
+              seen.add(parent);
+              roots.push(parent);
+            }
+          }
+        };
+
+        add(repo?.repo);
+        add(repo?.repo_root);
+        add(repo?.repo_path);
+
+        const keys = [repo?.repo_name, repo?.repo_slug, repo?.repo].filter(Boolean);
+        const expandedKeys = new Set(keys);
+        for (const key of keys) {
+          if (typeof key === "string" && key.startsWith("repo") && key.length > 4) {
+            expandedKeys.add(key.slice(4));
+          }
+        }
+        for (const key of expandedKeys) {
+          const mapped = repoPaths[key] || [];
+          for (const root of mapped) {
+            add(root);
+          }
+        }
+        return roots;
+      }
+
+      async function fetchFromRepoRoots(repo, relPath) {
+        const roots = getRepoRootCandidates(repo);
+        let lastError = null;
+        for (const root of roots) {
+          const candidatePath = joinPath(root, relPath);
+          try {
+            return await fetchTextAsset(candidatePath);
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        try {
+          return await fetchTextAsset(normalizeAssetPath(relPath));
+        } catch (error) {
+          lastError = lastError || error;
+        }
+        throw lastError || new Error("Unable to resolve citation path: " + relPath);
       }
 
       async function fetchKaggleFile(citationPath) {
@@ -1153,6 +1368,21 @@
         let normalized = citationPath.replace(/^\/+/, "");
         normalized = normalized.replace(/^kaggle\//, "");
         normalized = normalized.replace(/^repo\//, "");
+
+        // Dataset citations like /kaggle/input/titanic/train.csv
+        if (normalized.startsWith("input/")) {
+          const rel = normalized.replace(/^input\//, "");
+          const dataRoots = ["titanic-kaggle-data", "nlp-kaggle-data", "kaggle-data"];
+          let lastError = null;
+          for (const root of dataRoots) {
+            try {
+              return await fetchTextAsset(joinPath(root, rel));
+            } catch (error) {
+              lastError = error;
+            }
+          }
+          throw lastError || new Error("Unable to load Kaggle input file.");
+        }
 
         const segments = normalized.split("/");
         if (segments.length < 1) {
@@ -1178,9 +1408,17 @@
         throw lastError || new Error("Unable to load Kaggle file from local checkout.");
       }
 
-      async function fetchWorkspaceFile(citationPath) {
+      async function fetchWorkspaceFile(repo, citationPath) {
         let normalized = citationPath.replace(/^\/+/, "");
         normalized = normalized.replace(/^workspace\//, "");
+        normalized = normalized.replace(/^repo\//, "");
+
+        // Try generic repo-root resolution first.
+        try {
+          return await fetchFromRepoRoots(repo, normalized);
+        } catch (error) {
+          // fallback below
+        }
 
         const segments = normalized.split("/");
         if (segments.length < 1) {
@@ -1420,6 +1658,7 @@
               }
               return indexA - indexB;
             });
+            recomputeRepoCounts(repo);
           }
         }
         return logs;
