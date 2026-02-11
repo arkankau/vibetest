@@ -14,6 +14,20 @@ from vibetest.baselines import (
     map_review_to_hallucination_tests,
     run_refchecker,
 )
+try:
+    from experiments.usage_utils import (
+        aggregate_usage_from_results,
+        aggregate_usage_from_tests,
+        usage_from_result_metadata,
+    )
+    from experiments.result_naming import standardized_results_path
+except ImportError:
+    from usage_utils import (
+        aggregate_usage_from_results,
+        aggregate_usage_from_tests,
+        usage_from_result_metadata,
+    )
+    from result_naming import standardized_results_path
 
 
 def _safe_id(name: str) -> str:
@@ -164,7 +178,15 @@ def run_vibetest(
     agent = VibeTestAgent(model=model, static=not dynamic)
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
 
-    output_path = Path(output_path) if output_path else Path("results") / f"hallucination_results_AT-{agent.model_name.split('/')[1]}.jsonl"
+    output_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path(
+            "hallucination",
+            "AT",
+            model_name=agent.model_name,
+        )
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with jsonlines.open(str(output_path), mode="w") as writer:
@@ -203,6 +225,7 @@ def run_vibetest(
                     "passed_tests": paper_passed,
                     "failed_tests": len(test_results) - paper_passed,
                     "tests": test_results,
+                    "usage": aggregate_usage_from_results(paper_results),
                 }
             )
 
@@ -253,7 +276,11 @@ def run_codex_baseline(
     )
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     review_map = {
-        paper_path.name: result.message for paper_path, result in zip(paper_paths, all_results)
+        paper_path.name: {
+            "review_text": result.message,
+            "usage": usage_from_result_metadata(result),
+        }
+        for paper_path, result in zip(paper_paths, all_results)
     }
 
     for paper_path in paper_paths:
@@ -261,10 +288,12 @@ def run_codex_baseline(
         print(f"Paper: {paper_path.name}")
         print(f"{'=' * 80}")
 
-        review_text = review_map.get(paper_path.name, "")
+        review_info = review_map.get(paper_path.name, {})
+        review_text = str(review_info.get("review_text") or "")
         meta = {
             "codex_ok": bool(review_text),
             "codex_error": None if review_text else "No review output captured",
+            "review_usage": review_info.get("usage"),
         }
         tests = map_review_to_hallucination_tests(
             review_text,
@@ -284,10 +313,19 @@ def run_codex_baseline(
                 "passed_tests": passed,
                 "failed_tests": total - passed,
                 "tests": tests,
+                "usage": review_info.get("usage") or aggregate_usage_from_tests(tests),
             }
         )
 
-    output_path = Path(output_path) if output_path else Path("results") / "hallucination_results_codex_baseline.jsonl"
+    output_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path(
+            "hallucination",
+            "codex",
+            model_name=agent.model_name,
+        )
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(str(output_path), mode="w") as writer:
         for entry in results:
@@ -391,10 +429,15 @@ def run_refchecker_baseline(
                 "passed_tests": passed,
                 "failed_tests": total - passed,
                 "tests": tests,
+                "usage": aggregate_usage_from_tests(tests),
             }
         )
 
-    output_path = Path(output_path) if output_path else Path("results") / "hallucination_results_refchecker_baseline.jsonl"
+    output_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path("hallucination", "refchecker")
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(str(output_path), mode="w") as writer:
         for entry in results:

@@ -1,4 +1,4 @@
-"""Analyze results from .eval log files."""
+"""Analyze results from .eval and .jsonl result files."""
 
 import json
 from pathlib import Path
@@ -7,6 +7,11 @@ from collections import defaultdict, Counter
 import csv
 import zipfile
 import re
+from numbers import Number
+try:
+    from experiments.usage_utils import aggregate_usage_from_tests, usage_from_eval_sample_data
+except ImportError:
+    from usage_utils import aggregate_usage_from_tests, usage_from_eval_sample_data
 
 
 def extract_verdict_from_sample(sample_data: Dict[str, Any]) -> tuple[str, str, str]:
@@ -105,6 +110,7 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
             passed = (verdict == 'PASS')
             
             # Build test result object
+            usage = usage_from_eval_sample_data(sample_data)
             test = {
                 'description': test_description,
                 'passed': passed,
@@ -115,7 +121,9 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
                     'test_description': test_description,
                     'sample_id': sample_id,
                 },
-                'model_usage': sample_data.get('model_usage', {}),
+                'model_usage': usage["model_usage"],
+                'usage_totals': usage["usage_totals"],
+                'cost_usd': usage["cost_usd"],
                 'total_time': sample_data.get('total_time', 0),
             }
             
@@ -129,6 +137,7 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
     # Convert to list format
     results = []
     for repo_name, repo_data in results_by_repo.items():
+        usage = aggregate_usage_from_tests(repo_data["tests"])
         results.append({
             'repo_name': repo_name,
             'repo': repo_name,
@@ -136,6 +145,7 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
             'total_tests': repo_data['total_tests'],
             'passed_tests': repo_data['passed_tests'],
             'failed_tests': repo_data['failed_tests'],
+            'usage': usage,
         })
     
     return results
@@ -170,15 +180,30 @@ def _coerce_evidence(test: Dict[str, Any]) -> str:
 
 
 def load_results_from_jsonl(filepath: str) -> List[Dict[str, Any]]:
-    """Load results from a JSONL file (one repo result per line)."""
-    results: List[Dict[str, Any]] = []
+    """Load results from a JSONL file.
+
+    Supports:
+    - repo-level rows with `tests` arrays
+    - sample-level rows with `record_type: sample` (e.g., vulnerability recall JSONL)
+    """
+    raw_rows: List[Dict[str, Any]] = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            obj = json.loads(line)
+            raw_rows.append(json.loads(line))
+
+    if not raw_rows:
+        return []
+
+    # Case 1: repo-level JSONL rows, one repo per line.
+    if any(isinstance(row.get("tests"), list) for row in raw_rows):
+        results: List[Dict[str, Any]] = []
+        for obj in raw_rows:
             tests = obj.get("tests", [])
+            if not isinstance(tests, list):
+                continue
             for test in tests:
                 metadata = test.get("metadata", {}) or {}
                 metadata.setdefault("test_description", _normalize_test_description(test))
@@ -195,8 +220,82 @@ def load_results_from_jsonl(filepath: str) -> List[Dict[str, Any]]:
                 obj["passed_tests"] = sum(1 for t in tests if t.get("passed"))
             if "failed_tests" not in obj:
                 obj["failed_tests"] = obj["total_tests"] - obj["passed_tests"]
+            obj["usage"] = obj.get("usage") or aggregate_usage_from_tests(tests)
             results.append(obj)
-    return results
+        return results
+
+    # Case 2: standardized recall-like JSONL rows with record_type fields.
+    sample_rows = [row for row in raw_rows if str(row.get("record_type") or "").lower() == "sample"]
+    summary_rows = [row for row in raw_rows if str(row.get("record_type") or "").lower() == "summary"]
+    if sample_rows:
+        repos: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"tests": [], "total_tests": 0, "passed_tests": 0, "failed_tests": 0}
+        )
+        for row in sample_rows:
+            repo_name = (
+                row.get("repo_slug")
+                or row.get("repo_name")
+                or row.get("repo")
+                or "Unknown"
+            )
+            verdict = str(row.get("verdict") or "UNKNOWN").upper()
+            if verdict == "UNKNOWN":
+                if row.get("predicted_fail") is True:
+                    verdict = "FAIL"
+                elif row.get("predicted_fail") is False:
+                    verdict = "PASS"
+            reason = row.get("reason_text") or row.get("reason") or ""
+            evidence = row.get("evidence_text") or row.get("evidence") or ""
+
+            cwe_id = row.get("cwe_id")
+            sample_id = row.get("sample_id", "")
+            if cwe_id:
+                test_desc = f"CWE-{cwe_id}"
+            else:
+                test_desc = str(sample_id or row.get("property_id") or row.get("property") or "No specific test")
+
+            passed = verdict == "PASS"
+            test = {
+                "description": test_desc,
+                "passed": passed,
+                "verdict": verdict,
+                "reason": reason or "None",
+                "evidence": evidence or "None",
+                "metadata": {
+                    "test_description": test_desc,
+                    "sample_id": sample_id,
+                },
+                "model_usage": (row.get("usage") or {}).get("model_usage", {}),
+                "usage_totals": (row.get("usage") or {}).get("usage_totals", {}),
+                "cost_usd": (row.get("usage") or {}).get("cost_usd"),
+            }
+
+            repo_entry = repos[str(repo_name)]
+            repo_entry["tests"].append(test)
+            repo_entry["total_tests"] += 1
+            if passed:
+                repo_entry["passed_tests"] += 1
+            else:
+                repo_entry["failed_tests"] += 1
+
+        results = []
+        for repo_name, repo_data in repos.items():
+            usage = aggregate_usage_from_tests(repo_data["tests"])
+            results.append(
+                {
+                    "repo_name": repo_name,
+                    "repo": repo_name,
+                    "tests": repo_data["tests"],
+                    "total_tests": repo_data["total_tests"],
+                    "passed_tests": repo_data["passed_tests"],
+                    "failed_tests": repo_data["failed_tests"],
+                    "usage": usage,
+                }
+            )
+        return results
+
+    # Unknown JSONL structure.
+    return []
 
 
 def calculate_basic_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -219,6 +318,49 @@ def calculate_basic_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         'avg_pass_rate': avg_pass_rate,
         'repos_with_all_tests_passed': repos_with_all_tests_passed,
         'repos_with_some_failures': repos_with_some_failures,
+    }
+
+
+def calculate_usage_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate usage/cost stats across repositories."""
+    usage_fields = [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "input_tokens_cache_read",
+        "input_tokens_cache_write",
+        "reasoning_tokens",
+    ]
+    totals = {field: 0 for field in usage_fields}
+    model_totals: Dict[str, Dict[str, int]] = defaultdict(lambda: {field: 0 for field in usage_fields})
+    total_cost_usd = 0.0
+    cost_entries = 0
+
+    for repo_result in results:
+        usage = repo_result.get("usage") or {}
+        usage_totals = usage.get("usage_totals") or {}
+        for field in usage_fields:
+            value = usage_totals.get(field, 0)
+            if isinstance(value, Number):
+                totals[field] += int(value)
+
+        for model_name, model_usage in (usage.get("model_usage") or {}).items():
+            for field in usage_fields:
+                value = (model_usage or {}).get(field, 0)
+                if isinstance(value, Number):
+                    model_totals[model_name][field] += int(value)
+
+        cost = usage.get("cost_usd")
+        if isinstance(cost, Number):
+            total_cost_usd += float(cost)
+            cost_entries += 1
+
+    return {
+        "totals": totals,
+        "model_totals": dict(model_totals),
+        "total_cost_usd": total_cost_usd,
+        "cost_entries": cost_entries,
+        "repos_count": len(results),
     }
 
 
@@ -309,6 +451,37 @@ def print_analysis(results: List[Dict[str, Any]]):
     print(f"Overall pass rate: {basic_stats['avg_pass_rate']:.2f}%")
     print(f"Repos with all tests passed: {basic_stats['repos_with_all_tests_passed']}")
     print(f"Repos with some failures: {basic_stats['repos_with_some_failures']}")
+    print()
+
+    # Usage/cost statistics
+    print("USAGE / COST")
+    print("-" * 80)
+    usage_stats = calculate_usage_stats(results)
+    totals = usage_stats["totals"]
+    print(f"Input tokens: {totals['input_tokens']:,}")
+    print(f"Output tokens: {totals['output_tokens']:,}")
+    print(f"Total tokens: {totals['total_tokens']:,}")
+    print(f"Reasoning tokens: {totals['reasoning_tokens']:,}")
+    print(f"Cache read tokens: {totals['input_tokens_cache_read']:,}")
+    print(f"Cache write tokens: {totals['input_tokens_cache_write']:,}")
+    if usage_stats["cost_entries"] > 0:
+        print(f"Total cost (USD): ${usage_stats['total_cost_usd']:.6f}")
+        print(
+            f"Cost available for repos: {usage_stats['cost_entries']}/{usage_stats['repos_count']}"
+        )
+    else:
+        print("Total cost (USD): N/A (no explicit cost fields in input results)")
+
+    model_totals = usage_stats["model_totals"]
+    if model_totals:
+        print("\nPer-model token usage:")
+        for model_name in sorted(model_totals.keys()):
+            model_usage = model_totals[model_name]
+            print(
+                f"  {model_name}: input={model_usage['input_tokens']:,}, "
+                f"output={model_usage['output_tokens']:,}, total={model_usage['total_tokens']:,}, "
+                f"reasoning={model_usage['reasoning_tokens']:,}"
+            )
     print()
     
     # Test performance
@@ -430,7 +603,7 @@ def main():
     
     if not eval_file.exists():
         print(f"Error: Eval file not found at {eval_file}")
-        print(f"Usage: python {sys.argv[0]} [path/to/file.eval]")
+        print(f"Usage: python {sys.argv[0]} [path/to/file.eval|path/to/file.jsonl]")
         return
     
     print(f"Loading results from {eval_file}...")

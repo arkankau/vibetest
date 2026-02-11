@@ -98,10 +98,17 @@ TRAINCHECK_INVARIANT_INSTRUCTIONS = (
     "support a property violation, mark PASS or INCONCLUSIVE."
 )
 
+HALLUCINATION_EVIDENCE_INSTRUCTIONS = (
+    "For citation/reference properties, evidence must name the exact offending item(s) from the review: "
+    "citation key/number and/or arXiv id, DOI, URL, title fragment, or bibliography label. "
+    "Do not just summarize the issue. Include concrete identifiers showing what failed. "
+    "If no concrete offending citation is provided in the review, prefer INCONCLUSIVE."
+)
+
 
 def _normalize_verdict(raw: str) -> str:
     if not raw:
-        return "PASS"
+        return "INCONCLUSIVE"
     raw = raw.strip().upper()
     if raw in {"PASS", "FAIL", "INCONCLUSIVE"}:
         return raw
@@ -122,7 +129,6 @@ async def _map_review_async(
     mapper = get_model(
         mapper_model,
         config=GenerateConfig(
-            temperature=0.0,
             max_tokens=3000,
         ),
     )
@@ -135,8 +141,9 @@ async def _map_review_async(
         "For each property, determine whether the review provides evidence that the property is violated.\n"
         "Rules:\n"
         "- Use FAIL only if the review explicitly indicates a violation of the property.\n"
-        "- Use PASS if the review does not mention the property or indicates it is satisfied.\n"
-        "- Use INCONCLUSIVE only if the review provides partial/ambiguous evidence.\n"
+        "- Use PASS only if the review explicitly indicates the property is satisfied.\n"
+        "- Use INCONCLUSIVE if the property is not mentioned or evidence is partial/ambiguous.\n"
+        "- Evidence must include concrete identifiers from the review (IDs, citation keys, URLs, file paths, rule names, line refs) rather than only high-level summaries.\n"
         "- Never invent new issues. Only use the review text.\n\n"
     )
     if extra_instructions:
@@ -147,7 +154,7 @@ async def _map_review_async(
         "  property_index (int), verdict (PASS/FAIL/INCONCLUSIVE), reason (string), evidence (string)\n"
         "Constraints:\n"
         "- Output only JSON. Do not use markdown or code fences.\n"
-        "- Keep reason <= 30 words and evidence <= 30 words.\n\n"
+        "- Keep reason <= 40 words and evidence <= 160 words.\n\n"
         "- Use compact JSON with no extra whitespace.\n\n"
         "Review:\n"
         f"{review_text}\n\n"
@@ -155,7 +162,10 @@ async def _map_review_async(
         f"{properties_json}\n"
     )
 
-    result = await mapper.generate(prompt)
+    try:
+        result = await asyncio.wait_for(mapper.generate(prompt), timeout=120)
+    except TimeoutError:
+        return []
     data = _extract_json_array(result.completion or "")
     if not data:
         return []
@@ -235,10 +245,10 @@ def map_review_to_kaggle_tests(
     tests: list[dict[str, Any]] = []
     for idx, prop in enumerate(properties):
         item = by_index.get(idx)
-        verdict = item.verdict if item else "PASS"
+        verdict = item.verdict if item else "INCONCLUSIVE"
         reason = item.reason if item else "Not mentioned in review."
         evidence = item.evidence if item else ""
-        passed = verdict != "FAIL"
+        passed = verdict == "PASS"
         tests.append(
             {
                 "description": reason,
@@ -275,6 +285,7 @@ def map_review_to_hallucination_tests(
             review_text=review_text,
             properties=props_payload,
             mapper_model=mapper_model,
+            extra_instructions=HALLUCINATION_EVIDENCE_INSTRUCTIONS,
         )
     )
     by_index = {item.property_index: item for item in items}
@@ -282,10 +293,10 @@ def map_review_to_hallucination_tests(
     tests: list[dict[str, Any]] = []
     for idx, prop in enumerate(properties):
         item = by_index.get(idx)
-        verdict = item.verdict if item else "PASS"
+        verdict = item.verdict if item else "INCONCLUSIVE"
         reason = item.reason if item else "Not mentioned in review."
         evidence = item.evidence if item else ""
-        passed = verdict != "FAIL"
+        passed = verdict == "PASS"
         tests.append(
             {
                 "description": reason,
@@ -386,10 +397,10 @@ def map_review_to_vuln_tests(
     if dataset == "bibifi":
         for idx, prop_text in enumerate(properties):
             item = by_index.get(idx)
-            verdict = item.verdict if item else "PASS"
+            verdict = item.verdict if item else "INCONCLUSIVE"
             reason = item.reason if item else "Not mentioned in review."
             evidence = item.evidence if item else ""
-            passed = verdict != "FAIL"
+            passed = verdict == "PASS"
             tests.append(
                 {
                     "description": reason,
@@ -411,10 +422,10 @@ def map_review_to_vuln_tests(
 
     for idx, (cwe_num, prop_text) in enumerate(properties):
         item = by_index.get(idx)
-        verdict = item.verdict if item else "PASS"
+        verdict = item.verdict if item else "INCONCLUSIVE"
         reason = item.reason if item else "Not mentioned in review."
         evidence = item.evidence if item else ""
-        passed = verdict != "FAIL"
+        passed = verdict == "PASS"
         tests.append(
             {
                 "description": reason,

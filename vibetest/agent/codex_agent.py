@@ -14,6 +14,7 @@ from inspect_ai.util import sandbox
 
 from vibetest.agent.react_agent import get_files
 from vibetest.testcases.base import TestCase, TestResult
+from vibetest.usage import usage_payload_from_sample
 
 
 @agent
@@ -189,6 +190,9 @@ class CodexReviewAgent:
                             "codex_cmd": self.codex_cmd,
                             "codex_model": self.codex_model,
                             "codex_prompt": self.codex_prompt,
+                            "total_time": getattr(sample, "total_time", None),
+                            "working_time": getattr(sample, "working_time", None),
+                            **usage_payload_from_sample(sample),
                         },
                     )
 

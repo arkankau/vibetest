@@ -10,7 +10,8 @@ from inspect_ai.scorer import includes
 from inspect_ai.tool import Tool, bash_session, python, text_editor
 
 from vibetest.testcases.base import TestCase, TestResult
-from vibetest.agent.react_agent import get_files
+from vibetest.agent.react_agent import create_files_archive, cleanup_archive_temps
+from vibetest.usage import usage_payload_from_sample
 
 
 class BaselineAgent:
@@ -108,8 +109,9 @@ EXPLANATION: [Your explanation of what you found]"""
         Returns:
             Formatted prompt string - simply the repo name with the query
         """
+        repo_root = f"{test_case.sandbox_path.rstrip('/')}/repo"
         prompt = f"""Examine the repository and determine if there are any bugs.
-Repository: /workspace"""
+Repository: {repo_root}"""
         return prompt
 
     def execute_tests(
@@ -137,11 +139,15 @@ Repository: /workspace"""
         for idx, test_case in enumerate(test_cases):
             sample_id = f"{Path(test_case.repo_path).name}_{idx}"
             id_to_test_case[sample_id] = test_case
+            files_dict, setup_script = create_files_archive(
+                test_case, sandbox_prefix=test_case.sandbox_path
+            )
             samples.append(Sample(
                 input=self._create_prompt(test_case), 
                 target="VERDICT", 
                 id=sample_id,
-                files=get_files(test_case)
+                files=files_dict,
+                setup=setup_script,
             ))
         
         task = Task(
@@ -151,17 +157,20 @@ Repository: /workspace"""
             sandbox=sandbox,
         )
 
-        # Run evaluation
-        results = eval(
-            tasks=task,
-            model=self.model_name,
-            log_dir="./logs",
-            retry_on_error=2,
-            fail_on_error=False,
-        )
+        try:
+            # Run evaluation
+            results = eval(
+                tasks=task,
+                model=self.model_name,
+                log_dir="./logs",
+                retry_on_error=2,
+                fail_on_error=False,
+            )
 
-        # Parse results
-        return self._parse_results(results, id_to_test_case)
+            # Parse results
+            return self._parse_results(results, id_to_test_case)
+        finally:
+            cleanup_archive_temps()
 
     def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
         """Parse Inspect AI results into TestResults.
@@ -203,8 +212,7 @@ Repository: /workspace"""
                                 break
 
                     # Parse verdict from output
-                    # For baseline agent, "NO BUGS FOUND" means passed, "BUGS FOUND" means failed
-                    passed = "NO BUGS FOUND" in output.upper()
+                    passed = "VERDICT: PASS" in output.upper()
                     message = output
 
                     # Build execution log from message history
@@ -227,6 +235,9 @@ Repository: /workspace"""
                             "model": self.model_name,
                             "test_description": test_case.description,
                             "score": sample.score.value if sample.score else None,
+                            "total_time": getattr(sample, "total_time", None),
+                            "working_time": getattr(sample, "working_time", None),
+                            **usage_payload_from_sample(sample),
                         },
                     )
 

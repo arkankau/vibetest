@@ -6,6 +6,10 @@ import jsonlines
 
 from vibetest import TestCase, VibeTestAgent
 from vibetest.agent import BaselineAgent
+try:
+    from experiments.usage_utils import aggregate_usage_from_results, usage_from_result_metadata
+except ImportError:
+    from usage_utils import aggregate_usage_from_results, usage_from_result_metadata
 
 
 def get_tests():
@@ -74,6 +78,7 @@ def run_baseline():
             "message": result.message,
             "execution_log": result.execution_log,
             "metadata": result.metadata,
+            "usage": usage_from_result_metadata(result),
         })
     
     print(f"\n{'=' * 80}")
@@ -158,6 +163,7 @@ def run_vibetest():
                 "passed_tests": repo_passed,
                 "failed_tests": repo_total - repo_passed,
                 "tests": test_results,
+                "usage": aggregate_usage_from_results(repo_results),
             })
             
             print(f"\nRepo Summary: {repo_passed}/{repo_total} tests passed")

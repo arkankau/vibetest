@@ -19,6 +19,7 @@ import re
 
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.config import get_package_root
+from vibetest.usage import usage_payload_from_sample
 
 
 @scorer(metrics=[accuracy()])
@@ -742,6 +743,9 @@ Repository: {test_case.sandbox_path}/repo"""
                             "model": self.model_name,
                             "test_description": test_case.description,
                             "score": sample.score.value if sample.score else None,
+                            "total_time": getattr(sample, "total_time", None),
+                            "working_time": getattr(sample, "working_time", None),
+                            **usage_payload_from_sample(sample),
                         },
                     )
 

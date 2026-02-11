@@ -12,6 +12,20 @@ from vibetest.baselines import (
     prepare_reference_invariants,
     run_traincheck,
 )
+try:
+    from experiments.usage_utils import (
+        aggregate_usage_from_results,
+        aggregate_usage_from_tests,
+        usage_from_result_metadata,
+    )
+    from experiments.result_naming import standardized_results_path
+except ImportError:
+    from usage_utils import (
+        aggregate_usage_from_results,
+        aggregate_usage_from_tests,
+        usage_from_result_metadata,
+    )
+    from result_naming import standardized_results_path
 
 
 def get_tests():
@@ -209,10 +223,16 @@ def run_traincheck_baseline(
                 "passed_tests": passed,
                 "failed_tests": total - passed,
                 "tests": tests,
+                "usage": aggregate_usage_from_tests(tests),
             }
         )
 
-    output_path = Path(output_path) if output_path else Path("results") / f"kaggle_{subset}_results_traincheck.jsonl"
+    dataset_name = f"kaggle_{subset}"
+    output_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path(dataset_name, "traincheck")
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(str(output_path), mode="w") as writer:
         for entry in results:
@@ -275,7 +295,11 @@ def run_review_baseline(
     )
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
     review_map = {
-        repo_path.name: result.message for repo_path, result in zip(repo_paths, all_results)
+        repo_path.name: {
+            "review_text": result.message,
+            "usage": usage_from_result_metadata(result),
+        }
+        for repo_path, result in zip(repo_paths, all_results)
     }
 
     for repo_path in repo_paths:
@@ -283,10 +307,12 @@ def run_review_baseline(
         print(f"Repository: {repo_path.name}")
         print(f"{'=' * 80}")
 
-        review_text = review_map.get(repo_path.name, "")
+        review_info = review_map.get(repo_path.name, {})
+        review_text = str(review_info.get("review_text") or "")
         meta = {
             "codex_ok": bool(review_text),
             "codex_error": None if review_text else "No review output captured",
+            "review_usage": review_info.get("usage"),
         }
         tests = map_review_to_kaggle_tests(
             review_text,
@@ -306,10 +332,20 @@ def run_review_baseline(
                 "passed_tests": passed,
                 "failed_tests": total - passed,
                 "tests": tests,
+                "usage": review_info.get("usage") or aggregate_usage_from_tests(tests),
             }
         )
 
-    output_path = Path(output_path) if output_path else Path("results") / f"kaggle_{subset}_results_{reviewer}_baseline.jsonl"
+    dataset_name = f"kaggle_{subset}"
+    output_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path(
+            dataset_name,
+            reviewer,
+            model_name=model or "openai/gpt-5-mini",
+        )
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(str(output_path), mode="w") as writer:
         for entry in results:
@@ -386,6 +422,7 @@ def run_baseline(subset: str, model: str, static: bool):
                 "message": result.message,
                 "execution_log": result.execution_log,
                 "metadata": result.metadata,
+                "usage": usage_from_result_metadata(result),
             })
     
     print(f"\n{'=' * 80}")
@@ -441,8 +478,16 @@ def run_vibetest(subset: str, model: str, static: bool):
     print("Processing Results")
     print(f"{'=' * 80}\n")
     
+    dataset_name = f"kaggle_{subset}"
+    output_path = standardized_results_path(
+        dataset_name,
+        "AT",
+        model_name=agent.model_name,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Step 3: Group results by repository and write to file
-    with jsonlines.open(f"results/kaggle_{subset}_results_{agent.model_name.split('/')[1]}{'_static' if static else ''}.jsonl", mode="w") as writer:
+    with jsonlines.open(str(output_path), mode="w") as writer:
         # Group results by repository
         for repo_idx, repo_path in enumerate(repo_paths):
             print(f"\n{'=' * 80}")
@@ -460,7 +505,7 @@ def run_vibetest(subset: str, model: str, static: bool):
             repo_total = len(repo_results)
             
             for r in repo_results:
-                if "PASS" in r.message:
+                if r.passed:
                     repo_passed += 1
                     status = "✓ PASSED"
                 elif "INCONCLUSIVE" in r.message:
@@ -490,6 +535,7 @@ def run_vibetest(subset: str, model: str, static: bool):
                 "passed_tests": repo_passed,
                 "failed_tests": repo_total - repo_passed,
                 "tests": test_results,
+                "usage": aggregate_usage_from_results(repo_results),
             })
             
             print(f"\nRepo Summary: {repo_passed}/{repo_total} tests passed")
@@ -497,7 +543,7 @@ def run_vibetest(subset: str, model: str, static: bool):
     print(f"\n{'=' * 80}")
     print("SUMMARY")
     print(f"{'=' * 80}")
-    print(f"\nResults saved to: results/kaggle_{subset}_results_{agent.model_name.split('/')[1]}.jsonl")
+    print(f"\nResults saved to: {output_path}")
     print(f"{'=' * 80}")
 
 

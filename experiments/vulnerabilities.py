@@ -21,6 +21,22 @@ from vibetest.baselines import (
 
 from vibetest import TestCase, VibeTestAgent
 from vibetest.agent import BaselineAgent, CodexReviewAgent
+try:
+    from experiments.usage_utils import (
+        aggregate_usage_from_results,
+        aggregate_usage_from_tests,
+        usage_from_eval_sample_data,
+        usage_from_result_metadata,
+    )
+    from experiments.result_naming import standardized_results_path
+except ImportError:
+    from usage_utils import (
+        aggregate_usage_from_results,
+        aggregate_usage_from_tests,
+        usage_from_eval_sample_data,
+        usage_from_result_metadata,
+    )
+    from result_naming import standardized_results_path
 
 csv.field_size_limit(sys.maxsize)
 
@@ -88,6 +104,7 @@ def run_baseline(dataset: str):
                 "message": result.message,
                 "execution_log": result.execution_log,
                 "metadata": result.metadata,
+                "usage": usage_from_result_metadata(result),
             })
     
     print(f"\n{'=' * 80}")
@@ -192,8 +209,15 @@ def run_vibetest(dataset: str, dynamic: bool = False):
     print("Processing Results")
     print(f"{'=' * 80}\n")
     
+    output_path = standardized_results_path(
+        dataset,
+        "AT",
+        model_name=agent.model_name,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Step 3: Group results by repository and write to file
-    with jsonlines.open(f"results/vuln_results_{dataset}_AT-{agent.model_name.split('/')[1]}.jsonl", mode="w") as writer:
+    with jsonlines.open(str(output_path), mode="w") as writer:
         # Group results by repository
         for repo_idx, repo_path in enumerate(repo_paths):
             print(f"\n{'=' * 80}")
@@ -237,6 +261,7 @@ def run_vibetest(dataset: str, dynamic: bool = False):
                 "passed_tests": repo_passed,
                 "failed_tests": repo_total - repo_passed,
                 "tests": test_results,
+                "usage": aggregate_usage_from_results(repo_results),
             })
             
             print(f"\nRepo Summary: {repo_passed}/{repo_total} tests passed")
@@ -244,6 +269,7 @@ def run_vibetest(dataset: str, dynamic: bool = False):
     print(f"\n{'=' * 80}")
     print("SUMMARY")
     print(f"{'=' * 80}")
+    print(f"\nResults saved to: {output_path}")
 
 
 def run_codeql(dataset: str):
@@ -316,7 +342,7 @@ def run_codeql(dataset: str):
         repo_paths.append((repo, repo_path, analysis_path))
         print(f"Queueing repository: {repo}")
 
-    output_path = Path("results") / f"vuln_results_{dataset}_codeql.jsonl"
+    output_path = standardized_results_path(dataset, "codeql")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\nTotal repositories: {len(repo_paths)}")
@@ -455,6 +481,7 @@ def run_codeql(dataset: str):
                     "passed_tests": passed_tests,
                     "failed_tests": failed_tests,
                     "tests": tests,
+                    "usage": aggregate_usage_from_tests(tests),
                     "metadata": {
                         "codeql_ok": ok,
                         "codeql_error": analysis.get("error"),
@@ -494,6 +521,7 @@ def run_review_baseline(
     dataset: str,
     *,
     reviewer: str,
+    model: str | None,
     codex_cmd: str,
     codex_model: str | None,
     codex_prompt: str,
@@ -538,7 +566,16 @@ def run_review_baseline(
         repo_paths.append((repo, repo_path, analysis_path))
         print(f"Queueing repository: {repo}")
 
-    output_path = Path(output_path) if output_path else Path("results") / f"vuln_results_{dataset}_{reviewer}_baseline.jsonl"
+    model_name = (model or "openai/gpt-5-mini").strip()
+
+    if output_path:
+        output_path = Path(output_path)
+    else:
+        output_path = standardized_results_path(
+            dataset,
+            reviewer,
+            model_name=model_name,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not repo_paths:
@@ -556,6 +593,7 @@ def run_review_baseline(
         for repo, _, analysis_path in repo_paths
     ]
     agent = CodexReviewAgent(
+        model=model or "openai/gpt-5-mini",
         codex_cmd=codex_cmd,
         codex_model=codex_model,
         codex_prompt=codex_prompt,
@@ -565,9 +603,12 @@ def run_review_baseline(
         log_dir=codex_log_dir,
     )
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
-    review_map: dict[str, str] = {}
+    review_map: dict[str, dict[str, Any]] = {}
     for repo, result in zip(codex_repos, all_results):
-        review_map[repo] = result.message
+        review_map[repo] = {
+            "review_text": result.message,
+            "usage": usage_from_result_metadata(result),
+        }
 
     with jsonlines.open(str(output_path), mode="w") as writer:
         for repo, repo_root, analysis_path in repo_paths:
@@ -577,10 +618,12 @@ def run_review_baseline(
 
             repo_id_for_eval = repo if dataset == "bibifi" else "_".join(str(repo).split("_")[1:])
 
-            review_text = review_map.get(repo, "")
+            review_info = review_map.get(repo, {})
+            review_text = str(review_info.get("review_text") or "")
             meta = {
                 "codex_ok": bool(review_text),
                 "codex_error": None if review_text else "No review output captured",
+                "review_usage": review_info.get("usage"),
             }
 
             tests = map_review_to_vuln_tests(
@@ -604,6 +647,7 @@ def run_review_baseline(
                     "passed_tests": passed_tests,
                     "failed_tests": total_tests - passed_tests,
                     "tests": tests,
+                    "usage": review_info.get("usage") or aggregate_usage_from_tests(tests),
                     "metadata": {
                         "reviewer": reviewer,
                         "repo_root": str(repo_root),
@@ -706,6 +750,7 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
             passed = (verdict == 'PASS')
             
             # Build test result object
+            usage = usage_from_eval_sample_data(sample_data)
             test = {
                 'id': sample_id,
                 'description': test_description,
@@ -717,7 +762,9 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
                     'test_description': test_description,
                     'sample_id': sample_id,
                 },
-                'model_usage': sample_data.get('model_usage', {}),
+                'model_usage': usage["model_usage"],
+                'usage_totals': usage["usage_totals"],
+                'cost_usd': usage["cost_usd"],
                 'total_time': sample_data.get('total_time', 0),
             }
             
@@ -731,6 +778,7 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
     # Convert to list format
     results = []
     for repo_name, repo_data in results_by_repo.items():
+        usage = aggregate_usage_from_tests(repo_data["tests"])
         results.append({
             'repo_name': repo_name,
             'repo': repo_name,
@@ -738,6 +786,7 @@ def load_results_from_eval(filepath: str) -> List[Dict[str, Any]]:
             'total_tests': repo_data['total_tests'],
             'passed_tests': repo_data['passed_tests'],
             'failed_tests': repo_data['failed_tests'],
+            'usage': usage,
         })
     
     return results
@@ -804,6 +853,7 @@ def load_results_from_jsonl(filepath: str) -> List[Dict[str, Any]]:
                     "failed_tests": repo_entry.get("failed_tests")
                     if isinstance(repo_entry.get("failed_tests"), int)
                     else failed_tests,
+                    "usage": repo_entry.get("usage") or aggregate_usage_from_tests(tests_out),
                 }
             )
 
@@ -1020,6 +1070,11 @@ if __name__ == "__main__":
         help="Enable dynamic analysis"
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        help="Model name for Codex bridge (e.g., openai/gpt-5-mini or openai/gpt-5.2)",
+    )
+    parser.add_argument(
         "--codex-cmd",
         "--codex-command",
         dest="codex_cmd",
@@ -1078,7 +1133,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output-path",
         type=str,
-        help="Optional output path for Codex baseline results JSONL",
+        help="Optional output path for Codex baseline results JSONL (default includes dataset + codex model)",
     )
     args = parser.parse_args()
 
@@ -1092,6 +1147,7 @@ if __name__ == "__main__":
         run_review_baseline(
             args.dataset,
             reviewer="codex",
+            model=args.model,
             codex_cmd=args.codex_cmd,
             codex_model=args.codex_model,
             codex_prompt=args.codex_prompt,
