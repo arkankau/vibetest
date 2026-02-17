@@ -143,7 +143,7 @@ async def _map_review_async(
         "- Use FAIL only if the review explicitly indicates a violation of the property.\n"
         "- Use PASS only if the review explicitly indicates the property is satisfied.\n"
         "- Use INCONCLUSIVE if the property is not mentioned or evidence is partial/ambiguous.\n"
-        "- Evidence must include concrete identifiers from the review (IDs, citation keys, URLs, file paths, rule names, line refs) rather than only high-level summaries.\n"
+        "- For determining the verdict for each property, be sure that the review provides evidence for the specific property rather than any relaxation or simplification of the property.\n"
         "- Never invent new issues. Only use the review text.\n\n"
     )
     if extra_instructions:
@@ -154,7 +154,7 @@ async def _map_review_async(
         "  property_index (int), verdict (PASS/FAIL/INCONCLUSIVE), reason (string), evidence (string)\n"
         "Constraints:\n"
         "- Output only JSON. Do not use markdown or code fences.\n"
-        "- Keep reason <= 40 words and evidence <= 160 words.\n\n"
+        "- Evidence should provide the full evidence from the review in support or against the test property and the reason should be a summary of this evidence.\n\n"
         "- Use compact JSON with no extra whitespace.\n\n"
         "Review:\n"
         f"{review_text}\n\n"
