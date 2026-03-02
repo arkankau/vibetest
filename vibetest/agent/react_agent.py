@@ -22,6 +22,34 @@ from vibetest.config import get_package_root
 from vibetest.usage import usage_payload_from_sample
 
 
+_VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|FAIL|INCONCLUSIVE|NOT\s+APPLICABLE)\b", re.IGNORECASE)
+_REASON_RE = re.compile(r"REASON:\s*(.*?)(?:\nEVIDENCE:|\Z)", re.IGNORECASE | re.DOTALL)
+_EVIDENCE_RE = re.compile(r"EVIDENCE:\s*(.*)\Z", re.IGNORECASE | re.DOTALL)
+
+
+def _normalize_verdict_text(raw: str | None) -> str:
+    text = (raw or "").strip().upper().replace("  ", " ")
+    if text == "NOT APPLICABLE":
+        return "NOT APPLICABLE"
+    if text in {"PASS", "FAIL", "INCONCLUSIVE"}:
+        return text
+    return ""
+
+
+def _parse_submission_output(output: str) -> tuple[str, str, str]:
+    text = output or ""
+    m_verdict = _VERDICT_RE.search(text)
+    verdict = _normalize_verdict_text(m_verdict.group(1).replace(" ", " ") if m_verdict else "")
+
+    m_reason = _REASON_RE.search(text)
+    reason_text = (m_reason.group(1).strip() if m_reason else "")
+
+    m_evidence = _EVIDENCE_RE.search(text)
+    evidence_text = (m_evidence.group(1).strip() if m_evidence else "")
+
+    return verdict, reason_text, evidence_text
+
+
 @scorer(metrics=[accuracy()])
 def save_evidence_tar(out_dir: str | os.PathLike = "./evidence-dumps", *, dir_to_save="/evidence", returns_false=False):
     """
@@ -719,8 +747,18 @@ Repository: {test_case.sandbox_path}/repo"""
                                 output = msg.text
                                 break
 
-                    # Parse verdict from output
-                    passed = "VERDICT: PASS" in output.upper()
+                    # Parse structured verdict/reason/evidence from submission output
+                    verdict, reason_text, evidence_text = _parse_submission_output(output)
+                    if not verdict:
+                        if "VERDICT: PASS" in output.upper():
+                            verdict = "PASS"
+                        elif "VERDICT: FAIL" in output.upper():
+                            verdict = "FAIL"
+                        elif "VERDICT: INCONCLUSIVE" in output.upper():
+                            verdict = "INCONCLUSIVE"
+                        else:
+                            verdict = "INCONCLUSIVE"
+                    passed = verdict == "PASS"
                     message = output
 
                     # Build execution log from message history
@@ -742,6 +780,9 @@ Repository: {test_case.sandbox_path}/repo"""
                         metadata={
                             "model": self.model_name,
                             "test_description": test_case.description,
+                            "verdict": verdict,
+                            "reason_text": reason_text,
+                            "evidence_text": evidence_text,
                             "score": sample.score.value if sample.score else None,
                             "total_time": getattr(sample, "total_time", None),
                             "working_time": getattr(sample, "working_time", None),

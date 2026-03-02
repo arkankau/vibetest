@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,44 @@ def _select_matching_bbl(root: Path, main_tex: Path) -> Path | None:
 
 def _safe_slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "paper"
+
+
+def _resolve_refchecker_command(refchecker_cmd: str) -> tuple[list[str], str | None]:
+    """Resolve RefChecker command with local fallbacks when entrypoint is missing."""
+    repo_root = Path(__file__).resolve().parents[2]
+    args = shlex.split(refchecker_cmd)
+    if not args:
+        return ["academic-refchecker"], None
+
+    # If the provided command is already resolvable, use it as-is.
+    first = args[0]
+    if os.path.isabs(first) or first.startswith(".") or "/" in first:
+        if Path(first).exists():
+            return args, None
+    elif shutil.which(first):
+        return args, None
+
+    # Fallback 1: local wrapper script in this repository.
+    local_wrapper = repo_root / "tools" / "refchecker" / "run_refchecker.py"
+    if local_wrapper.exists():
+        return [sys.executable, str(local_wrapper), *args[1:]], (
+            f"RefChecker command '{first}' not found; using local wrapper at {local_wrapper}"
+        )
+
+    # Fallback 2: installed module invocation if available in current Python env.
+    module_spec = None
+    try:
+        import importlib.util
+
+        module_spec = importlib.util.find_spec("refchecker")
+    except Exception:
+        module_spec = None
+    if module_spec is not None:
+        return [sys.executable, "-m", "refchecker", *args[1:]], (
+            f"RefChecker command '{first}' not found; using module invocation 'python -m refchecker'"
+        )
+
+    return args, None
 
 
 def _create_safe_view(paper_dir: Path, paper_file: Path, output_root: Path) -> tuple[Path, Path]:
@@ -190,7 +230,7 @@ def run_refchecker(
     paper_dir = paper_path if paper_path.is_dir() else paper_file.parent
     safe_workdir, safe_paper_file = _create_safe_view(paper_dir, paper_file, output_root)
 
-    args = shlex.split(refchecker_cmd)
+    args, resolved_cmd_note = _resolve_refchecker_command(refchecker_cmd)
     repo_root = Path(__file__).resolve().parents[2]
     for idx, arg in enumerate(args):
         if arg.endswith(".py") and not os.path.isabs(arg):
@@ -234,6 +274,8 @@ def run_refchecker(
             "report_path": str(output_file),
             "review": "",
             "paper_file": str(paper_file),
+            "resolved_refchecker_cmd": " ".join(args),
+            "resolved_refchecker_note": resolved_cmd_note,
         }
     except OSError as exc:
         return {
@@ -242,6 +284,8 @@ def run_refchecker(
             "report_path": str(output_file),
             "review": "",
             "paper_file": str(paper_file),
+            "resolved_refchecker_cmd": " ".join(args),
+            "resolved_refchecker_note": resolved_cmd_note,
         }
 
     review_text = ""
@@ -262,4 +306,6 @@ def run_refchecker(
         "review": review_text,
         "paper_file": str(safe_paper_file),
         "generated_input": str(generated_input) if generated_input else None,
+        "resolved_refchecker_cmd": " ".join(args),
+        "resolved_refchecker_note": resolved_cmd_note,
     }

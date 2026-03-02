@@ -416,6 +416,8 @@ def run_refchecker_baseline(
                 "refchecker_error": result.get("error"),
                 "refchecker_report": result.get("report_path"),
                 "refchecker_paper_file": result.get("paper_file"),
+                "resolved_refchecker_cmd": result.get("resolved_refchecker_cmd"),
+                "resolved_refchecker_note": result.get("resolved_refchecker_note"),
             },
         )
 

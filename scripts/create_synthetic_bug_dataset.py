@@ -20,6 +20,7 @@ import json
 import random
 import re
 import shutil
+import subprocess
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -165,9 +166,11 @@ def _build_injection_prompt(plan_row: dict[str, Any], *, sandbox_repo_path: str 
         "   - changed_files (array of relative paths)\n"
         "   - injection_summary (string)\n"
         "   - bug_locations (array of {file, hint})\n"
-        "2. `/evidence/artifacts/repo.tar.gz` containing the full modified repo root contents.\n"
+        f"2. `/evidence/artifacts/repo.tar.gz` containing the full modified contents of `{sandbox_repo_path}`.\n"
+        "   You must archive from the repository root path itself (not from any nested subdirectory).\n"
         "   Example command:\n"
-        f"   `mkdir -p /evidence/artifacts && tar -czf /evidence/artifacts/repo.tar.gz -C {sandbox_repo_path} .`\n\n"
+        f"   `mkdir -p /evidence/artifacts && tar -czf /evidence/artifacts/repo.tar.gz -C {sandbox_repo_path} .`\n"
+        "   Do NOT use a subdirectory in `-C` (for example, do NOT use `/workspace/repo/dir`).\n\n"
         "Repository constraints:\n"
         "- Do not leave any backup artifacts in the repo (including files ending in .bak, .orig, .old,\n"
         "  ~, or names containing backup/copy of).\n"
@@ -181,6 +184,15 @@ def _build_injection_prompt(plan_row: dict[str, Any], *, sandbox_repo_path: str 
 
 def _evidence_tar_path(evidence_root: Path, model_name: str, sample_name: str) -> Path:
     return evidence_root / _model_suffix(model_name) / f"evidence-{sample_name}.tar.gz"
+
+
+def _extract_tar_compat(tf: tarfile.TarFile, dest: Path) -> None:
+    """Extract tar safely with Python 3.12+ filter support and older fallback."""
+    try:
+        tf.extractall(dest, filter="data")
+    except TypeError:
+        # Python <3.12 does not support the filter argument.
+        tf.extractall(dest)
 
 
 def _extract_injection_artifacts(
@@ -202,7 +214,7 @@ def _extract_injection_artifacts(
         temp_dir = Path(td)
         try:
             with tarfile.open(evidence_tar, "r:gz") as tf:
-                tf.extractall(temp_dir)
+                _extract_tar_compat(tf, temp_dir)
         except Exception as exc:
             info["error"] = f"Failed to extract evidence tar: {exc}"
             return False, info
@@ -225,17 +237,27 @@ def _extract_injection_artifacts(
             info["error"] = "Missing /evidence/artifacts/repo.tar.gz"
             return False, info
 
-        if output_repo_dir.exists():
-            shutil.rmtree(output_repo_dir)
-        output_repo_dir.mkdir(parents=True, exist_ok=True)
+        extracted_dir = temp_dir / "repo_unpack"
+        extracted_dir.mkdir(parents=True, exist_ok=True)
         try:
             with tarfile.open(repo_tgz, "r:gz") as tf:
-                tf.extractall(output_repo_dir)
+                members = tf.getmembers()
+                member_names = [m.name for m in members]
+                info["repo_archive_member_count"] = len(member_names)
+                info["repo_archive_members_preview"] = member_names[:200]
+                _extract_tar_compat(tf, extracted_dir)
         except Exception as exc:
             info["error"] = f"Failed to extract injected repo archive: {exc}"
             return False, info
 
-        return True, info
+        if output_repo_dir.exists():
+            shutil.rmtree(output_repo_dir)
+        output_repo_dir.mkdir(parents=True, exist_ok=True)
+        # Preserve tar root layout exactly; do not flatten one-level directory trees.
+        for child in extracted_dir.iterdir():
+            shutil.move(str(child), str(output_repo_dir / child.name))
+
+    return True, info
 
 
 def _iter_repo_files(root: Path) -> set[str]:
@@ -274,6 +296,60 @@ def _sha256_hex(path: Path) -> str:
     return h.hexdigest()
 
 
+def _is_notebook_path(rel_path: str) -> bool:
+    return rel_path.lower().endswith(".ipynb")
+
+
+def _truncate_text_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
+    if max_bytes <= 0:
+        return text, False
+    raw = text.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return text, False
+    return raw[:max_bytes].decode("utf-8", errors="replace"), True
+
+
+def _nbdime_notebook_diff(
+    original_notebook: Path,
+    injected_notebook: Path,
+    *,
+    max_bytes: int,
+) -> tuple[str | None, str | None]:
+    nbdiff = shutil.which("nbdiff")
+    if not nbdiff:
+        return None, "nbdiff not found; install nbdime to get human-readable notebook diffs."
+
+    try:
+        proc = subprocess.run(
+            [nbdiff, str(original_notebook), str(injected_notebook)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        return None, f"nbdiff execution failed: {exc}"
+
+    # nbdiff commonly returns 1 when differences are present.
+    stdout = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout or "")
+    stderr = re.sub(r"\x1b\[[0-9;]*m", "", proc.stderr or "")
+    if proc.returncode not in (0, 1):
+        err = stderr.strip() or f"unexpected exit code {proc.returncode}"
+        return None, f"nbdiff failed: {err}"
+
+    if not stdout.strip():
+        return None, "nbdiff returned no diff text."
+
+    output = stdout.rstrip() + "\n"
+    output, truncated = _truncate_text_bytes(output, max_bytes=max_bytes)
+    if truncated:
+        return output, "nbdiff output truncated to diff preview byte limit."
+
+    if stderr.strip():
+        return output, f"nbdiff warning: {stderr.strip()}"
+    return output, None
+
+
 def _compute_repo_diff(
     original_repo: Path,
     injected_repo: Path,
@@ -291,6 +367,10 @@ def _compute_repo_diff(
     modified: list[str] = []
     unchanged: list[str] = []
     patch_parts: list[str] = []
+    notebooks_modified: list[str] = []
+    nbdime_used: list[str] = []
+    nbdime_fallback: list[str] = []
+    nbdime_notes: list[dict[str, str]] = []
 
     for rel in all_files:
         a_path = original_repo / rel
@@ -317,7 +397,7 @@ def _compute_repo_diff(
                 if b_truncated:
                     patch_parts.append("NOTE: preview truncated while checking binary content.\n")
             else:
-                b_text = b_data.decode("utf-8", errors="replace").splitlines(keepends=True)
+                b_text = b_data.decode("utf-8", errors="replace").splitlines()
                 ud = difflib.unified_diff([], b_text, fromfile="/dev/null", tofile=f"b/{rel}", lineterm="")
                 patch_parts.extend(line + "\n" for line in ud)
             continue
@@ -343,9 +423,30 @@ def _compute_repo_diff(
             continue
 
         modified.append(rel)
+        if _is_notebook_path(rel):
+            notebooks_modified.append(rel)
         patch_parts.append(f"diff --git a/{rel} b/{rel}\n")
-        a_lines = a_text_full.splitlines(keepends=True)
-        b_lines = b_text_full.splitlines(keepends=True)
+
+        if _is_notebook_path(rel):
+            nb_text, nb_note = _nbdime_notebook_diff(a_path, b_path, max_bytes=max_file_bytes)
+            if nb_text:
+                nbdime_used.append(rel)
+                patch_parts.append("# Notebook diff generated by nbdime (nbdiff)\n")
+                patch_parts.append(nb_text)
+                if not nb_text.endswith("\n"):
+                    patch_parts.append("\n")
+                if nb_note:
+                    nbdime_notes.append({"file": rel, "note": nb_note})
+                    patch_parts.append(f"# NOTE: {nb_note}\n")
+                continue
+
+            nbdime_fallback.append(rel)
+            note = nb_note or "nbdime unavailable; used unified text diff fallback."
+            nbdime_notes.append({"file": rel, "note": note})
+            patch_parts.append(f"# NOTE: {note}\n")
+
+        a_lines = a_text_full.splitlines()
+        b_lines = b_text_full.splitlines()
         ud = difflib.unified_diff(a_lines, b_lines, fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm="")
         patch_parts.extend(line + "\n" for line in ud)
 
@@ -368,6 +469,12 @@ def _compute_repo_diff(
         "removed_count": len(removed),
         "modified_count": len(modified),
         "changed_count": len(added) + len(removed) + len(modified),
+        "notebook_diffs": {
+            "modified_ipynb_files": notebooks_modified,
+            "nbdime_used_files": nbdime_used,
+            "nbdime_fallback_files": nbdime_fallback,
+            "notes": nbdime_notes,
+        },
     }
     diff_meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return meta
@@ -418,6 +525,162 @@ def _test_evidence_text(test: dict[str, Any]) -> str:
     if isinstance(evidence, str):
         return evidence
     return ""
+
+
+def _property_catalog_from_plan_rows(plan_rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, str]]:
+    catalog: dict[tuple[str, str], dict[str, str]] = {}
+    for row in plan_rows:
+        domain = str(row.get("domain") or "").strip()
+        dataset = str(row.get("dataset") or "").strip()
+        key = (domain, dataset)
+        props = catalog.setdefault(key, {})
+
+        for pid in row.get("selected_property_ids") or []:
+            pid_s = str(pid or "").strip()
+            if pid_s:
+                props.setdefault(pid_s, "")
+
+        for ex in row.get("selected_bug_examples") or []:
+            if not isinstance(ex, dict):
+                continue
+            pid = str(ex.get("property_id") or "").strip()
+            if not pid:
+                continue
+            ptxt = _normalize_whitespace(str(ex.get("property_text") or ""))
+            if ptxt:
+                props[pid] = ptxt
+            else:
+                props.setdefault(pid, "")
+    return catalog
+
+
+def _property_description_from_bug_locations(
+    property_id: str,
+    bug_locations: list[dict[str, Any]],
+    *,
+    injection_summary: str,
+    changed_files: list[str],
+) -> str:
+    pid = (property_id or "").strip()
+    if not pid:
+        return _normalize_whitespace(injection_summary)
+
+    pid_lower = pid.lower()
+    aliases = [pid_lower]
+    suffix = pid_lower.split("_")[-1] if "_" in pid_lower else ""
+    if suffix and suffix not in aliases:
+        aliases.append(suffix)
+
+    matched: list[str] = []
+    for item in bug_locations:
+        if not isinstance(item, dict):
+            continue
+        file_path = _normalize_whitespace(str(item.get("file") or ""))
+        hint = _normalize_whitespace(str(item.get("hint") or ""))
+        blob = f"{file_path} {hint}".lower()
+        ok = False
+        for tok in aliases:
+            if not tok:
+                continue
+            if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", blob):
+                ok = True
+                break
+        if ok:
+            if file_path and hint:
+                matched.append(f"{file_path}: {hint}")
+            elif hint:
+                matched.append(hint)
+            elif file_path:
+                matched.append(file_path)
+
+    if matched:
+        return " | ".join(matched)
+
+    summary = _normalize_whitespace(injection_summary)
+    if summary:
+        return f"Injected for {pid}. {summary}"
+    if changed_files:
+        return f"Injected for {pid}. Changed files: {', '.join(changed_files)}."
+    return f"Injected for {pid}."
+
+
+def _ground_truth_labels_for_row(
+    row: dict[str, Any],
+    *,
+    extract_info: dict[str, Any] | None,
+    property_catalog: dict[tuple[str, str], dict[str, str]],
+) -> dict[str, Any]:
+    domain = str(row.get("domain") or "").strip()
+    dataset = str(row.get("dataset") or "").strip()
+    key = (domain, dataset)
+
+    catalog_for_key: dict[str, str] = dict(property_catalog.get(key, {}))
+    # Ensure this row's selected bug examples are represented even if catalog was sparse.
+    for ex in row.get("selected_bug_examples") or []:
+        if not isinstance(ex, dict):
+            continue
+        pid = str(ex.get("property_id") or "").strip()
+        if not pid:
+            continue
+        ptxt = _normalize_whitespace(str(ex.get("property_text") or ""))
+        if ptxt:
+            catalog_for_key[pid] = ptxt
+        else:
+            catalog_for_key.setdefault(pid, "")
+
+    intended_failed = {str(pid).strip() for pid in (row.get("selected_property_ids") or []) if str(pid).strip()}
+
+    report = ((extract_info or {}).get("injection_report") or {}) if isinstance(extract_info, dict) else {}
+    injected_from_report = {
+        str(pid).strip() for pid in (report.get("injected_property_ids") or []) if str(pid).strip()
+    }
+    failed_property_ids = sorted(intended_failed or injected_from_report)
+
+    # Ensure all failed properties appear even if absent from catalog.
+    for pid in failed_property_ids:
+        catalog_for_key.setdefault(pid, "")
+
+    bug_locations = report.get("bug_locations") or []
+    if not isinstance(bug_locations, list):
+        bug_locations = []
+    changed_files = report.get("changed_files") or []
+    if not isinstance(changed_files, list):
+        changed_files = []
+    injection_summary = _normalize_whitespace(str(report.get("injection_summary") or ""))
+
+    ordered_pids = sorted(catalog_for_key.keys())
+    property_rows: list[dict[str, Any]] = []
+    property_labels: dict[str, int] = {}
+    violation_descriptions: dict[str, str] = {}
+
+    failed_set = set(failed_property_ids)
+    for pid in ordered_pids:
+        is_fail = pid in failed_set
+        property_labels[pid] = 1 if is_fail else 0
+        row_obj = {
+            "property_id": pid,
+            "property_text": catalog_for_key.get(pid) or "",
+            "label": 1 if is_fail else 0,
+            "verdict": "FAIL" if is_fail else "PASS",
+            "gt_violation_description": "",
+        }
+        if is_fail:
+            desc = _property_description_from_bug_locations(
+                pid,
+                bug_locations,
+                injection_summary=injection_summary,
+                changed_files=[str(x) for x in changed_files],
+            )
+            row_obj["gt_violation_description"] = desc
+            violation_descriptions[pid] = desc
+        property_rows.append(row_obj)
+
+    return {
+        "failed_property_ids": failed_property_ids,
+        "property_labels": property_labels,
+        "violation_descriptions": violation_descriptions,
+        "by_property": property_rows,
+    }
 
 
 def _read_bullet_properties(path: Path) -> list[str]:
@@ -538,6 +801,45 @@ def _resolve_existing(path_candidates: list[Path]) -> Path:
     raise FileNotFoundError(f"No candidate file exists: {tried}")
 
 
+def _resolve_cwe_bench_repo_path(cwe_repo_root: Path, repo_slug: str) -> Path:
+    """Resolve CWE-Bench repo path supporting numeric-prefixed directory names."""
+    slug = _normalize_whitespace(repo_slug)
+    if not slug:
+        raise FileNotFoundError("Empty CWE-Bench repo slug")
+
+    exact = cwe_repo_root / slug
+    if exact.exists() and exact.is_dir():
+        return exact
+
+    # Common layout is: <int>_<repo_slug>
+    prefixed = sorted(p for p in cwe_repo_root.glob(f"[0-9]*_{slug}") if p.is_dir())
+    if len(prefixed) == 1:
+        return prefixed[0]
+    if len(prefixed) > 1:
+        raise FileNotFoundError(
+            f"Ambiguous CWE-Bench repo slug '{slug}' matched multiple directories: "
+            + ", ".join(str(p.name) for p in prefixed[:10])
+        )
+
+    # Fallback: strip any leading numeric prefix and compare.
+    fallback = sorted(
+        p
+        for p in cwe_repo_root.iterdir()
+        if p.is_dir() and re.sub(r"^\d+_", "", p.name) == slug
+    )
+    if len(fallback) == 1:
+        return fallback[0]
+    if len(fallback) > 1:
+        raise FileNotFoundError(
+            f"Ambiguous CWE-Bench fallback resolution for slug '{slug}': "
+            + ", ".join(str(p.name) for p in fallback[:10])
+        )
+
+    raise FileNotFoundError(
+        f"CWE-Bench repo for slug '{slug}' not found under {cwe_repo_root}"
+    )
+
+
 def _collect_vulnerability_domain(
     results_dir: Path,
     data_dir: Path,
@@ -558,9 +860,11 @@ def _collect_vulnerability_domain(
 
     bibifi_props = _read_bullet_properties(data_dir / "vuln" / "bibifi" / "properties.md")
     cwe_props = _read_cwe_properties(data_dir / "vuln" / "cwe-bench" / "properties.md")
+    cwe_repo_root = data_dir / "vuln" / "cwe-bench" / "repos"
 
     clean_state: dict[tuple[str, str], dict[str, Any]] = {}
     bug_examples: list[dict[str, Any]] = []
+    cwe_resolution_missing = 0
 
     for dataset, recall_path in (("bibifi", bibifi_recall), ("cwe-bench", cwe_recall)):
         for row in _load_jsonl(recall_path):
@@ -578,7 +882,11 @@ def _collect_vulnerability_domain(
                 prop_id = f"bibifi_vuln{prop_idx}" if prop_idx >= 0 else "bibifi_unknown"
                 prop_text = bibifi_props[prop_idx] if 0 <= prop_idx < len(bibifi_props) else ""
             else:
-                repo_path = data_dir / "vuln" / "cwe-bench" / "repos" / repo_slug
+                try:
+                    repo_path = _resolve_cwe_bench_repo_path(cwe_repo_root, repo_slug)
+                except FileNotFoundError:
+                    cwe_resolution_missing += 1
+                    continue
                 cwe_id = _normalize_whitespace(str(row.get("cwe_id") or "")).lstrip("0") or "0"
                 prop_id = f"cwe-bench_CWE-{cwe_id}"
                 prop_text = cwe_props.get(cwe_id, "")
@@ -641,6 +949,8 @@ def _collect_vulnerability_domain(
             "bibifi_recall": str(bibifi_recall),
             "cwe_bench_recall": str(cwe_recall),
         },
+        "cwe_repo_root": str(cwe_repo_root),
+        "cwe_repo_resolution_missing_count": cwe_resolution_missing,
         "clean_repo_count": len(clean_repos),
         "bug_example_count": len(bug_examples),
         "property_count_with_examples": len({e["property_id"] for e in bug_examples}),
@@ -747,10 +1057,10 @@ def _collect_hallucination_domain(
     max_per_property: int,
     allow_unverified_fallback: bool,
 ) -> DomainArtifacts:
-    source_file = _resolve_existing([results_dir / "hallucination_AT-gpt-5-mini.jsonl"])
+    source_file = _resolve_existing([results_dir / "hallucination_refchecker.jsonl"])
     method_run_name = source_file.stem
     rows = _load_jsonl(source_file)
-    verified = _load_human_c_labels(human_long_csv, method_prefixes=("hallucination_",))
+    verified = _load_human_c_labels(human_long_csv, method_prefixes=("hallucination_refchecker",))
     verified_keys = verified.get(method_run_name, set())
     has_verified_labels = bool(verified_keys)
 
@@ -814,14 +1124,16 @@ def _collect_hallucination_domain(
                         "evidence_text": _test_evidence_text(test),
                         "execution_log_excerpt": str(test.get("execution_log") or "")[:4000],
                         "verified": False,
-                        "verification_source": "unverified_vibetester_fail_fallback",
+                        "verification_source": "unverified_refchecker_fail_fallback",
                         "method_run_name": method_run_name,
                     }
                 )
 
         if has_verified_labels:
-            is_clean = (not has_verified_fail) and (not has_inconclusive)
-            clean_criterion = "no_verified_fail_and_no_inconclusive"
+            # Hallucination verification is sparse and provided on FAIL predictions only;
+            # use "no verified FAIL" as the clean criterion for this domain.
+            is_clean = not has_verified_fail
+            clean_criterion = "no_verified_fail"
         else:
             is_clean = (not any_fail) and (not has_inconclusive)
             clean_criterion = "strict_all_pass_no_inconclusive"
@@ -845,19 +1157,19 @@ def _collect_hallucination_domain(
         "domain": "citation-hallucinations",
         "source": str(source_file),
         "human_annotation_source": str(human_long_csv),
-        "has_verified_hallucination_at_labels": has_verified_labels,
+        "has_verified_hallucination_refchecker_labels": has_verified_labels,
         "clean_repo_count": len(clean_repos),
         "bug_example_count": len(bug_examples),
         "property_count_with_examples": len({e["property_id"] for e in bug_examples}),
         "clean_definition": (
-            "no verified FAIL and no INCONCLUSIVE in vibetester output"
+            "no verified FAIL in refchecker output"
             if has_verified_labels
-            else "strict all-PASS and no INCONCLUSIVE in vibetester output"
+            else "strict all-PASS and no INCONCLUSIVE in refchecker output"
         ),
         "bug_example_definition": (
-            "verified FAIL from vibetester outputs via human C labels"
+            "verified FAIL from refchecker outputs via human C labels"
             if has_verified_labels
-            else "unverified FAIL fallback from vibetester outputs (no AT human labels found)"
+            else "unverified FAIL fallback from refchecker outputs (no refchecker human labels found)"
         ),
     }
     return DomainArtifacts("citation-hallucinations", clean_repos, bug_examples, summary)
@@ -956,31 +1268,55 @@ def _plan(args: argparse.Namespace) -> None:
         clean_repos = _load_jsonl(clean_path)
         bug_examples = _load_jsonl(bug_path)
 
-        by_prop: dict[str, list[dict[str, Any]]] = {}
+        by_dataset_prop: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for ex in bug_examples:
-            by_prop.setdefault(str(ex.get("property_id") or ""), []).append(ex)
-        prop_ids = sorted([p for p in by_prop.keys() if p])
-        if not prop_ids:
+            dataset_name = str(ex.get("dataset") or "").strip() or "__all__"
+            prop_id = str(ex.get("property_id") or "")
+            if not prop_id:
+                continue
+            by_dataset_prop.setdefault(dataset_name, {}).setdefault(prop_id, []).append(ex)
+
+        # Fallback bucket for artifacts that do not carry dataset names.
+        fallback_props = by_dataset_prop.get("__all__", {})
+        if not by_dataset_prop:
             continue
 
-        for repo in clean_repos:
+        def _make_plan_row(repo: dict[str, Any]) -> dict[str, Any]:
+            repo_dataset = str(repo.get("dataset") or "").strip()
+            dataset_props = by_dataset_prop.get(repo_dataset) or fallback_props
+            prop_ids = sorted([p for p in dataset_props.keys() if p])
             max_k = min(len(prop_ids), max(int(args.max_properties_per_repo), 0))
             k = rng.randint(0, max_k)
             chosen_props = rng.sample(prop_ids, k) if k > 0 else []
             chosen_examples: list[dict[str, Any]] = []
             for pid in chosen_props:
-                chosen_examples.append(rng.choice(by_prop[pid]))
-            plan_rows.append(
-                {
-                    "domain": domain_dir.name,
-                    "repo_name": repo.get("repo_name"),
-                    "repo_slug": repo.get("repo_slug"),
-                    "repo_path": repo.get("repo_path"),
-                    "k": k,
-                    "selected_property_ids": chosen_props,
-                    "selected_bug_examples": chosen_examples,
-                }
-            )
+                chosen_examples.append(rng.choice(dataset_props[pid]))
+            return {
+                "domain": domain_dir.name,
+                "dataset": repo.get("dataset"),
+                "repo_name": repo.get("repo_name"),
+                "repo_slug": repo.get("repo_slug"),
+                "repo_path": repo.get("repo_path"),
+                "k": k,
+                "selected_property_ids": chosen_props,
+                "selected_bug_examples": chosen_examples,
+            }
+
+        samples_per_subdataset = int(args.samples_per_subdataset or 0)
+        if samples_per_subdataset > 0:
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for repo in clean_repos:
+                key = str(repo.get("dataset") or "unknown")
+                grouped.setdefault(key, []).append(repo)
+            for dataset_name in sorted(grouped):
+                repos = grouped[dataset_name]
+                if not repos:
+                    continue
+                for _ in range(samples_per_subdataset):
+                    plan_rows.append(_make_plan_row(rng.choice(repos)))
+        else:
+            for repo in clean_repos:
+                plan_rows.append(_make_plan_row(repo))
 
     out_path = Path(args.plan_path)
     _write_jsonl(out_path, plan_rows)
@@ -1001,6 +1337,21 @@ def _inject(args: argparse.Namespace) -> None:
     plan_rows = _load_jsonl(plan_path)
     if not plan_rows:
         raise SystemExit(f"No plan rows found in: {plan_path}")
+
+    domain_filters = {str(x).strip() for x in (args.domains or []) if str(x).strip()}
+    if domain_filters:
+        plan_rows = [r for r in plan_rows if str(r.get("domain") or "").strip() in domain_filters]
+
+    dataset_filters = {str(x).strip() for x in (args.datasets or []) if str(x).strip()}
+    if dataset_filters:
+        plan_rows = [r for r in plan_rows if str(r.get("dataset") or "").strip() in dataset_filters]
+
+    if not plan_rows:
+        raise SystemExit(
+            "No plan rows remain after applying filters "
+            f"(domains={sorted(domain_filters) or 'ALL'}, datasets={sorted(dataset_filters) or 'ALL'})."
+        )
+    property_catalog = _property_catalog_from_plan_rows(plan_rows)
 
     offset = max(int(args.offset), 0)
     if offset:
@@ -1041,14 +1392,15 @@ def _inject(args: argparse.Namespace) -> None:
 
     agent = VibeTestAgent(model=model_name, static=bool(args.static))
     label_rows: list[dict[str, Any]] = []
-
+    pending_rows: list[dict[str, Any]] = []
     for idx, row in enumerate(plan_rows):
+        row_index = idx + offset
         repo_path_raw = str(row.get("repo_path") or "").strip()
         if not repo_path_raw:
             label_rows.append(
                 {
                     "run_id": run_id,
-                    "row_index": idx + offset,
+                    "row_index": row_index,
                     "status": "error",
                     "error": "missing repo_path in plan row",
                     "plan_row": row,
@@ -1057,10 +1409,11 @@ def _inject(args: argparse.Namespace) -> None:
             continue
         source_repo_path = Path(repo_path_raw)
         if not source_repo_path.exists():
+            print(source_repo_path)
             label_rows.append(
                 {
                     "run_id": run_id,
-                    "row_index": idx + offset,
+                    "row_index": row_index,
                     "status": "error",
                     "error": f"repo_path does not exist: {source_repo_path}",
                     "plan_row": row,
@@ -1071,7 +1424,7 @@ def _inject(args: argparse.Namespace) -> None:
         domain = _slugify(str(row.get("domain") or "unknown"), max_len=60)
         repo_name = str(row.get("repo_name") or row.get("repo_slug") or source_repo_path.name)
         repo_slug = _slugify(repo_name, max_len=100)
-        sample_name = f"inject_{idx + offset:06d}_{repo_slug}"
+        sample_name = f"inject_{row_index:06d}_{repo_slug}"
         prompt = _build_injection_prompt(row)
         test_case = TestCase(
             name=sample_name,
@@ -1080,26 +1433,70 @@ def _inject(args: argparse.Namespace) -> None:
             sandbox_path="/workspace",
             metadata={
                 "run_id": run_id,
-                "plan_row_index": idx + offset,
+                "plan_row_index": row_index,
             },
         )
+        pending_rows.append(
+            {
+                "row_index": row_index,
+                "row": row,
+                "source_repo_path": source_repo_path,
+                "domain": domain,
+                "repo_name": repo_name,
+                "repo_slug": repo_slug,
+                "sample_name": sample_name,
+                "test_case": test_case,
+            }
+        )
 
-        results = agent.execute_tests([test_case], sandbox=sandbox_name)
-        result = results[0] if results else None
-        result_text = result.message if result is not None else ""
+    all_error: str | None = None
+    result_by_name: dict[str, Any] = {}
+    if pending_rows:
+        all_test_cases = [entry["test_case"] for entry in pending_rows]
+        print(f"Running injection eval with {len(all_test_cases)} sample(s).")
+        try:
+            all_results = agent.execute_tests(all_test_cases, sandbox=sandbox_name)
+            result_by_name = {res.test_case.name: res for res in all_results}
+        except Exception as exc:
+            all_error = str(exc)
+
+    for entry in pending_rows:
+        row_index = int(entry["row_index"])
+        row = entry["row"]
+        source_repo_path = entry["source_repo_path"]
+        domain = str(entry["domain"])
+        repo_name = str(entry["repo_name"])
+        repo_slug = str(entry["repo_slug"])
+        sample_name = str(entry["sample_name"])
+
+        result = result_by_name.get(sample_name)
+        if result is None and all_error:
+            result_text = f"Injection execution error: {all_error}"
+        else:
+            result_text = result.message if result is not None else ""
         parsed_report = _extract_json_object(result_text)
         evidence_tar = _evidence_tar_path(evidence_root, model_name, sample_name)
 
-        target_dir = repos_root / domain / f"{idx + offset:06d}_{repo_slug}"
-        ok_extract, extract_info = _extract_injection_artifacts(evidence_tar, output_repo_dir=target_dir)
+        sample_dir = repos_root / domain / f"{row_index:06d}_{repo_slug}"
+        repo_dir_name = _slugify(str(row.get("repo_slug") or repo_slug), max_len=100)
+        injected_repo_dir = sample_dir / repo_dir_name
+        ok_extract, extract_info = _extract_injection_artifacts(
+            evidence_tar,
+            output_repo_dir=injected_repo_dir,
+        )
+        ground_truth = _ground_truth_labels_for_row(
+            row,
+            extract_info=extract_info if ok_extract else None,
+            property_catalog=property_catalog,
+        )
         diff_info: dict[str, Any] | None = None
         if ok_extract:
-            diff_patch_path = target_dir / "injection.diff.patch"
-            diff_meta_path = target_dir / "injection.diff.json"
+            diff_patch_path = sample_dir / "injection.diff.patch"
+            diff_meta_path = sample_dir / "injection.diff.json"
             try:
                 diff_info = _compute_repo_diff(
                     source_repo_path,
-                    target_dir,
+                    injected_repo_dir,
                     diff_path=diff_patch_path,
                     diff_meta_path=diff_meta_path,
                     max_file_bytes=int(args.diff_max_file_bytes),
@@ -1108,40 +1505,44 @@ def _inject(args: argparse.Namespace) -> None:
                 diff_info = {
                     "error": f"Failed to compute repo diff: {exc}",
                     "original_repo": str(source_repo_path),
-                    "injected_repo": str(target_dir),
+                    "injected_repo": str(injected_repo_dir),
                     "diff_patch_path": str(diff_patch_path),
                     "diff_meta_path": str(diff_meta_path),
                 }
 
         status = "ok" if ok_extract else "error"
-        label_rows.append(
-            {
-                "run_id": run_id,
-                "row_index": idx + offset,
-                "status": status,
-                "domain": row.get("domain"),
-                "repo_name": repo_name,
-                "repo_slug": row.get("repo_slug"),
-                "source_repo_path": str(source_repo_path),
-                "output_repo_path": str(target_dir),
-                "k": row.get("k"),
-                "selected_property_ids": row.get("selected_property_ids", []),
-                "selected_bug_examples": row.get("selected_bug_examples", []),
-                "agent_model": model_name,
-                "agent_static": bool(args.static),
-                "sandbox": sandbox_name,
-                "sample_name": sample_name,
-                "result_passed": bool(result.passed) if result is not None else False,
-                "result_message": result_text,
-                "result_report_json": parsed_report,
-                "artifact_extraction": extract_info,
-                "repo_diff": diff_info,
-                "timestamp_utc": _utc_now_iso(),
-            }
-        )
-
-        if bool(args.stop_on_error) and status != "ok":
-            break
+        row_payload = {
+            "run_id": run_id,
+            "row_index": row_index,
+            "status": status,
+            "domain": row.get("domain"),
+            "dataset": row.get("dataset"),
+            "repo_name": repo_name,
+            "repo_slug": row.get("repo_slug"),
+            "source_repo_path": str(source_repo_path),
+            "output_repo_path": str(injected_repo_dir),
+            "output_sample_path": str(sample_dir),
+            "k": row.get("k"),
+            "selected_property_ids": row.get("selected_property_ids", []),
+            "selected_bug_examples": row.get("selected_bug_examples", []),
+            "agent_model": model_name,
+            "agent_static": bool(args.static),
+            "sandbox": sandbox_name,
+            "sample_name": sample_name,
+            "result_passed": bool(result.passed) if result is not None else False,
+            "result_message": result_text,
+            "result_report_json": parsed_report,
+            "artifact_extraction": extract_info,
+            "repo_diff": diff_info,
+            "ground_truth": ground_truth,
+            "ground_truth_by_property": ground_truth.get("by_property", []),
+            "ground_truth_property_labels": ground_truth.get("property_labels", {}),
+            "ground_truth_violation_descriptions": ground_truth.get("violation_descriptions", {}),
+            "timestamp_utc": _utc_now_iso(),
+        }
+        if all_error and result is None:
+            row_payload["execution_error"] = all_error
+        label_rows.append(row_payload)
 
     _write_jsonl(labels_path, label_rows)
     summary = {
@@ -1152,6 +1553,8 @@ def _inject(args: argparse.Namespace) -> None:
         "repos_root": str(repos_root),
         "model": model_name,
         "sandbox": sandbox_name,
+        "domain_filters": sorted(domain_filters),
+        "dataset_filters": sorted(dataset_filters),
         "static": bool(args.static),
         "row_count": len(label_rows),
         "ok_count": sum(1 for r in label_rows if r.get("status") == "ok"),
@@ -1223,6 +1626,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=9999,
         help="Upper bound for sampled k properties per clean repo.",
     )
+    plan.add_argument(
+        "--samples-per-subdataset",
+        type=int,
+        default=0,
+        help="If >0, sample exactly this many plan rows per subdataset (dataset field), with replacement.",
+    )
     plan.add_argument("--seed", type=int, default=1337, help="Random seed.")
     plan.set_defaults(func=_plan)
 
@@ -1252,6 +1661,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max bytes per file preview while computing diffs (full text compare still used for UTF-8 text files).",
     )
     inject.add_argument("--run-id", default="", help="Optional run ID (default: UTC timestamp).")
+    inject.add_argument(
+        "--domains",
+        nargs="+",
+        default=[],
+        help="Optional domain filters applied to plan rows before injection (e.g., ml-bugs security-vuln).",
+    )
+    inject.add_argument(
+        "--datasets",
+        nargs="+",
+        default=[],
+        help="Optional dataset filters applied to plan rows before injection (e.g., kaggle_titanic).",
+    )
     inject.add_argument("--limit", type=int, default=0, help="Optional number of plan rows to execute.")
     inject.add_argument("--offset", type=int, default=0, help="Optional plan row offset.")
     inject.add_argument(

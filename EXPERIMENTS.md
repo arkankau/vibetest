@@ -69,32 +69,154 @@ description of the bug.
   - Security vulnerabilities: `*_AT-*_recall_scored.jsonl` with `verification.verified_fail=true`
   - ML bugs (Kaggle): human annotation `C` labels for `kaggle_*_AT-*` in `results/human-annotations/human_annotations_long.csv`
   - Citation hallucinations:
-    - If `hallucination_AT-*` human `C` labels exist, use them as verified FAILs
-    - Otherwise optional fallback (`--allow-unverified-hallucination-fallback`) uses unverified VibeTester FAIL examples to avoid empty bug-example sets
+    - Primary source is `results/hallucination_refchecker.jsonl`
+    - Verified FAILs come from human annotation `C` labels for `hallucination_refchecker` in `results/human-annotations/human_annotations_long.csv`
+    - Otherwise optional fallback (`--allow-unverified-hallucination-fallback`) uses unverified RefChecker FAIL examples to avoid empty bug-example sets
 - Current "clean" operationalization used by `collect`:
   - For domains with verification labels: no verified FAIL and no INCONCLUSIVE
-  - For hallucination when no AT verification labels are available: strict all-PASS and no INCONCLUSIVE (may produce zero clean repos)
+  - Citation hallucinations (RefChecker-verified): no verified FAIL (INCONCLUSIVE is not treated as disqualifying due sparse verification on FAIL outputs)
+  - For hallucination when no RefChecker verification labels are available: strict all-PASS and no INCONCLUSIVE (may produce zero clean repos)
 - `collect` supports domain filtering via `--domains` (e.g., run only `security-vuln` and `ml-bugs`)
 - `collect` supports subdataset balancing via `--equalize-clean-repos-per-subdataset`
   - This balances *clean repo counts* per subdataset (using the `dataset` field) by random downsampling to the minimum available count
   - Deterministic with `--seed`
+- For `security-vuln` / `cwe-bench`, repo paths are resolved against numeric-prefixed directories (e.g., `23_<repo_slug>`) under `data/vuln/cwe-bench/repos/`.
+- `plan` supports fixed-size planning per subdataset via `--samples-per-subdataset`
+  - If set to `N>0`, planner emits exactly `N` rows per subdataset (`dataset` field), sampling clean repos with replacement
+  - If unset/0, planner emits one row per clean repo (previous behavior)
+  - Property sampling is dataset-scoped: each clean repo only samples from bug exemplars with the same `dataset` value (e.g., `cwe-bench` repos only use `data/vuln/cwe-bench/properties.md`-derived exemplars, not `bibifi`).
 - Bug examples are capped per property by `--max-examples-per-property` (e.g., `3`)
 - `inject` is now implemented in `scripts/create_synthetic_bug_dataset.py` and requires explicit `--confirm`
   - Reads `synth-data/injection_plan.jsonl`
   - Runs a VibeTest agent per planned row to perform code edits inside sandbox
+  - Executes all selected planned rows in a single `execute_tests(...)` call (Inspect handles internal scheduling)
+  - Supports filtering planned rows by domain/dataset for one-split-at-a-time runs:
+    - `--domains ml-bugs` and/or `--datasets kaggle_titanic`
   - Requires agent to emit:
     - `/evidence/artifacts/injection_report.json`
-    - `/evidence/artifacts/repo.tar.gz` (full modified repo)
+    - `/evidence/artifacts/repo.tar.gz` (full modified repo contents from repo root; tar command uses `-C /workspace/repo .`, not a nested subdirectory)
   - Injection prompt explicitly requires in-place edits only (no `.bak`/backup/renamed-clean-copy artifacts)
-  - Extracts modified repos into `synth-data/injected/repos/<domain>/<row>_<repo>/`
+  - Extracts modified repos into `synth-data/injected/repos/<domain>/<row>_<repo>/<repo_code>/`
+    - Example: `synth-data/injected/repos/security-vuln/000001_49/49/`
+    - Diff/artifact metadata stays one level above the repo code directory.
+    - Extractor preserves tar root layout exactly (no post-extraction flattening), and stores tar member previews in labels metadata for debugging.
   - Computes and stores source-vs-injected diffs per sample:
     - `synth-data/injected/repos/<domain>/<row>_<repo>/injection.diff.patch`
     - `synth-data/injected/repos/<domain>/<row>_<repo>/injection.diff.json`
+    - For modified `.ipynb` files, diff text uses `nbdime` (`nbdiff`) when available; otherwise falls back to unified text diff and records fallback notes in diff metadata.
   - Writes labels and metadata to `synth-data/injected/labels.jsonl`
+    - `output_repo_path` points to the code directory (`.../<row>_<repo>/<repo_code>/`)
+    - `output_sample_path` points to the sample directory (`.../<row>_<repo>/`)
+    - Includes explicit per-property ground-truth fields per injected sample:
+      - `ground_truth_property_labels`: map `{property_id: 0|1}` where `1=FAIL (bug injected)` and `0=PASS`
+      - `ground_truth_violation_descriptions`: map `{property_id: description}` for failed properties
+      - `ground_truth_by_property`: row-friendly list with `(property_id, verdict, gt_violation_description)`
   - Writes run summary to `synth-data/injected/injection_run_summary.json`
   - Supports `--limit`, `--offset`, `--model`, `--sandbox`, `--static`, and `--stop-on-error`
+
+##### Inject One Subdataset At A Time (Example: Kaggle Titanic)
+```sh
+uv run --active python scripts/create_synthetic_bug_dataset.py inject \
+  --plan-path synth-data/injection_plan_25_per_subdataset.jsonl \
+  --output-root synth-data/injected \
+  --labels-path synth-data/injected/labels_kaggle_titanic.jsonl \
+  --domains ml-bugs \
+  --datasets kaggle_titanic \
+  --model openai/gpt-5-mini \
+  --sandbox docker \
+  --confirm
+```
 
 ### Experiment
 Using the data created as described above, we then run the vibetester as well as
 the baselines on the data with an automated LLM judge which determines if the
 output (verdict, evidence) is correct by comparing it to the ground truth.
+
+#### Synthetic Experiment Runner (Current)
+- Implementation script: `experiments/synthetic.py`
+- Supported methods:
+  - `vibetest` (AT)
+  - `codex` (generic code review + LLM property mapping)
+  - `traincheck` (ML bugs only)
+  - `codeql` (security-vuln only)
+  - `refchecker` (citation-hallucinations only)
+- Input:
+  - `--labels-path synth-data/injected/labels_<subdataset>.jsonl`
+- Output:
+  - Standardized JSONL in `results/synthetic/` by default (or `--output-path` override)
+  - Includes predictions plus per-property synthetic scoring metadata
+
+##### Synthetic Scoring Semantics
+- Binary verdict check:
+  - PASS/FAIL prediction must match `ground_truth_property_labels[property_id]`
+  - PASS/FAIL mismatch is scored incorrect
+- FAIL evidence verification:
+  - If prediction is FAIL and GT is FAIL, an LLM verifier checks whether predicted FAIL evidence matches `ground_truth_violation_descriptions[property_id]`
+  - Only verifier grade `C` is scored correct
+- Abstentions:
+  - `INCONCLUSIVE` / `NOT APPLICABLE` are treated as abstentions (not correct)
+- Verified FAIL classification metrics:
+  - Positive class: GT FAIL labels (`ground_truth_label = 1`)
+  - Candidate positive prediction: any FAIL prediction (`predicted_verdict = FAIL`)
+  - True positive: candidate FAIL prediction with verifier grade `C` on a GT FAIL
+  - False positive: candidate FAIL prediction not counted as TP (including verifier grade `I`)
+  - True negative: GT PASS with predicted PASS (abstentions are not counted as TN)
+  - Precision / Recall / F1 are computed from these verifier-backed TP/FP/FN definitions
+
+##### Example Commands
+Run synthetic AT on one injected subdataset:
+```sh
+uv run --active python experiments/synthetic.py \
+  --method vibetest \
+  --labels-path synth-data/injected/labels_kaggle_titanic.jsonl \
+  --datasets kaggle_titanic \
+  --model openai/gpt-5-mini \
+  --sandbox docker \
+  --scorer-model openai/gpt-5-mini
+```
+
+Run synthetic Codex baseline on one injected subdataset:
+```sh
+uv run --active python experiments/synthetic.py \
+  --method codex \
+  --labels-path synth-data/injected/labels_kaggle_titanic.jsonl \
+  --datasets kaggle_titanic \
+  --model openai/gpt-5-mini \
+  --codex-cmd codex \
+  --codex-model inspect \
+  --codex-prompt /review \
+  --sandbox docker \
+  --review-mapper-model openai/gpt-5-mini \
+  --scorer-model openai/gpt-5-mini
+```
+
+Run synthetic TrainCheck baseline (ML bugs only):
+```sh
+uv run --active python experiments/synthetic.py \
+  --method traincheck \
+  --labels-path synth-data/injected/labels_kaggle_titanic.jsonl \
+  --datasets kaggle_titanic \
+  --traincheck-reference data/traincheck/mnist.py \
+  --traincheck-timeout 1200 \
+  --review-mapper-model openai/gpt-5-mini \
+  --scorer-model openai/gpt-5-mini
+```
+
+Run synthetic RefChecker baseline (citation hallucinations only):
+```sh
+uv run --active python experiments/synthetic.py \
+  --method refchecker \
+  --labels-path synth-data/injected/labels_hallucination.jsonl \
+  --domains citation-hallucinations \
+  --datasets hallucination \
+  --refchecker-timeout 1200 \
+  --review-mapper-model openai/gpt-5-mini \
+  --scorer-model openai/gpt-5-mini
+```
+
+Compute precision/recall/F1 from saved synthetic results:
+```sh
+uv run --active python scripts/analyze_synthetic_metrics.py \
+  results/synthetic/synthetic_kaggle_titanic_AT-gpt-5-mini.jsonl \
+  --output-csv results/synthetic/synthetic_metrics.csv
+```

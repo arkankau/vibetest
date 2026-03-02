@@ -343,6 +343,7 @@ def analyze_repo_with_codeql(
 	repo_path: Path,
 	*,
 	timeout_s: int = 1800,
+	build_mode_override: str | None = None,
 ) -> dict[str, Any]:
 	"""Analyze a repository with CodeQL.
 
@@ -384,7 +385,7 @@ def analyze_repo_with_codeql(
 			db_dir = tmp_path / "db"
 			sarif_path = tmp_path / "results.sarif"
 
-			build_mode = _build_mode_for_language(language)
+			build_mode = build_mode_override or _build_mode_for_language(language)
 
 			_run(
 				[
