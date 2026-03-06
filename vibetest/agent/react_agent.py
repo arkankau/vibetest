@@ -1,7 +1,9 @@
 """ReAct agent implementation using Inspect AI."""
 
+import json
 import os
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import uuid
@@ -118,6 +120,29 @@ _temp_archive_dirs: list[Path] = []
 
 # Cache for archives: maps (repo_path, additional_data_tuple, sandbox_prefix) to (files_dict, setup_script)
 _archive_cache: dict[tuple, tuple[dict[str, str], str]] = {}
+
+
+def _docker_supports_nvidia_runtime() -> bool:
+    """Return True when the local Docker daemon advertises an NVIDIA runtime."""
+    if os.getenv("VIBETEST_DOCKER_REQUIRE_GPU") == "1":
+        return True
+
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return False
+
+    try:
+        runtimes = json.loads(result.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        return False
+
+    return isinstance(runtimes, dict) and "nvidia" in runtimes
 
 
 def _make_cache_key(test_case: TestCase, sandbox_prefix: str) -> tuple:
@@ -388,6 +413,7 @@ def setup_docker_sandbox() -> tuple[SandboxEnvironmentSpec, Path]:
     package_root = get_package_root()
     dockerfile_path = package_root / "Dockerfile"
     source_compose_path = package_root / "compose.yaml"
+    supports_nvidia = _docker_supports_nvidia_runtime()
 
     if not dockerfile_path.exists():
         raise FileNotFoundError(
@@ -417,6 +443,8 @@ def setup_docker_sandbox() -> tuple[SandboxEnvironmentSpec, Path]:
                     'context': str(package_root),
                     'dockerfile': 'Dockerfile'
                 }
+            if not supports_nvidia:
+                compose_config['services']['default'].pop('deploy', None)
 
         # Write temporary compose.yaml
         with open(temp_compose_path, 'w') as f:
@@ -432,20 +460,21 @@ def setup_docker_sandbox() -> tuple[SandboxEnvironmentSpec, Path]:
                     },
                     'init': True,
                     'command': 'tail -f /dev/null',
-                    'deploy': {
-                        'resources': {
-                            'reservations': {
-                                'devices': [{
-                                    'driver': 'nvidia',
-                                    'count': 1,
-                                    'capabilities': ['gpu']
-                                }]
-                            }
-                        }
-                    }
                 }
             }
         }
+        if supports_nvidia:
+            compose_config['services']['default']['deploy'] = {
+                'resources': {
+                    'reservations': {
+                        'devices': [{
+                            'driver': 'nvidia',
+                            'count': 1,
+                            'capabilities': ['gpu']
+                        }]
+                    }
+                }
+            }
         with open(temp_compose_path, 'w') as f:
             yaml.dump(compose_config, f)
 
