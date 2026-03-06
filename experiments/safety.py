@@ -22,6 +22,7 @@ import jsonlines
 from inspect_ai.model import GenerateConfig, get_model
 
 from vibetest import TestCase, VibeTestAgent
+from vibetest.agent import ClaudeCodeSafetyAgent
 from vibetest.baselines import LLMJudgeBaseline
 from vibetest.usage import aggregate_usage_payloads
 
@@ -872,6 +873,12 @@ def run_vibetest(
     dynamic: bool,
     setup: str,
     sandbox: str | None,
+    vibetest_backend: str,
+    claude_cmd: str,
+    claude_model: str,
+    claude_timeout_s: int,
+    claude_runner: str,
+    claude_log_dir: str | None,
     trace_repos_dir: Path,
     output_path: Path | None,
 ) -> Path:
@@ -896,8 +903,19 @@ def run_vibetest(
                 },
             )
         ]
-    agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
-    results = agent.execute_tests(test_cases, sandbox=sandbox)
+    if vibetest_backend == "claude-code":
+        agent = ClaudeCodeSafetyAgent(
+            claude_cmd=claude_cmd,
+            claude_model=claude_model,
+            timeout_s=claude_timeout_s,
+            static=not dynamic,
+            runner=claude_runner,
+            log_dir=claude_log_dir or "./logs",
+        )
+        results = agent.execute_tests(test_cases)
+    else:
+        agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
+        results = agent.execute_tests(test_cases, sandbox=sandbox)
 
     out_path = output_path or standardized_results_path(
         dataset_name,
@@ -1102,6 +1120,12 @@ def run_impossiblebench_vibetest(
     model: str | None,
     dynamic: bool,
     sandbox: str | None,
+    vibetest_backend: str,
+    claude_cmd: str,
+    claude_model: str,
+    claude_timeout_s: int,
+    claude_runner: str,
+    claude_log_dir: str | None,
     scorer_model: str,
     scorer_concurrency: int,
     output_path: Path | None,
@@ -1124,8 +1148,19 @@ def run_impossiblebench_vibetest(
             )
         )
 
-    agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
-    results = agent.execute_tests(test_cases, sandbox=sandbox)
+    if vibetest_backend == "claude-code":
+        agent = ClaudeCodeSafetyAgent(
+            claude_cmd=claude_cmd,
+            claude_model=claude_model,
+            timeout_s=claude_timeout_s,
+            static=not dynamic,
+            runner=claude_runner,
+            log_dir=claude_log_dir or "./logs",
+        )
+        results = agent.execute_tests(test_cases)
+    else:
+        agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
+        results = agent.execute_tests(test_cases, sandbox=sandbox)
 
     rows: list[dict[str, Any]] = []
     for case, result in zip(cases, results):
@@ -1236,7 +1271,13 @@ def _parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="openai/gpt-5-mini",
-        help="Model for both vibetest and LLM judge baseline.",
+        help="Inspect model for vibetest/judge baselines.",
+    )
+    parser.add_argument(
+        "--vibetest-backend",
+        choices=["inspect", "claude-code"],
+        default="inspect",
+        help="Backend used for the vibetest safety agent.",
     )
     parser.add_argument("--dynamic", action="store_true", help="Use dynamic VibeTest mode.")
     parser.add_argument(
@@ -1244,6 +1285,36 @@ def _parse_args() -> argparse.Namespace:
         choices=["per-trace", "all-traces"],
         default="per-trace",
         help="Run vibetest on each trace separately or one repo containing all traces.",
+    )
+    parser.add_argument(
+        "--claude-cmd",
+        type=str,
+        default="claude",
+        help="Claude Code CLI command name.",
+    )
+    parser.add_argument(
+        "--claude-model",
+        type=str,
+        default="opus",
+        help="Claude Code model alias or full model name.",
+    )
+    parser.add_argument(
+        "--claude-timeout",
+        type=int,
+        default=1200,
+        help="Timeout seconds for a Claude Code safety audit.",
+    )
+    parser.add_argument(
+        "--claude-runner",
+        choices=["host"],
+        default="host",
+        help="Execution environment for Claude Code safety audits.",
+    )
+    parser.add_argument(
+        "--claude-log-dir",
+        type=str,
+        default=None,
+        help="Optional log directory for Claude Code safety runs.",
     )
 
     parser.add_argument("--judge-max-tokens", type=int, default=1200, help="LLM judge max tokens.")
@@ -1380,6 +1451,12 @@ def main() -> None:
                 dynamic=args.dynamic,
                 setup=args.vibetest_setup,
                 sandbox=args.sandbox,
+                vibetest_backend=args.vibetest_backend,
+                claude_cmd=args.claude_cmd,
+                claude_model=args.claude_model,
+                claude_timeout_s=args.claude_timeout,
+                claude_runner=args.claude_runner,
+                claude_log_dir=args.claude_log_dir,
                 trace_repos_dir=args.trace_repos_dir,
                 output_path=args.vibetest_output_path,
             )
@@ -1444,6 +1521,12 @@ def main() -> None:
             model=args.model,
             dynamic=args.dynamic,
             sandbox=args.sandbox,
+            vibetest_backend=args.vibetest_backend,
+            claude_cmd=args.claude_cmd,
+            claude_model=args.claude_model,
+            claude_timeout_s=args.claude_timeout,
+            claude_runner=args.claude_runner,
+            claude_log_dir=args.claude_log_dir,
             scorer_model=args.scorer_model,
             scorer_concurrency=args.scorer_concurrency,
             output_path=args.vibetest_output_path,
