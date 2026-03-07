@@ -30,6 +30,7 @@ _DOCENT_MCP_TOOLS = (
     "mcp__plugin_docent_docent__get_metadata_fields",
     "mcp__plugin_docent_docent__list_result_sets",
 )
+_DOCENT_SKILL_TOOLS = ("Skill",)
 
 
 def _parse_submission_output(output: str) -> tuple[str, str, str]:
@@ -112,6 +113,7 @@ def _allowed_tools(*, static: bool, docent_enabled: bool) -> str:
     if not static:
         tool_parts.append(_READ_ONLY_BASH)
     if docent_enabled:
+        tool_parts.extend(_DOCENT_SKILL_TOOLS)
         tool_parts.extend(_DOCENT_MCP_TOOLS)
     return ",".join(part for part in tool_parts if part)
 
@@ -289,6 +291,8 @@ class ClaudeCodeSafetyAgent:
             "-p",
             "--output-format",
             "json",
+            "--input-format",
+            "text",
             "--model",
             self.claude_model,
             "--permission-mode",
@@ -300,7 +304,6 @@ class ClaudeCodeSafetyAgent:
         ]
         for plugin_dir in self.plugin_dirs:
             args.extend(["--plugin-dir", plugin_dir])
-        args.append(user_prompt)
 
         env = os.environ.copy()
         env.pop("CLAUDE_CODE_SSE_PORT", None)
@@ -313,6 +316,7 @@ class ClaudeCodeSafetyAgent:
             cwd=repo_root.parent,
             capture_output=True,
             text=True,
+            input=user_prompt,
             timeout=self.timeout_s,
             env=env,
         )
