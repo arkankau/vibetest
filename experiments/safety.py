@@ -878,6 +878,8 @@ def run_vibetest(
     claude_model: str,
     claude_timeout_s: int,
     claude_runner: str,
+    claude_plugin_dirs: list[str],
+    claude_docent_collection_id: str | None,
     claude_log_dir: str | None,
     trace_repos_dir: Path,
     output_path: Path | None,
@@ -910,6 +912,8 @@ def run_vibetest(
             timeout_s=claude_timeout_s,
             static=not dynamic,
             runner=claude_runner,
+            plugin_dirs=claude_plugin_dirs,
+            docent_collection_id=claude_docent_collection_id,
             log_dir=claude_log_dir or "./logs",
         )
         results = agent.execute_tests(test_cases)
@@ -1125,6 +1129,8 @@ def run_impossiblebench_vibetest(
     claude_model: str,
     claude_timeout_s: int,
     claude_runner: str,
+    claude_plugin_dirs: list[str],
+    claude_docent_collection_id: str | None,
     claude_log_dir: str | None,
     scorer_model: str,
     scorer_concurrency: int,
@@ -1155,6 +1161,8 @@ def run_impossiblebench_vibetest(
             timeout_s=claude_timeout_s,
             static=not dynamic,
             runner=claude_runner,
+            plugin_dirs=claude_plugin_dirs,
+            docent_collection_id=claude_docent_collection_id,
             log_dir=claude_log_dir or "./logs",
         )
         results = agent.execute_tests(test_cases)
@@ -1316,6 +1324,21 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional log directory for Claude Code safety runs.",
     )
+    parser.add_argument(
+        "--claude-plugin-dir",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable Claude Code plugin directory to load for a session. "
+            "Required for Docent-backed Claude runs."
+        ),
+    )
+    parser.add_argument(
+        "--claude-docent-collection-id",
+        type=str,
+        default=None,
+        help="Optional Docent collection UUID to expose to the Claude Code analysis skill.",
+    )
 
     parser.add_argument("--judge-max-tokens", type=int, default=1200, help="LLM judge max tokens.")
     parser.add_argument("--judge-temperature", type=float, default=0.0, help="LLM judge temperature.")
@@ -1456,6 +1479,8 @@ def main() -> None:
                 claude_model=args.claude_model,
                 claude_timeout_s=args.claude_timeout,
                 claude_runner=args.claude_runner,
+                claude_plugin_dirs=args.claude_plugin_dir,
+                claude_docent_collection_id=args.claude_docent_collection_id,
                 claude_log_dir=args.claude_log_dir,
                 trace_repos_dir=args.trace_repos_dir,
                 output_path=args.vibetest_output_path,
@@ -1526,6 +1551,8 @@ def main() -> None:
             claude_model=args.claude_model,
             claude_timeout_s=args.claude_timeout,
             claude_runner=args.claude_runner,
+            claude_plugin_dirs=args.claude_plugin_dir,
+            claude_docent_collection_id=args.claude_docent_collection_id,
             claude_log_dir=args.claude_log_dir,
             scorer_model=args.scorer_model,
             scorer_concurrency=args.scorer_concurrency,
