@@ -907,6 +907,7 @@ def run_vibetest(
         ]
     if vibetest_backend == "claude-code":
         agent = ClaudeCodeSafetyAgent(
+            model=model,
             claude_cmd=claude_cmd,
             claude_model=claude_model,
             timeout_s=claude_timeout_s,
@@ -916,7 +917,7 @@ def run_vibetest(
             docent_collection_id=claude_docent_collection_id,
             log_dir=claude_log_dir or "./logs",
         )
-        results = agent.execute_tests(test_cases)
+        results = agent.execute_tests(test_cases, sandbox=sandbox)
     else:
         agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
         results = agent.execute_tests(test_cases, sandbox=sandbox)
@@ -1156,6 +1157,7 @@ def run_impossiblebench_vibetest(
 
     if vibetest_backend == "claude-code":
         agent = ClaudeCodeSafetyAgent(
+            model=model,
             claude_cmd=claude_cmd,
             claude_model=claude_model,
             timeout_s=claude_timeout_s,
@@ -1165,7 +1167,7 @@ def run_impossiblebench_vibetest(
             docent_collection_id=claude_docent_collection_id,
             log_dir=claude_log_dir or "./logs",
         )
-        results = agent.execute_tests(test_cases)
+        results = agent.execute_tests(test_cases, sandbox=sandbox)
     else:
         agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
         results = agent.execute_tests(test_cases, sandbox=sandbox)
@@ -1279,7 +1281,7 @@ def _parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="openai/gpt-5-mini",
-        help="Inspect model for vibetest/judge baselines.",
+        help="Primary Inspect model for vibetest/judge baselines, including the Claude backend.",
     )
     parser.add_argument(
         "--vibetest-backend",
@@ -1304,7 +1306,7 @@ def _parse_args() -> argparse.Namespace:
         "--claude-model",
         type=str,
         default="opus",
-        help="Claude Code model alias or full model name.",
+        help="Legacy fallback Claude model if --model is unset.",
     )
     parser.add_argument(
         "--claude-timeout",
@@ -1329,15 +1331,14 @@ def _parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help=(
-            "Repeatable Claude Code plugin directory to load for a session. "
-            "Required for Docent-backed Claude runs."
+            "Deprecated. The inspect_swe Claude integration used by this branch does not support Claude plugin dirs."
         ),
     )
     parser.add_argument(
         "--claude-docent-collection-id",
         type=str,
         default=None,
-        help="Optional Docent collection UUID to expose to the Claude Code analysis skill.",
+        help="Deprecated. Docent integration is not supported by the inspect_swe Claude wrapper.",
     )
 
     parser.add_argument("--judge-max-tokens", type=int, default=1200, help="LLM judge max tokens.")
