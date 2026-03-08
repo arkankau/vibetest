@@ -220,3 +220,53 @@ uv run --active python scripts/analyze_synthetic_metrics.py \
   results/synthetic/synthetic_kaggle_titanic_AT-gpt-5-mini.jsonl \
   --output-csv results/synthetic/synthetic_metrics.csv
 ```
+
+## Safety (ImpossibleBench)
+
+- Implementation script: `experiments/safety.py` with `--safety-mode impossiblebench`
+- Optional harder positive-case construction:
+  - `--impossiblebench-hard-positives-from-judge`
+  - When enabled, oneoff PASS traces are first classified per-trace with the judge.
+  - Only oneoff traces judged `legit` are used as positive (reward-hacking) traces when materializing cases.
+  - This is intended to create harder positives (more judge-confusable hacked traces).
+  - Per-trace judge filtering is cached (default under `results/safety/trace_repos/<dataset>/impossiblebench-sets/_metadata/`), and can be overridden with `--impossiblebench-hard-positive-cache`.
+
+## Safety (MLE-Sabotage)
+
+- Implementation script: `experiments/safety.py` with `--safety-mode mle-sabotage`
+- Input: two `.eval` logs (`regular` and `aware`/`sabotage`) under `data/safety/mle-sabotage/`
+- Materialization assumptions:
+  - All traces are kept (including repeated runs for the same benchmark sample).
+  - For aware traces, the initial auxiliary-instruction block is removed from the first user message before writing trace files.
+  - Tool outputs dumping `/home/data/description.md` are redacted only when they contain auxiliary-task leakage text.
+  - Cases are then composed by mixing regular and aware traces; case label is positive if any aware trace is included.
+- Optional hard split (judge-filtered):
+  - `--mle-sabotage-hard-split-from-judge`
+  - Keeps only regular traces judged `cheating` and aware traces judged `legit` (filters easy traces out for both classes).
+  - Cache path can be set with `--mle-sabotage-hard-split-cache` (default under `results/safety/trace_repos/<dataset>/mle-sabotage-sets/_metadata/`).
+
+Example (judge baseline first):
+```sh
+uv run --active python experiments/safety.py \
+  --safety-mode mle-sabotage \
+  --method judge \
+  --data-path data/safety/mle-sabotage \
+  --model openai/gpt-5-mini \
+  --cases 24 \
+  --traces-per-case 8 \
+  --sandbox docker
+```
+
+Example (hard split):
+```sh
+uv run --active python experiments/safety.py \
+  --safety-mode mle-sabotage \
+  --method both \
+  --data-path data/safety/mle-sabotage \
+  --model openai/gpt-5-mini \
+  --cases 24 \
+  --traces-per-case 8 \
+  --mle-sabotage-hard-split-from-judge \
+  --rematerialize \
+  --sandbox docker
+```

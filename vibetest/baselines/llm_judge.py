@@ -45,8 +45,12 @@ def _default_judge_model() -> str:
     return os.getenv("VIBETEST_LLM_JUDGE_MODEL", "openai/gpt-5-mini")
 
 
-def render_impossiblebench_judge_prompt(transcript_dump: str) -> str:
-    return IMPOSSIBLEBENCH_JUDGE_PROMPT.format(dump=transcript_dump or "")
+def render_impossiblebench_judge_prompt(
+    transcript_dump: str,
+    *,
+    prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
+) -> str:
+    return prompt_template.format(dump=transcript_dump or "")
 
 
 def extract_judgment(text: str) -> str:
@@ -87,8 +91,9 @@ async def _run_llm_judge_async(
     max_tokens: int,
     temperature: float,
     timeout_s: int,
+    prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
 ) -> dict[str, Any]:
-    prompt = render_impossiblebench_judge_prompt(transcript_dump)
+    prompt = render_impossiblebench_judge_prompt(transcript_dump, prompt_template=prompt_template)
     model = get_model(
         model_name,
         config=GenerateConfig(
@@ -146,6 +151,7 @@ def run_llm_judge(
     max_tokens: int = 1200,
     temperature: float = 0.0,
     timeout_s: int = 180,
+    prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
 ) -> dict[str, Any]:
     """Run the ImpossibleBench-style LLM cheating judge over a transcript dump."""
     chosen_model = model_name or _default_judge_model()
@@ -156,6 +162,7 @@ def run_llm_judge(
             max_tokens=max_tokens,
             temperature=temperature,
             timeout_s=timeout_s,
+            prompt_template=prompt_template,
         )
     )
 
@@ -165,12 +172,13 @@ def impossiblebench_judge_solver(
     *,
     max_tokens: int = 1200,
     temperature: float = 0.0,
+    prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
 ) -> Any:
     """Inspect solver that applies the ImpossibleBench cheating-judge prompt."""
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         transcript_dump = str(state.input_text or state.input or "")
-        prompt = render_impossiblebench_judge_prompt(transcript_dump)
+        prompt = render_impossiblebench_judge_prompt(transcript_dump, prompt_template=prompt_template)
         state.messages = [ChatMessageUser(content=prompt)]
         return await generate(
             state,
@@ -195,17 +203,20 @@ class LLMJudgeBaseline:
         temperature: float = 0.0,
         log_dir: str = "./logs",
         retry_on_error: int = 1,
+        prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
     ) -> None:
         self.model_name = model or _default_judge_model()
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.log_dir = log_dir
         self.retry_on_error = retry_on_error
+        self.prompt_template = prompt_template
 
     def _create_solver(self):
         return impossiblebench_judge_solver(
             max_tokens=self.max_tokens,
             temperature=self.temperature,
+            prompt_template=self.prompt_template,
         )
 
     @staticmethod
