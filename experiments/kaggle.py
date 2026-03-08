@@ -5,7 +5,7 @@ from pathlib import Path
 import jsonlines
 
 from vibetest import TestCase, VibeTestAgent
-from vibetest.agent import BaselineAgent, CodexReviewAgent
+from vibetest.agent import BaselineAgent, CodexReviewAgent, CodexVibeTestAgent
 from vibetest.baselines import (
     load_kaggle_properties,
     map_review_to_kaggle_tests,
@@ -547,14 +547,93 @@ def run_vibetest(subset: str, model: str, static: bool):
     print(f"{'=' * 80}")
 
 
+def run_codex_vibetest(subset: str, model: str):
+    """Run the Codex-backed VibeTest agent across all repositories."""
+    print("=" * 80)
+    print("Starting Kaggle Repository Tests - Codex VibeTest Method")
+    print("=" * 80)
+
+    test_strs = get_tests()
+    all_test_cases = []
+    repo_paths = []
+    tests_per_repo = len(test_strs)
+
+    total_repos = 0
+    for repo_path in Path(f"./data/kaggle/kaggle-{subset}").iterdir():
+        if total_repos >= 50:
+            break
+
+        if repo_path.is_dir():
+            print(f"Queueing repository: {repo_path.name}")
+            repo_paths.append(repo_path)
+
+            for i, desc in enumerate(test_strs):
+                if "titanic" in subset:
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic-kaggle-data": "/kaggle/input"}))
+                elif "nlp" in subset:
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./nlp-kaggle-data": "/kaggle/input"}))
+                else:
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle"))
+
+            total_repos += 1
+
+    print(f"\nTotal repositories: {len(repo_paths)}")
+    print(f"Total test cases: {len(all_test_cases)} ({tests_per_repo} tests × {len(repo_paths)} repos)")
+    print(f"\n{'=' * 80}")
+    print("Executing all tests in parallel...")
+    print(f"{'=' * 80}\n")
+
+    agent = CodexVibeTestAgent(model=model)
+    all_results = agent.execute_tests(all_test_cases, sandbox="docker")
+
+    dataset_name = f"kaggle_{subset}"
+    output_path = standardized_results_path(
+        dataset_name,
+        "AT-codex",
+        model_name=agent.model_name,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with jsonlines.open(str(output_path), mode="w") as writer:
+        for repo_idx, repo_path in enumerate(repo_paths):
+            start_idx = repo_idx * tests_per_repo
+            end_idx = start_idx + tests_per_repo
+            repo_results = all_results[start_idx:end_idx]
+            repo_total = len(repo_results)
+            repo_passed = sum(1 for r in repo_results if r.passed)
+            repo_failed = sum(1 for r in repo_results if (r.metadata or {}).get("verdict") == "FAIL")
+
+            writer.write({
+                "repo": str(repo_path),
+                "repo_name": repo_path.name,
+                "total_tests": repo_total,
+                "passed_tests": repo_passed,
+                "failed_tests": repo_failed,
+                "tests": [
+                    {
+                        "description": r.message,
+                        "passed": r.passed,
+                        "evidence": [e.model_dump() for e in r.evidence],
+                        "execution_log": r.execution_log,
+                        "metadata": r.metadata,
+                    }
+                    for r in repo_results
+                ],
+                "usage": aggregate_usage_from_results(repo_results),
+            })
+
+    print(f"\nResults saved to: {output_path}")
+    print(f"{'=' * 80}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run vibetest on Kaggle repositories")
     parser.add_argument(
         "--method",
         type=str,
-        choices=["vibetest", "baseline", "traincheck", "codex"],
+        choices=["vibetest", "baseline", "traincheck", "codex", "codex-vibetest"],
         default="vibetest",
-        help="Method to use: vibetest, baseline, traincheck, or codex"
+        help="Method to use: vibetest, baseline, traincheck, codex, or codex-vibetest"
     )
     parser.add_argument(
         "--model",
@@ -697,5 +776,7 @@ if __name__ == "__main__":
             repo_offset=args.repo_offset,
             output_path=args.output_path,
         )
+    elif args.method == "codex-vibetest":
+        run_codex_vibetest(args.subset, args.model)
     else:
         run_vibetest(args.subset, args.model, args.static)

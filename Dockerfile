@@ -31,7 +31,7 @@ RUN npm i -g @openai/codex
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Set working directory
-WORKDIR /workdir
+WORKDIR /workspace
 
 # # Copy project files
 # COPY pyproject.toml uv.lock ./
@@ -51,7 +51,7 @@ WORKDIR /workdir
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV VIBETEST_EVIDENCE_DIR=/workdir/evidence
+ENV VIBETEST_EVIDENCE_DIR=/workspace/evidence
 
 # Default command
 CMD ["uv", "run", "python", "-m", "vibetest.cli"]

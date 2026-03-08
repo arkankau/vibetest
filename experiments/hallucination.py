@@ -8,7 +8,7 @@ from pathlib import Path
 import jsonlines
 
 from vibetest import TestCase, VibeTestAgent
-from vibetest.agent import CodexReviewAgent
+from vibetest.agent import CodexReviewAgent, CodexVibeTestAgent
 from vibetest.baselines import (
     load_hallucination_properties,
     map_review_to_hallucination_tests,
@@ -232,6 +232,94 @@ def run_vibetest(
     print(f"\nResults saved to: {output_path}")
 
 
+def run_codex_vibetest(
+    *,
+    model: str | None,
+    paper_limit: int,
+    paper_offset: int,
+    paper_list: str | None,
+    output_path: str | None,
+) -> None:
+    print("=" * 80)
+    print("Starting Hallucination Tests - Codex VibeTest")
+    print("=" * 80)
+
+    properties = load_hallucination_properties()
+    paper_paths = _iter_paper_paths(
+        paper_limit,
+        paper_offset,
+        Path(paper_list) if paper_list else None,
+    )
+    tests_per_paper = len(properties)
+    all_test_cases: list[TestCase] = []
+
+    for paper_path in paper_paths:
+        safe_name = _safe_id(paper_path.name)
+        print(f"Queueing paper: {paper_path.name}")
+        for idx, prop in enumerate(properties):
+            all_test_cases.append(
+                TestCase(
+                    name=f"{safe_name}_prop{idx}",
+                    description=prop,
+                    repo_path=paper_path,
+                    sandbox_path="/workdir",
+                )
+            )
+
+    agent = CodexVibeTestAgent(model=model)
+    all_results = agent.execute_tests(all_test_cases, sandbox="docker")
+
+    out_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path(
+            "hallucination",
+            "AT-codex",
+            model_name=agent.model_name,
+        )
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with jsonlines.open(str(out_path), mode="w") as writer:
+        for paper_idx, paper_path in enumerate(paper_paths):
+            start_idx = paper_idx * tests_per_paper
+            end_idx = start_idx + tests_per_paper
+            paper_results = all_results[start_idx:end_idx]
+            tests = []
+            passed = 0
+            failed = 0
+            for idx, r in enumerate(paper_results):
+                meta = dict(r.metadata or {})
+                meta["property_index"] = idx
+                meta["property_text"] = properties[idx]
+                if r.passed:
+                    passed += 1
+                elif meta.get("verdict") == "FAIL":
+                    failed += 1
+                tests.append(
+                    {
+                        "description": r.message,
+                        "passed": r.passed,
+                        "evidence": [e.model_dump() for e in r.evidence],
+                        "execution_log": r.execution_log,
+                        "metadata": meta,
+                    }
+                )
+            writer.write(
+                {
+                    "repo": str(paper_path),
+                    "repo_name": paper_path.name,
+                    "total_tests": len(tests),
+                    "passed_tests": passed,
+                    "failed_tests": failed,
+                    "tests": tests,
+                    "usage": aggregate_usage_from_results(paper_results),
+                }
+            )
+
+    print(f"\nResults saved to: {out_path}")
+
+
 def run_codex_baseline(
     *,
     model: str | None,
@@ -452,7 +540,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--method",
-        choices=["vibetest", "codex", "refchecker"],
+        choices=["vibetest", "codex", "codex-vibetest", "refchecker"],
         required=True,
         help="Which method to run.",
     )
@@ -508,6 +596,14 @@ def main() -> None:
             codex_prompt=args.codex_prompt,
             codex_timeout_s=args.codex_timeout,
             mapper_model=args.review_mapper_model,
+            paper_limit=args.paper_limit,
+            paper_offset=args.paper_offset,
+            paper_list=args.paper_list,
+            output_path=args.output_path,
+        )
+    elif args.method == "codex-vibetest":
+        run_codex_vibetest(
+            model=args.model,
             paper_limit=args.paper_limit,
             paper_offset=args.paper_offset,
             paper_list=args.paper_list,
