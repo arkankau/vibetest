@@ -20,7 +20,7 @@ from vibetest.baselines import (
 )
 
 from vibetest import TestCase, VibeTestAgent
-from vibetest.agent import BaselineAgent, CodexReviewAgent
+from vibetest.agent import BaselineAgent, CodexReviewAgent, CodexVibeTestAgent
 try:
     from experiments.usage_utils import (
         aggregate_usage_from_results,
@@ -268,6 +268,105 @@ def run_vibetest(dataset: str, dynamic: bool = False):
     
     print(f"\n{'=' * 80}")
     print("SUMMARY")
+    print(f"{'=' * 80}")
+
+
+def run_codex_vibetest(dataset: str, model: str | None = None):
+    """Run the Codex-backed VibeTest agent across vulnerability repositories."""
+    print("=" * 80)
+    print("Starting Vulnerability Tests - Codex VibeTest Method")
+    print("=" * 80)
+
+    with open(f"./data/vuln/{dataset}/properties.md", mode="r") as f:
+        content = f.read()
+        if "## " in content:
+            properties = re.split(r"## .*\n", content)[1:]
+        else:
+            properties = content.split("- ")[1:]
+    properties = [p.strip() for p in properties if p.strip()]
+
+    instructions = None
+    instructions_path = f"./data/vuln/{dataset}/instructions.md"
+    if Path(instructions_path).is_file():
+        with open(instructions_path, mode="r") as f:
+            instructions = f.read()
+
+    vuln_metadata = {}
+    with open(f"./data/vuln/{dataset}/vulnerability_info.csv", mode="r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            repo_name = row["project_slug"] if dataset == "bibifi" else row["vuln_id"] + "_" + row["project_slug"]
+            vuln_metadata[repo_name] = True
+
+    all_test_cases = []
+    repo_paths = []
+    tests_per_repo = len(properties)
+
+    random.seed(42)
+    selected_repos = random.sample(list(vuln_metadata.keys()), min(50, len(vuln_metadata)))
+    for repo in selected_repos:
+        repo_path = Path(f"./data/vuln/{dataset}/repos/{repo}")
+        if not repo_path.is_dir():
+            continue
+        print(f"Queueing repository: {repo_path.name}")
+        if dataset == "bibifi":
+            repo_id = repo_path.name
+            repo_path = repo_path / "build"
+        else:
+            repo_id = "_".join(str(repo_path.name).split("_")[1:])
+        repo_paths.append(repo_path)
+
+        for pid, prop in enumerate(properties):
+            if dataset == "bibifi":
+                cwe_str = str(pid)
+            else:
+                match = re.search(r"CWE-(\d+)", prop)
+                if not match:
+                    continue
+                cwe_str = match.group(1)
+            all_test_cases.append(TestCase(
+                name=f"repo{repo_id}_vuln{cwe_str}" if dataset == "bibifi" else f"repo{repo_id}_cwe{cwe_str}",
+                description=prop,
+                extra_instructions=instructions,
+                repo_path=repo_path,
+                sandbox_path="/workdir",
+            ))
+
+    agent = CodexVibeTestAgent(model=model)
+    all_results = agent.execute_tests(all_test_cases, sandbox="docker")
+
+    output_path = standardized_results_path(
+        dataset,
+        "AT-codex",
+        model_name=agent.model_name,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with jsonlines.open(str(output_path), mode="w") as writer:
+        for repo_idx, repo_path in enumerate(repo_paths):
+            start_idx = repo_idx * tests_per_repo
+            end_idx = start_idx + tests_per_repo
+            repo_results = all_results[start_idx:end_idx]
+            writer.write({
+                "repo": str(repo_path),
+                "repo_name": repo_path.name,
+                "total_tests": len(repo_results),
+                "passed_tests": sum(1 for r in repo_results if r.passed),
+                "failed_tests": sum(1 for r in repo_results if (r.metadata or {}).get("verdict") == "FAIL"),
+                "tests": [
+                    {
+                        "description": r.message,
+                        "passed": r.passed,
+                        "evidence": [e.model_dump() for e in r.evidence],
+                        "execution_log": r.execution_log,
+                        "metadata": r.metadata,
+                    }
+                    for r in repo_results
+                ],
+                "usage": aggregate_usage_from_results(repo_results),
+            })
+
+    print(f"\nResults saved to: {output_path}")
     print(f"{'=' * 80}")
     print(f"\nResults saved to: {output_path}")
 
@@ -1048,9 +1147,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--method",
         type=str,
-        choices=["vibetest", "baseline", "codeql", "codex"],
+        choices=["vibetest", "baseline", "codeql", "codex", "codex-vibetest"],
         default="vibetest",
-        help="Method to use: vibetest, baseline, codeql, or codex"
+        help="Method to use: vibetest, baseline, codeql, codex, or codex-vibetest"
     )
     parser.add_argument(
         "--dataset",
@@ -1160,5 +1259,7 @@ if __name__ == "__main__":
             output_path=args.output_path,
             codex_log_dir=args.codex_log_dir,
         )
+    elif args.method == "codex-vibetest":
+        run_codex_vibetest(args.dataset, model=args.model)
     else:
         run_vibetest(args.dataset, dynamic=args.dynamic)

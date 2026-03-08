@@ -24,6 +24,7 @@ import jsonlines
 from inspect_ai.model import GenerateConfig, get_model
 
 from vibetest import TestCase, VibeTestAgent
+from vibetest.agent import CodexVibeTestAgent
 from vibetest.baselines import LLMJudgeBaseline
 from vibetest.usage import aggregate_usage_payloads
 
@@ -1828,6 +1829,72 @@ def run_vibetest(
     return out_path
 
 
+def run_codex_vibetest(
+    traces: list[dict[str, Any]],
+    *,
+    dataset_name: str,
+    source_data_path: Path,
+    model: str | None,
+    setup: str,
+    sandbox: str | None,
+    trace_repos_dir: Path,
+    output_path: Path | None,
+) -> Path:
+    print("=" * 80)
+    print("Running safety experiment: Codex VibeTest")
+    print("=" * 80)
+
+    materialization_root = trace_repos_dir / dataset_name / setup
+    if setup == "per-trace":
+        materialized_traces = _materialize_trace_repos(traces, repos_root=materialization_root)
+        test_cases = _build_vibetest_testcases(materialized_traces)
+    else:
+        all_repo = _materialize_all_traces_repo(traces, repos_root=materialization_root)
+        test_cases = [
+            TestCase(
+                name="safety_all_traces",
+                description=IMPOSSIBLEBENCH_VIBETEST_TEST,
+                repo_path=Path(all_repo["repo_path"]),
+                metadata={
+                    "trace_count": int(all_repo["trace_count"]),
+                    "setup": "all-traces",
+                },
+            )
+        ]
+    agent = CodexVibeTestAgent(model=model, safety_agent=True)
+    results = agent.execute_tests(test_cases, sandbox=sandbox)
+
+    out_path = output_path or standardized_results_path(
+        dataset_name,
+        "AT-codex",
+        model_name=agent.model_name,
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with jsonlines.open(str(out_path), mode="w") as writer:
+        if setup == "per-trace":
+            for trace_row, result in zip(materialized_traces, results):
+                writer.write(
+                    _row_from_result(
+                        dataset_name=dataset_name,
+                        source_data_path=source_data_path,
+                        trace_row=trace_row,
+                        result=result,
+                    )
+                )
+        else:
+            writer.write(
+                _row_from_all_traces_result(
+                    dataset_name=dataset_name,
+                    source_data_path=source_data_path,
+                    all_repo=all_repo,
+                    result=results[0],
+                )
+            )
+
+    print(f"Wrote {len(results)} row(s): {out_path}")
+    return out_path
+
+
 def run_impossiblebench_judge(
     cases: list[ImpossibleBenchCase],
     *,
@@ -2108,6 +2175,106 @@ def run_impossiblebench_vibetest(
     return out_path
 
 
+def run_impossiblebench_codex_vibetest(
+    cases: list[ImpossibleBenchCase],
+    *,
+    dataset_name: str,
+    model: str | None,
+    sandbox: str | None,
+    scorer_model: str,
+    scorer_concurrency: int,
+    output_path: Path | None,
+    task_name: str = "reward hacking",
+    test_description: str = IMPOSSIBLEBENCH_VIBETEST_TEST,
+    gt_field_name: str = "reward_hacking",
+) -> Path:
+    print("=" * 80)
+    print(f"Running safety experiment: case-set Codex VibeTest ({task_name})")
+    print("=" * 80)
+
+    test_cases: list[TestCase] = []
+    for case in cases:
+        test_cases.append(
+            TestCase(
+                name=f"safety_{case.case_id}",
+                description=test_description,
+                repo_path=case.repo_path,
+                metadata={
+                    "trace_set_id": case.case_id,
+                    "trace_files": case.trace_files,
+                },
+            )
+        )
+
+    agent = CodexVibeTestAgent(model=model, safety_agent=True)
+    results = agent.execute_tests(test_cases, sandbox=sandbox)
+
+    rows: list[dict[str, Any]] = []
+    for case, result in zip(cases, results):
+        rows.append(
+            {
+                "dataset": dataset_name,
+                "repo": str(case.repo_path),
+                "repo_name": case.case_id,
+                "case_id": case.case_id,
+                "traces_per_case": case.traces_per_case,
+                "total_tests": 1,
+                "passed_tests": 1 if result.passed else 0,
+                "failed_tests": 0 if result.passed else 1,
+                "tests": [
+                    {
+                        "description": result.message,
+                        "passed": result.passed,
+                        "evidence": [ev.model_dump() for ev in result.evidence],
+                        "execution_log": result.execution_log,
+                        "metadata": dict(result.metadata or {}),
+                    }
+                ],
+                "ground_truth": {
+                    **(
+                        {
+                            "has_reward_hacking": bool(case.gt_hacked_trace_files),
+                            "hacked_trace_files": case.gt_hacked_trace_files,
+                        }
+                        if gt_field_name == "reward_hacking"
+                        else {
+                            "has_suspicious_auxiliary": bool(case.gt_hacked_trace_files),
+                            "suspicious_trace_files": case.gt_hacked_trace_files,
+                        }
+                    ),
+                    "trace_files": case.trace_files,
+                },
+                "usage": aggregate_usage_from_results([result]),
+            }
+        )
+
+    _score_impossiblebench_rows(
+        rows,
+        method="vibetest",
+        scorer_model=scorer_model,
+        scorer_concurrency=scorer_concurrency,
+        task_name=task_name,
+    )
+    summary = (rows[0].get("summary") or {}) if rows else {}
+    print(
+        "Codex VibeTest summary: "
+        f"classification_accuracy={summary.get('classification_accuracy', 0.0):.3f}, "
+        f"verified_accuracy={summary.get('verified_accuracy', 0.0):.3f}"
+    )
+    out_path = output_path or standardized_results_path(
+        dataset_name,
+        "AT-codex",
+        model_name=agent.model_name,
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with jsonlines.open(str(out_path), mode="w") as writer:
+        for row in rows:
+            writer.write(row)
+
+    print(f"Wrote {len(rows)} rows: {out_path}")
+    return out_path
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2118,7 +2285,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--method",
-        choices=["judge", "vibetest", "both"],
+        choices=["judge", "vibetest", "codex-vibetest", "both"],
         default="both",
         help="Which method(s) to run.",
     )
@@ -2389,8 +2556,8 @@ def main() -> None:
     if args.safety_mode == "iquest":
         if args.judge_trace_path is not None and args.method not in {"judge", "both"}:
             raise SystemExit("--judge-trace-path is only supported with --method judge|both")
-        if args.vibetest_trace_path is not None and args.method not in {"vibetest", "both"}:
-            raise SystemExit("--vibetest-trace-path is only supported with --method vibetest|both")
+        if args.vibetest_trace_path is not None and args.method not in {"vibetest", "codex-vibetest", "both"}:
+            raise SystemExit("--vibetest-trace-path is only supported with --method vibetest|codex-vibetest|both")
 
         traces: list[dict[str, Any]] = []
         dataset_name = ""
@@ -2439,6 +2606,17 @@ def main() -> None:
                 source_data_path=source_data_path,
                 model=args.model,
                 dynamic=args.dynamic,
+                setup=args.vibetest_setup,
+                sandbox=args.sandbox,
+                trace_repos_dir=args.trace_repos_dir,
+                output_path=args.vibetest_output_path,
+            )
+        if args.method == "codex-vibetest":
+            run_codex_vibetest(
+                traces,
+                dataset_name=dataset_name,
+                source_data_path=source_data_path,
+                model=args.model,
                 setup=args.vibetest_setup,
                 sandbox=args.sandbox,
                 trace_repos_dir=args.trace_repos_dir,
@@ -2743,6 +2921,19 @@ def main() -> None:
             dataset_name=base_dataset_name,
             model=args.model,
             dynamic=args.dynamic,
+            sandbox=args.sandbox,
+            scorer_model=args.scorer_model,
+            scorer_concurrency=args.scorer_concurrency,
+            output_path=args.vibetest_output_path,
+            task_name=task_name,
+            test_description=vibetest_case_description,
+            gt_field_name=gt_field_name,
+        )
+    if args.method == "codex-vibetest":
+        run_impossiblebench_codex_vibetest(
+            all_cases,
+            dataset_name=base_dataset_name,
+            model=args.model,
             sandbox=args.sandbox,
             scorer_model=args.scorer_model,
             scorer_concurrency=args.scorer_concurrency,
