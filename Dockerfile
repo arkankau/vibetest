@@ -22,10 +22,8 @@ RUN pip install --no-cache-dir \
     scikit-learn \
     scipy \
     plotly \
-    ipywidgets
-
-# Install Codex CLI
-RUN npm i -g @openai/codex
+    ipywidgets \
+    openai
 
 # install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
