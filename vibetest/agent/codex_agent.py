@@ -9,7 +9,12 @@ from inspect_ai.dataset import Sample
 from inspect_ai.scorer import includes
 from inspect_swe import codex_cli
 
-from vibetest.agent.react_agent import _parse_submission_output, get_files
+from vibetest.agent.react_agent import (
+    _parse_submission_output,
+    cleanup_docker_sandbox,
+    get_files,
+    setup_docker_sandbox,
+)
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.usage import usage_payload_from_sample
 
@@ -254,6 +259,13 @@ class _CodexAgentBase:
         *,
         sandbox: str | None = None,
     ) -> list[TestResult]:
+        sandbox_config = None
+        temp_dir_to_cleanup = None
+        if sandbox == "docker":
+            sandbox_config, temp_dir_to_cleanup = setup_docker_sandbox()
+        elif sandbox is not None:
+            sandbox_config = sandbox
+
         id_to_test_case: dict[str, TestCase] = {}
         samples: list[Sample] = []
         for idx, test_case in enumerate(test_cases):
@@ -276,17 +288,20 @@ class _CodexAgentBase:
             dataset=samples,
             solver=self._create_solver(),
             scorer=includes(),
-            sandbox=sandbox,
+            sandbox=sandbox_config,
         )
-
-        results = eval(
-            tasks=task,
-            model=self.model_name,
-            log_dir=self.log_dir,
-            retry_on_error=1,
-            fail_on_error=False,
-        )
-        return self._parse_results(results, id_to_test_case)
+        try:
+            results = eval(
+                tasks=task,
+                model=self.model_name,
+                log_dir=self.log_dir,
+                retry_on_error=1,
+                fail_on_error=False,
+            )
+            return self._parse_results(results, id_to_test_case)
+        finally:
+            if sandbox == "docker" and temp_dir_to_cleanup is not None:
+                cleanup_docker_sandbox(temp_dir_to_cleanup)
 
     def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
         sample_id_to_result: dict[str, TestResult] = {}
