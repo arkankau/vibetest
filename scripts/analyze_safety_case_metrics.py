@@ -15,6 +15,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -35,11 +36,13 @@ TEXT_COLOR = "#222222"
 METHOD_COLORS = {
     "AT": "#1F5AA6",
     "AT (Codex)": "#1B9E77",
+    "AT (No Tools)": "#6B4C9A",
     "Judge": "#C65D21",
 }
 METHOD_MARKERS = {
     "AT": "o",
     "AT (Codex)": "D",
+    "AT (No Tools)": "^",
     "Judge": "s",
 }
 
@@ -96,6 +99,31 @@ def _wilson_ci(successes: int, total: int, z: float = 1.96) -> tuple[float | Non
     low = max(0.0, center - radius)
     high = min(1.0, center + radius)
     return p, low, high
+
+
+def _bootstrap_mean_ci(
+    values: list[float],
+    *,
+    confidence: float = 0.95,
+    n_resamples: int = 2000,
+    seed: int = 0,
+) -> tuple[float | None, float | None, float | None]:
+    if not values:
+        return None, None, None
+    mean = sum(values) / len(values)
+    if len(values) == 1:
+        return mean, mean, mean
+    rng = random.Random(seed)
+    means: list[float] = []
+    n = len(values)
+    for _ in range(n_resamples):
+        sample = [values[rng.randrange(n)] for _ in range(n)]
+        means.append(sum(sample) / n)
+    means.sort()
+    alpha = (1.0 - confidence) / 2.0
+    low_idx = max(0, min(len(means) - 1, int(alpha * len(means))))
+    high_idx = max(0, min(len(means) - 1, int((1.0 - alpha) * len(means)) - 1))
+    return mean, means[low_idx], means[high_idx]
 
 
 def _fmt(x: float | None, digits: int = 4) -> str:
@@ -253,6 +281,7 @@ def _init_metric_row(label: str, file_path: Path, group_key: str) -> dict[str, A
         "total_tokens": 0,
         "total_cost_usd": 0.0,
         "has_cost": False,
+        "_case_costs": [],
     }
 
 
@@ -295,6 +324,7 @@ def _update_metric_row(metric: dict[str, Any], row: dict[str, Any], *, fallback_
     if entry_cost is not None:
         metric["total_cost_usd"] += entry_cost
         metric["has_cost"] = True
+        metric["_case_costs"].append(float(entry_cost))
 
 
 def _finalize_metric_row(metric: dict[str, Any]) -> dict[str, Any]:
@@ -321,9 +351,13 @@ def _finalize_metric_row(metric: dict[str, Any]) -> dict[str, Any]:
     out["recall"] = recall
     out["f1"] = f1
     out["avg_total_tokens_per_case"] = _safe_ratio(int(metric["total_tokens"]), total)
-    out["avg_cost_usd_per_case"] = (
-        (float(metric["total_cost_usd"]) / total) if total > 0 and metric.get("has_cost") else None
-    )
+    avg_cost = (float(metric["total_cost_usd"]) / total) if total > 0 and metric.get("has_cost") else None
+    out["avg_cost_usd_per_case"] = avg_cost
+    case_costs = [float(v) for v in metric.get("_case_costs") or []]
+    _, cost_low, cost_high = _bootstrap_mean_ci(case_costs)
+    out["avg_cost_usd_per_case_ci_low"] = cost_low
+    out["avg_cost_usd_per_case_ci_high"] = cost_high
+    out.pop("_case_costs", None)
     return out
 
 
@@ -464,12 +498,20 @@ def _infer_dataset_and_method_from_file(file_path: str) -> tuple[str, str]:
     return "unknown", name
 
 
-def _pretty_method(method: str) -> str:
+def _split_dataset_variant(dataset: str) -> tuple[str, str | None]:
+    if dataset.endswith("_no-tools"):
+        return dataset[: -len("_no-tools")], "no-tools"
+    return dataset, None
+
+
+def _pretty_method(method: str, *, dataset_variant: str | None = None) -> str:
     if method == "llmjudge":
         return "Judge"
     if method.startswith("AT-codex-"):
         return "AT (Codex)"
     if method.startswith("AT-"):
+        if dataset_variant == "no-tools":
+            return "AT (No Tools)"
         return "AT"
     return method
 
@@ -528,11 +570,13 @@ def _group_plot_rows_by_dataset(rows: list[dict[str, Any]]) -> dict[str, list[di
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         dataset, method = _infer_dataset_and_method_from_file(str(row.get("file") or ""))
+        dataset_base, dataset_variant = _split_dataset_variant(dataset)
         out = dict(row)
-        out["dataset"] = dataset
+        out["dataset"] = dataset_base
+        out["dataset_variant"] = dataset_variant
         out["method_key"] = method
-        out["method_label"] = _pretty_method(method)
-        grouped.setdefault(dataset, []).append(out)
+        out["method_label"] = _pretty_method(method, dataset_variant=dataset_variant)
+        grouped.setdefault(dataset_base, []).append(out)
     return grouped
 
 
@@ -718,6 +762,7 @@ def _generate_figures(
         y_verified: dict[str, list[float | None]] = {m: [] for m in methods}
         y_verified_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
         y_cost: dict[str, list[float | None]] = {m: [] for m in methods}
+        y_cost_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
         row_lookup = {
             (str(r.get("method_label") or ""), int(str(r.get("group") or "0"))): r for r in rows if str(r.get("group", "")).isdigit()
         }
@@ -728,6 +773,7 @@ def _generate_figures(
                     y_verified[m].append(None)
                     y_verified_ci[m].append(None)
                     y_cost[m].append(None)
+                    y_cost_ci[m].append(None)
                     continue
                 total_cases = _to_int(row.get("total_cases"))
                 verified_correct = _to_int(row.get("verified_correct"))
@@ -737,7 +783,14 @@ def _generate_figures(
                     y_verified_ci[m].append(None)
                 else:
                     y_verified_ci[m].append((p - low, high - p))
-                y_cost[m].append(_to_float(row.get("avg_cost_usd_per_case")))
+                cost = _to_float(row.get("avg_cost_usd_per_case"))
+                cost_low = _to_float(row.get("avg_cost_usd_per_case_ci_low"))
+                cost_high = _to_float(row.get("avg_cost_usd_per_case_ci_high"))
+                y_cost[m].append(cost)
+                if cost is None or cost_low is None or cost_high is None:
+                    y_cost_ci[m].append(None)
+                else:
+                    y_cost_ci[m].append((max(0.0, cost - cost_low), max(0.0, cost_high - cost)))
 
         dataset_slug = _slug(dataset)
         out_paths.extend(
@@ -760,7 +813,7 @@ def _generate_figures(
                 x_values=x_vals,
                 x_labels=x_labels,
                 y_by_method=y_cost,
-                yerr_by_method=None,
+                yerr_by_method=y_cost_ci,
                 ylabel="Avg Cost per Case (USD)",
                 xlabel="Traces per Case",
                 x_label_rotation=0,

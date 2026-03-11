@@ -1791,6 +1791,7 @@ def run_vibetest(
     sandbox: str | None,
     trace_repos_dir: Path,
     output_path: Path | None,
+    safety_analysis_tools: bool,
 ) -> Path:
     print("=" * 80)
     print("Running safety experiment: VibeTest")
@@ -1813,11 +1814,17 @@ def run_vibetest(
                 },
             )
         ]
-    agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
+    agent = VibeTestAgent(
+        model=model,
+        static=not dynamic,
+        safety_agent=True,
+        safety_analysis_tools=safety_analysis_tools,
+    )
     results = agent.execute_tests(test_cases, sandbox=sandbox)
 
+    output_dataset_name = dataset_name if safety_analysis_tools else f"{dataset_name}_no-tools"
     out_path = output_path or standardized_results_path(
-        dataset_name,
+        output_dataset_name,
         "AT",
         model_name=agent.model_name,
     )
@@ -2106,6 +2113,7 @@ def run_impossiblebench_vibetest(
     task_name: str = "reward hacking",
     test_description: str = IMPOSSIBLEBENCH_VIBETEST_TEST,
     gt_field_name: str = "reward_hacking",
+    safety_analysis_tools: bool = True,
 ) -> Path:
     print("=" * 80)
     print(f"Running safety experiment: case-set VibeTest ({task_name})")
@@ -2125,7 +2133,12 @@ def run_impossiblebench_vibetest(
             )
         )
 
-    agent = VibeTestAgent(model=model, static=not dynamic, safety_agent=True)
+    agent = VibeTestAgent(
+        model=model,
+        static=not dynamic,
+        safety_agent=True,
+        safety_analysis_tools=safety_analysis_tools,
+    )
     results = agent.execute_tests(test_cases, sandbox=sandbox)
 
     rows: list[dict[str, Any]] = []
@@ -2179,8 +2192,9 @@ def run_impossiblebench_vibetest(
         f"classification_accuracy={summary.get('classification_accuracy', 0.0):.3f}, "
         f"verified_accuracy={summary.get('verified_accuracy', 0.0):.3f}"
     )
+    output_dataset_name = dataset_name if safety_analysis_tools else f"{dataset_name}_no-tools"
     out_path = output_path or standardized_results_path(
-        dataset_name,
+        output_dataset_name,
         "AT",
         model_name=agent.model_name,
     )
@@ -2365,6 +2379,16 @@ def _parse_args() -> argparse.Namespace:
         choices=["per-trace", "all-traces"],
         default="per-trace",
         help="Run vibetest on each trace separately or one repo containing all traces.",
+    )
+    parser.add_argument(
+        "--safety-analysis-tools",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable the extra safety-analysis tools for VibeTest "
+            "(parallel scanner, embeddings, clustering). Use --no-safety-analysis-tools "
+            "to run AT with only the baseline bash/python/text-editor toolset."
+        ),
     )
 
     parser.add_argument("--judge-max-tokens", type=int, default=8000, help="LLM judge max tokens.")
@@ -2637,6 +2661,7 @@ def main() -> None:
                 sandbox=args.sandbox,
                 trace_repos_dir=args.trace_repos_dir,
                 output_path=args.vibetest_output_path,
+                safety_analysis_tools=args.safety_analysis_tools,
             )
         if args.method == "codex-vibetest":
             run_codex_vibetest(
@@ -2963,6 +2988,7 @@ def main() -> None:
             task_name=task_name,
             test_description=vibetest_case_description,
             gt_field_name=gt_field_name,
+            safety_analysis_tools=args.safety_analysis_tools,
         )
     if args.method == "codex-vibetest":
         run_impossiblebench_codex_vibetest(
