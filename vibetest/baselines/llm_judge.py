@@ -15,6 +15,7 @@ from inspect_ai.model import ChatMessageUser
 from inspect_ai.scorer import includes
 from inspect_ai.solver import Generate, TaskState, solver
 
+from vibetest.agent.react_agent import cleanup_docker_sandbox, setup_docker_sandbox
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.usage import usage_payload_from_sample
 
@@ -265,6 +266,13 @@ class LLMJudgeBaseline:
         sandbox: str | None = None,
     ) -> list[TestResult]:
         """Run Inspect eval over transcript samples and return parsed TestResults."""
+        sandbox_config = None
+        temp_dir_to_cleanup = None
+        if sandbox == "docker":
+            sandbox_config, temp_dir_to_cleanup = setup_docker_sandbox()
+        elif sandbox is not None:
+            sandbox_config = sandbox
+
         id_to_test_case: dict[str, TestCase] = {}
         samples: list[Sample] = []
 
@@ -284,16 +292,20 @@ class LLMJudgeBaseline:
             dataset=samples,
             solver=self._create_solver(),
             scorer=includes(),
-            sandbox=sandbox,
+            sandbox=sandbox_config,
         )
-        results = eval(
-            tasks=task,
-            model=self.model_name,
-            log_dir=self.log_dir,
-            retry_on_error=self.retry_on_error,
-            fail_on_error=False,
-        )
-        return self._parse_results(results, id_to_test_case)
+        try:
+            results = eval(
+                tasks=task,
+                model=self.model_name,
+                log_dir=self.log_dir,
+                retry_on_error=self.retry_on_error,
+                fail_on_error=False,
+            )
+            return self._parse_results(results, id_to_test_case)
+        finally:
+            if sandbox == "docker" and temp_dir_to_cleanup is not None:
+                cleanup_docker_sandbox(temp_dir_to_cleanup)
 
     def _parse_results(
         self,
