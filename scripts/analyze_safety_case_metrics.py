@@ -19,6 +19,30 @@ import re
 from pathlib import Path
 from typing import Any
 
+FIGURE_WIDTH_IN = 2.5
+LINE_FIGURE_HEIGHT_IN = 1.85
+BAR_FIGURE_HEIGHT_IN = 1.65
+TITLE_FONTSIZE = 0  # Titles are omitted; captions should live in the paper.
+AXIS_LABEL_FONTSIZE = 7.0
+TICK_LABEL_FONTSIZE = 6.0
+LEGEND_FONTSIZE = 6.0
+LINE_WIDTH = 1.2
+MARKER_SIZE = 2.8
+GRID_COLOR = "#D9D9D9"
+GRID_ALPHA = 0.55
+SPINE_COLOR = "#666666"
+TEXT_COLOR = "#222222"
+METHOD_COLORS = {
+    "AT": "#1F5AA6",
+    "AT (Codex)": "#1B9E77",
+    "Judge": "#C65D21",
+}
+METHOD_MARKERS = {
+    "AT": "o",
+    "AT (Codex)": "D",
+    "Judge": "s",
+}
+
 
 PRICING_USD_PER_M: dict[str, dict[str, float]] = {
     "gpt-5-mini": {
@@ -290,6 +314,7 @@ def _finalize_metric_row(metric: dict[str, Any]) -> dict[str, Any]:
     out = dict(metric)
     out["classification_accuracy"] = _safe_ratio(int(metric["classification_correct"]), total)
     out["verified_accuracy"] = _safe_ratio(int(metric["verified_correct"]), total)
+    out["response_rate"] = _safe_ratio(total - int(metric["unknown_predictions"]), total)
     out["gt_positive_rate"] = _safe_ratio(int(metric["gt_positive"]), total)
     out["pred_positive_rate"] = _safe_ratio(int(metric["pred_positive"]), total)
     out["precision"] = precision
@@ -374,6 +399,7 @@ def _print_table(title: str, rows: list[dict[str, Any]], *, include_group: bool)
         "total_cases",
         "classification_accuracy",
         "verified_accuracy",
+        "response_rate",
         "precision",
         "recall",
         "f1",
@@ -400,6 +426,7 @@ def _print_table(title: str, rows: list[dict[str, Any]], *, include_group: bool)
             if c in {
                 "classification_accuracy",
                 "verified_accuracy",
+                "response_rate",
                 "precision",
                 "recall",
                 "f1",
@@ -439,8 +466,50 @@ def _infer_dataset_and_method_from_file(file_path: str) -> tuple[str, str]:
 
 def _pretty_method(method: str) -> str:
     if method == "llmjudge":
-        return "LLM Judge"
+        return "Judge"
+    if method.startswith("AT-codex-"):
+        return "AT (Codex)"
+    if method.startswith("AT-"):
+        return "AT"
     return method
+
+
+def _apply_publication_style(plt) -> None:
+    plt.style.use("seaborn-v0_8-whitegrid")
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Serif",
+            "mathtext.fontset": "dejavuserif",
+            "font.size": TICK_LABEL_FONTSIZE,
+            "axes.labelsize": AXIS_LABEL_FONTSIZE,
+            "xtick.labelsize": TICK_LABEL_FONTSIZE,
+            "ytick.labelsize": TICK_LABEL_FONTSIZE,
+            "legend.fontsize": LEGEND_FONTSIZE,
+            "axes.titlesize": AXIS_LABEL_FONTSIZE,
+            "axes.edgecolor": SPINE_COLOR,
+            "axes.labelcolor": TEXT_COLOR,
+            "xtick.color": TEXT_COLOR,
+            "ytick.color": TEXT_COLOR,
+            "text.color": TEXT_COLOR,
+            "axes.facecolor": "white",
+            "figure.facecolor": "white",
+            "savefig.facecolor": "white",
+            "savefig.edgecolor": "white",
+        }
+    )
+
+
+def _method_color(method: str, fallback_index: int, palette: list[str]) -> str:
+    color = METHOD_COLORS.get(method)
+    if color:
+        return color
+    if palette:
+        return palette[fallback_index % len(palette)]
+    return f"C{fallback_index % 10}"
+
+
+def _method_marker(method: str) -> str:
+    return METHOD_MARKERS.get(method, "o")
 
 
 def _pct_bucket_sort_key(label_text: str) -> tuple[int, float]:
@@ -486,8 +555,8 @@ def _line_plot(
         print("Skipping figure generation: matplotlib is not installed.")
         return []
 
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, ax = plt.subplots(figsize=(8.4, 4.8), constrained_layout=True)
+    _apply_publication_style(plt)
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_IN, LINE_FIGURE_HEIGHT_IN), constrained_layout=True)
     palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
 
     for i, (method, ys) in enumerate(sorted(y_by_method.items(), key=lambda kv: kv[0])):
@@ -516,37 +585,48 @@ def _line_plot(
                 upper_bounds.append(y_val + high_delta)
         if not xs:
             continue
-        color = palette[i % len(palette)] if palette else None
+        color = _method_color(method, i, palette)
         if yerr_by_method is not None:
             ax.fill_between(
                 xs,
                 lower_bounds,
                 upper_bounds,
                 color=color,
-                alpha=0.18,
+                alpha=0.12,
                 linewidth=0.0,
                 zorder=1,
             )
         ax.plot(
             xs,
             vals,
-            marker="o",
-            linewidth=2.0,
-            markersize=5,
+            marker=_method_marker(method),
+            linewidth=LINE_WIDTH,
+            markersize=MARKER_SIZE,
             label=method,
             color=color,
             zorder=2,
         )
 
-    ax.set_title(title, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=11)
-    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+    ax.set_xlabel(xlabel, fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
     ax.set_xticks(list(range(len(x_values))))
     ax.set_xticklabels(x_labels, rotation=x_label_rotation)
-    ax.grid(True, which="major", alpha=0.35, linewidth=0.8)
+    ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
     ax.set_axisbelow(True)
-    ax.legend(frameon=True, fontsize=9, loc="best")
-
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(SPINE_COLOR)
+    ax.spines["bottom"].set_color(SPINE_COLOR)
+    ax.legend(
+        frameon=False,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=max(1, min(2, len(y_by_method))),
+        handlelength=1.4,
+        columnspacing=0.8,
+        handletextpad=0.4,
+        borderaxespad=0.0,
+    )
     out_paths: list[Path] = []
     out_base.parent.mkdir(parents=True, exist_ok=True)
     for ext in formats:
@@ -577,34 +657,33 @@ def _bar_plot_with_ci(
         print("Skipping figure generation: matplotlib is not installed.")
         return []
 
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, ax = plt.subplots(figsize=(8.4, 4.8), constrained_layout=True)
+    _apply_publication_style(plt)
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_IN, BAR_FIGURE_HEIGHT_IN), constrained_layout=True)
     palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
-    if palette:
-        colors = [palette[i % len(palette)] for i in range(len(method_labels))]
-    else:
-        colors = [f"C{i % 10}" for i in range(len(method_labels))]
+    colors = [_method_color(label, i, palette) for i, label in enumerate(method_labels)]
     x = list(range(len(method_labels)))
     ax.bar(
         x,
         values,
         yerr=[lower_errs, upper_errs],
-        capsize=4,
+        capsize=2.5,
         ecolor="black",
         color=colors,
-        edgecolor="black",
-        linewidth=0.7,
-        alpha=0.9,
+        edgecolor=SPINE_COLOR,
+        linewidth=0.6,
+        alpha=0.92,
     )
 
-    ax.set_title(title, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=11)
-    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.0)
+    ax.set_xlabel(xlabel, fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.0)
     ax.set_xticks(x)
-    ax.set_xticklabels(method_labels, rotation=15)
-    ax.grid(True, which="major", axis="y", alpha=0.35, linewidth=0.8)
+    ax.set_xticklabels(method_labels, rotation=12)
+    ax.grid(True, which="major", axis="y", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
     ax.set_axisbelow(True)
-
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(SPINE_COLOR)
+    ax.spines["bottom"].set_color(SPINE_COLOR)
     out_paths: list[Path] = []
     out_base.parent.mkdir(parents=True, exist_ok=True)
     for ext in formats:
@@ -760,7 +839,7 @@ def _generate_figures(
                 values=benign_values,
                 lower_errs=benign_lower_errs,
                 upper_errs=benign_upper_errs,
-                ylabel="False Positive Rate on Benign Cases",
+                ylabel="Benign FPR",
                 xlabel="Method",
                 out_base=figures_dir / f"safety_{dataset_slug}_benign_false_positive_rate",
                 formats=formats,
