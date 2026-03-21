@@ -55,23 +55,30 @@ The agent also outputs per-trace suspicion scores (0.0–1.0) to enable precisio
 | **Cyber** P/R | 0.333 / 1.000 | 0.048 / 1.000 | 0.010 / 0.833 |
 | **Bio** P/R | 0.222 / 0.667 | 0.016 / 0.333 | 0.000 / 0.000 |
 
-### PR Curves
+### Precision–Recall Curves
 
-The per-trace suspicion scores reveal the full operating curve:
+Per-trace suspicion scores enable full PR curve analysis. Lighter colors indicate harder settings (more background noise). Dotted lines show random-classifier baselines.
 
-![PR Curves by Setting](../results/dm_pr_curves_all.png)
+![PR Curves](../results/dm_pr_curves_final.png)
+
+| Domain | bg=2x AUC | bg=20x AUC | bg=100x AUC |
+|--------|-----------|------------|-------------|
+| Cyber | 0.95 | 0.35 | 0.32 |
+| Bio | 0.86 | 0.73 | — (no scores) |
+
+### Performance Degradation
+
+![Degradation](../results/dm_degradation_bars.png)
 
 **Key observations:**
 
-1. **Cyber domain degrades gracefully.** At bg=2x, the PR curve stays near-perfect (precision=1.0) up to ~85% recall. At bg=20x, there's still meaningful signal above the random baseline. At bg=100x, the curve barely exceeds random.
+1. **Cyber domain degrades gracefully.** At bg=2x, the PR curve stays near-perfect (AUC=0.95). At bg=20x, there's still meaningful signal above the random baseline (AUC=0.35). At bg=100x, the scored curve (AUC=0.32) barely exceeds random, though the agent maintains high recall at its chosen operating point.
 
-2. **Bio domain is fundamentally harder.** Even at bg=2x, precision drops earlier. At bg=20x, only 1 of 3 cases produced trace scores. At bg=100x, the agent produced no structured scores at all.
+2. **Bio domain is fundamentally harder.** Even at bg=2x, AUC is lower (0.86 vs 0.95). At bg=20x, only 1 of 3 cases produced trace scores. At bg=100x, the agent produced no structured scores at all.
 
 3. **The semantic similarity gap.** Bio benign traces (WMDP bio questions about virology, biosecurity) are much more semantically similar to harmful bio campaigns than cyber benign traces are to harmful cyber campaigns. This makes bio campaigns harder to distinguish even at low background levels.
 
 4. **Agent failure mode at high bg.** The agent consistently detects *something* suspicious (FAIL verdict in most cases) but localizes the wrong traces. It finds thematically suspicious clusters of benign traces instead of the actual planted campaign.
-
-![Operating Points Summary](../results/dm_operating_summary.png)
 
 ### Available Data
 
