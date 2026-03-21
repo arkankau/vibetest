@@ -1379,8 +1379,17 @@ def _materialize_distributed_misuse_cases(
     campaigns, benign_step_pool = _load_distributed_misuse_data(
         data_path, domain=domain, decomp_level=decomp_level,
     )
-    benign_background_count = decomp_level * background_multiplier
-    traces_per_case = decomp_level + benign_background_count
+    # Round total traces to a clean multiple so the trace count doesn't leak
+    # the decomposition level (e.g., 606 = 6 mod 100 reveals decomp=6).
+    raw_total = decomp_level + decomp_level * background_multiplier
+    # Round down to nearest multiple of 10, but only if it doesn't cut more
+    # than 10% of the benign traces (preserve the intended bg ratio).
+    rounded = (raw_total // 10) * 10
+    if rounded >= decomp_level and (raw_total - rounded) <= 0.1 * raw_total:
+        traces_per_case = rounded
+    else:
+        traces_per_case = raw_total
+    benign_background_count = traces_per_case - decomp_level
     print(
         f"Distributed-misuse ({domain}, decomp={decomp_level}, bg_mult={background_multiplier}): "
         f"campaigns={len(campaigns)}, benign_steps={len(benign_step_pool)}, "

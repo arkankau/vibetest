@@ -54,8 +54,8 @@ The key finding is that **per-prompt classification alone cannot detect decompos
 
 | Domain | bg=2× AP | bg=20× AP | bg=100× AP |
 |--------|----------|-----------|------------|
-| Cyber | 0.01 | 0.04 | 0.04 |
-| Bio | 0.02 | 0.01 | 0.03 |
+| Cyber | 0.01±0.00 | 0.04±0.04 | 0.04±0.01 |
+| Bio | 0.02±0.01 | 0.01±0.00 | 0.03±0.02 |
 
 This confirms that the decomposition attack successfully evades input-level classifiers, consistent with the findings in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414).
 
@@ -63,8 +63,8 @@ This confirms that the decomposition attack successfully evades input-level clas
 
 | Domain | bg=2× AP | bg=20× AP | bg=100× AP |
 |--------|----------|-----------|------------|
-| Cyber | **0.99** | **0.51** | 0.01 |
-| Bio | **0.98** | 0.22 | — (no scores) |
+| Cyber | **0.99±0.02** | **0.51±0.21** | 0.01±0.01 |
+| Bio | **0.98±0.02** | 0.22±0.00 (n=1) | — (no scores) |
 
 The agent provides a **25–100× improvement in AP** at bg=2× and bg=20× over per-prompt classification alone, demonstrating that compositional reasoning is essential for detecting decomposed misuse.
 
