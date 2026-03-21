@@ -1252,12 +1252,30 @@ def _trace_content_hash(content: str) -> str:
 
 
 def _load_score_cache(cache_path: Path) -> dict[str, float]:
-    """Load {content_hash: score} cache from disk."""
+    """Load {content_hash: score} cache from disk, falling back to HuggingFace."""
     if cache_path.exists():
         try:
             return json.loads(cache_path.read_text(encoding="utf-8"))
         except Exception:
             pass
+    # Try to download from HuggingFace.
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_path = hf_hub_download(
+            repo_id=_HF_DISTRIBUTED_MISUSE_REPO,
+            filename=f"score_cache/{cache_path.name}",
+            repo_type="dataset",
+        )
+        cache = json.loads(Path(hf_path).read_text(encoding="utf-8"))
+        # Save locally for future runs.
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return cache
+    except Exception:
+        pass
     return {}
 
 
