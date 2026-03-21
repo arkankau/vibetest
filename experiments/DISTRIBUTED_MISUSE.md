@@ -85,10 +85,9 @@ The per-trace suspicion scores reveal the full operating curve:
 ## Running the Experiment
 
 ```bash
-# Basic run
+# Basic run (downloads dataset from HuggingFace automatically)
 uv run --active python experiments/safety.py \
   --safety-mode distributed-misuse \
-  --distributed-misuse-data-path /path/to/decompositions_bsd_wmdp_kimi_k2 \
   --distributed-misuse-domain cyber \
   --distributed-misuse-decomp-level 6 \
   --distributed-misuse-background-multiplier 20 \
@@ -97,6 +96,13 @@ uv run --active python experiments/safety.py \
   --model openai/gpt-5.4-mini-2026-03-17 \
   --sandbox docker \
   --seed 42
+
+# Or with a local data path (skips HuggingFace download)
+uv run --active python experiments/safety.py \
+  --safety-mode distributed-misuse \
+  --distributed-misuse-data-path /path/to/decompositions_bsd_wmdp_kimi_k2 \
+  --distributed-misuse-domain cyber \
+  ...
 
 # Sweep background multipliers
 for bg in 2 10 20 50 100; do

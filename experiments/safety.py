@@ -1055,13 +1055,20 @@ class _DistributedMisuseCampaign:
     step_traces: list[ImpossibleBenchTrace]  # one per decomposition step
 
 
+_HF_DISTRIBUTED_MISUSE_REPO = "davisrbr/distributed-misuse-benchmark"
+
+
 def _load_distributed_misuse_data(
-    data_path: Path,
+    data_path: Path | None,
     *,
     domain: str,
     decomp_level: int,
 ) -> tuple[list[_DistributedMisuseCampaign], list[ImpossibleBenchTrace]]:
     """Load harmful campaigns and benign individual-step traces from Arrow dataset.
+
+    Loads from the HuggingFace dataset davisrbr/distributed-misuse-benchmark by
+    default.  Falls back to a local Arrow file if --distributed-misuse-data-path
+    is provided.
 
     Each row in the dataset contains all steps for one question+epoch.  We explode
     each row into individual per-step traces so that the agent must reassemble them.
@@ -1072,15 +1079,33 @@ def _load_distributed_misuse_data(
     """
     import pyarrow as pa
 
-    arrow_path = data_path / f"{domain}_combined" / "data-00000-of-00001.arrow"
-    if not arrow_path.exists():
-        raise SystemExit(
-            f"Distributed-misuse dataset not found: {arrow_path}\n"
-            f"Expected a combined Arrow dataset at {data_path / f'{domain}_combined'}/."
+    if data_path is not None:
+        # Local Arrow file path.
+        arrow_path = data_path / f"{domain}_combined" / "data-00000-of-00001.arrow"
+        if not arrow_path.exists():
+            raise SystemExit(
+                f"Distributed-misuse dataset not found: {arrow_path}\n"
+                f"Expected a combined Arrow dataset at {data_path / f'{domain}_combined'}/."
+            )
+        reader = pa.ipc.open_stream(str(arrow_path))
+        table = reader.read_all()
+    else:
+        # Load from HuggingFace.
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            raise SystemExit(
+                "huggingface_hub is required to download the distributed-misuse dataset. "
+                "Install it with: pip install huggingface_hub"
+            )
+        hf_split = f"{domain}_combined"
+        local_path = hf_hub_download(
+            repo_id=_HF_DISTRIBUTED_MISUSE_REPO,
+            filename=f"{hf_split}/data-00000-of-00001.arrow",
+            repo_type="dataset",
         )
-
-    reader = pa.ipc.open_stream(str(arrow_path))
-    table = reader.read_all()
+        reader = pa.ipc.open_stream(local_path)
+        table = reader.read_all()
 
     available_levels: set[int] = set()
     for i in range(table.num_rows):
@@ -3069,8 +3094,8 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Path to parent directory containing {domain}_combined/ Arrow datasets "
-            "for distributed-misuse mode."
+            "Optional local path to parent directory containing {domain}_combined/ Arrow datasets. "
+            "If not set, downloads from HuggingFace (davisrbr/distributed-misuse-benchmark)."
         ),
     )
     parser.add_argument(
@@ -3217,10 +3242,7 @@ def main() -> None:
         vibetest_case_description = MLE_SABOTAGE_VIBETEST_TEST
         judge_prompt_template = MLE_SABOTAGE_JUDGE_PROMPT
     elif args.safety_mode == "distributed-misuse":
-        if args.distributed_misuse_data_path is None:
-            raise SystemExit(
-                "--distributed-misuse-data-path is required for --safety-mode distributed-misuse."
-            )
+        # Data loads from HuggingFace by default; --distributed-misuse-data-path overrides.
         # No pos_eval/neg_eval needed — data comes from Arrow dataset.
         pos_eval = None  # type: ignore[assignment]
         neg_eval = None  # type: ignore[assignment]
