@@ -1095,7 +1095,7 @@ class _DistributedMisuseCampaign:
     step_traces: list[ImpossibleBenchTrace]  # one per decomposition step
 
 
-_HF_DISTRIBUTED_MISUSE_REPO = "davisrbr/distributed-misuse-benchmark"
+_HF_DISTRIBUTED_MISUSE_REPO = "BrachioLab/distributed-misuse-benchmark"
 
 
 def _load_distributed_misuse_data(
@@ -1106,7 +1106,7 @@ def _load_distributed_misuse_data(
 ) -> tuple[list[_DistributedMisuseCampaign], list[ImpossibleBenchTrace]]:
     """Load harmful campaigns and benign individual-step traces from Arrow dataset.
 
-    Loads from the HuggingFace dataset davisrbr/distributed-misuse-benchmark by
+    Loads from the HuggingFace dataset BrachioLab/distributed-misuse-benchmark by
     default.  Falls back to a local Arrow file if --distributed-misuse-data-path
     is provided.
 
@@ -3342,7 +3342,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional local path to parent directory containing {domain}_combined/ Arrow datasets. "
-            "If not set, downloads from HuggingFace (davisrbr/distributed-misuse-benchmark)."
+            "If not set, downloads from HuggingFace (BrachioLab/distributed-misuse-benchmark)."
         ),
     )
     parser.add_argument(

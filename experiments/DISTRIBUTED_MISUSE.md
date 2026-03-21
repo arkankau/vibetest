@@ -23,7 +23,7 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 **Data sources:**
 - Harmful campaigns: BSD (Benign Sub-question Decomposition) dataset — harmful questions decomposed by Kimi-K2, answered by Qwen 2.5 7B
 - Benign background: WMDP (Weapons of Mass Destruction Proxy) benchmark questions, decomposed and answered by Qwen 2.5 7B
-- Dataset: [davisrbr/distributed-misuse-benchmark](https://huggingface.co/datasets/davisrbr/distributed-misuse-benchmark) (private)
+- Dataset: [BrachioLab/distributed-misuse-benchmark](https://huggingface.co/datasets/BrachioLab/distributed-misuse-benchmark) (private)
 
 ## Two-Stage Scoring Pipeline
 
