@@ -72,11 +72,27 @@ The agent provides a **25–100× improvement in AP** at bg=2× and bg=20× over
 
 ![PR Curves](../results/dm_pr_curves_v2.png)
 
+### Comparison with Brown et al. (2025) Buffer Defense
+
+The paper reports AUROC for input-level classification of decomposition sub-questions. To enable a fair comparison, we compute AUROC alongside AP from our per-trace scores.
+
+![ROC Curves](../results/dm_roc_stage_comparison.png)
+
+| Method | Brown et al. AUROC | Our AUROC |
+|---|---|---|
+| Pointwise (no buffer/context) | ~0.60 | 0.43–0.81 (Stage 1) |
+| Stateful buffer defense | 0.76–0.86 | — |
+| Compositional agent (Stage 2) | — | 0.81–0.99 |
+
+Our Stage 1 per-prompt scores are comparable to the paper's pointwise baseline when measured on the same metric (AUROC). The apparent gap (AP ≈ 0.01 vs paper's AUC ≈ 0.60) was primarily a **metric mismatch**: AP is heavily penalized by the extreme class imbalance (6 harmful traces in 600), while AUROC is not.
+
+Our Stage 2 compositional agent matches or exceeds the paper's buffer defense, reaching AUROC 0.97–0.99 at bg=2× and bg=20×.
+
 ### Key Observations
 
-1. **Per-prompt classification is ineffective.** Stage 1 scores are near-random (AP ≈ 0.01–0.04) regardless of background noise level. The decomposition attack succeeds at making individual traces indistinguishable from benign queries — this is consistent with the UMAP and ROC analysis in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414) Figure 4.
+1. **Per-prompt classification has limited discriminative power.** Stage 1 AUROC (0.43–0.81) confirms the decomposition attack degrades input-level classifiers, consistent with [Brown et al. (2025)](https://arxiv.org/abs/2506.06414) Figure 4. AP is near-random (0.01–0.04) due to class imbalance.
 
-2. **Compositional reasoning enables detection.** The agent's Stage 2 revision dramatically boosts campaign trace scores (from ~0.1 to ~0.95) while keeping benign trace scores low, but only when the agent can successfully identify the campaign cluster.
+2. **Compositional reasoning provides large gains.** Stage 2 AUROC (0.81–0.99) exceeds the paper's buffer defense (0.76–0.86) at low-to-moderate background levels, demonstrating that agentic cross-trace reasoning is a viable defense.
 
 3. **Cyber degrades gracefully with background noise.** AP goes from 0.99 → 0.51 → 0.01 as background increases from 2× → 20× → 100×. At 20× the agent still identifies campaigns with ~85% precision at 80% recall.
 
