@@ -3014,9 +3014,12 @@ def run_impossiblebench_vibetest(
             initial_scores = json.loads(
                 initial_scores_path.read_text(encoding="utf-8")
             )
-            # Start with initial scores, overlay agent revisions.
+            # Merge: take the MAX of initial and revised scores per trace.
+            # The agent should only boost (not lower) based on campaign evidence,
+            # so the initial per-prompt score is the floor.
             merged = dict(initial_scores)
-            merged.update(trace_scores)
+            for k, v in trace_scores.items():
+                merged[k] = max(merged.get(k, 0.0), v)
             result_metadata["trace_scores"] = merged
         elif trace_scores:
             result_metadata["trace_scores"] = trace_scores
