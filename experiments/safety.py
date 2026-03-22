@@ -1367,118 +1367,207 @@ def _run_initial_trace_scoring(
         print(f"  Score cache saved: {cache_path} ({len(cache)} entries)")
 
 
+def _embed_traces(
+    case: ImpossibleBenchCase,
+    *,
+    embedding_model: str = "text-embedding-3-small",
+    max_chars: int = 2000,
+    batch_size: int = 64,
+):
+    """Embed all traces for a case. Returns (trace_ids, trace_texts, embeddings_array)."""
+    from openai import OpenAI
+    import numpy as np
+
+    client = OpenAI()
+    trace_texts: list[str] = []
+    trace_ids: list[str] = []
+    for rel in case.trace_files:
+        trace_path = case.repo_path / rel
+        if trace_path.exists():
+            text = trace_path.read_text(encoding="utf-8", errors="replace")
+            trace_texts.append(text[:max_chars])
+            trace_ids.append(rel)
+
+    if not trace_texts:
+        return [], [], np.array([])
+
+    all_embeddings: list[list[float]] = []
+    for start in range(0, len(trace_texts), batch_size):
+        batch = trace_texts[start:start + batch_size]
+        response = client.embeddings.create(model=embedding_model, input=batch)
+        all_embeddings.extend([row.embedding for row in response.data])
+
+    return trace_ids, trace_texts, np.array(all_embeddings, dtype=float)
+
+
+def _build_clusters_payload(
+    trace_ids: list[str],
+    trace_texts: list[str],
+    x,  # np.ndarray
+    labels,  # np.ndarray
+    centroids,  # np.ndarray or None
+    *,
+    embedding_model: str,
+    strategy: str,
+) -> dict[str, Any]:
+    """Build the clusters.json payload with coherence scores."""
+    import numpy as np
+
+    n = len(trace_ids)
+    chosen_k = len(set(int(v) for v in labels))
+
+    clusters_info: list[dict[str, Any]] = []
+    for cid in sorted(set(int(v) for v in labels)):
+        members = [i for i in range(n) if labels[i] == cid]
+        member_traces = [trace_ids[i] for i in members]
+
+        # Representative traces.
+        if centroids is not None and len(centroids) > cid:
+            dists = [(float(np.linalg.norm(x[i] - centroids[cid])), i) for i in members]
+            dists.sort()
+            reps = [trace_ids[i] for _, i in dists[:3]]
+        else:
+            reps = [trace_ids[i] for i in members[:3]]
+
+        # Coherence: mean pairwise cosine similarity within cluster.
+        if len(members) >= 2:
+            vecs = x[members]
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-10)
+            normed = vecs / norms
+            sim_matrix = normed @ normed.T
+            # Mean of upper triangle (excluding diagonal).
+            n_pairs = len(members) * (len(members) - 1) / 2
+            coherence = float((sim_matrix.sum() - len(members)) / (2 * n_pairs)) if n_pairs > 0 else 0.0
+        else:
+            coherence = 1.0
+
+        clusters_info.append({
+            "cluster_id": cid,
+            "size": len(members),
+            "coherence": round(coherence, 4),
+            "traces": member_traces,
+            "representatives": reps,
+            "preview": [trace_texts[i][:200] for i in members[:2]],
+        })
+
+    # Sort by coherence descending — most suspicious first.
+    clusters_info.sort(key=lambda c: -c["coherence"])
+
+    return {
+        "n_clusters": chosen_k,
+        "n_traces": n,
+        "embedding_model": embedding_model,
+        "clustering_strategy": strategy,
+        "clusters": clusters_info,
+        "trace_to_cluster": {trace_ids[i]: int(labels[i]) for i in range(n)},
+    }
+
+
+def _cluster_silhouette(x, min_clusters: int, max_clusters: int):
+    """KMeans with silhouette score to pick k."""
+    import numpy as np
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    n = len(x)
+    eff_max = min(max_clusters, n - 1)
+    eff_min = min(min_clusters, eff_max)
+    if n <= 2 or eff_max <= 1:
+        return np.zeros(n, dtype=int), None, 1
+
+    best_k, best_score = eff_min, -1.0
+    for k in range(eff_min, eff_max + 1):
+        km = KMeans(n_clusters=k, random_state=0, n_init=10)
+        labs = km.fit_predict(x)
+        if len(set(labs)) < 2:
+            continue
+        score = silhouette_score(x, labs)
+        if score > best_score:
+            best_score = score
+            best_k = k
+
+    km = KMeans(n_clusters=best_k, random_state=0, n_init=10)
+    labels = km.fit_predict(x)
+    return labels, km.cluster_centers_, best_k
+
+
+def _cluster_high_k(x):
+    """KMeans with forced high k = n/10 for many small clusters."""
+    import numpy as np
+    from sklearn.cluster import KMeans
+
+    n = len(x)
+    k = max(3, n // 10)
+    k = min(k, n - 1)
+    km = KMeans(n_clusters=k, random_state=0, n_init=10)
+    labels = km.fit_predict(x)
+    return labels, km.cluster_centers_, k
+
+
+def _cluster_coherence(x):
+    """KMeans with high k + coherence scores. Focuses on producing
+    small tight clusters where campaigns are identifiable."""
+    import numpy as np
+    from sklearn.cluster import KMeans
+
+    n = len(x)
+    # Target ~8 traces per cluster.
+    k = max(5, n // 8)
+    k = min(k, n - 1, 100)
+    km = KMeans(n_clusters=k, random_state=0, n_init=10)
+    labels = km.fit_predict(x)
+    return labels, km.cluster_centers_, k
+
+
 def _run_trace_embedding_and_clustering(
     cases: list[ImpossibleBenchCase],
     *,
     embedding_model: str = "text-embedding-3-small",
     max_chars: int = 2000,
     batch_size: int = 64,
-    min_clusters: int = 3,
-    max_clusters: int | None = None,  # Default: sqrt(n_traces), capped at 100
+    strategy: str = "silhouette",
 ) -> None:
     """Embed and cluster traces for each case, writing clusters.json.
 
-    This pre-computes the embedding+clustering step so the agent can
-    read cluster assignments directly instead of orchestrating tool calls.
+    Strategies:
+    - "silhouette": KMeans with silhouette-optimized k (default)
+    - "high_k": KMeans with k = n/10, many small clusters
+    - "coherence": KMeans with k = n/8 + coherence scores sorted
     """
-    from openai import OpenAI
     import numpy as np
-    from sklearn.cluster import KMeans
-    from sklearn.metrics import silhouette_score
-
-    client = OpenAI()
 
     for case in cases:
         clusters_path = case.repo_path / "clusters.json"
         if clusters_path.exists():
             continue
 
-        # Read trace contents.
-        trace_texts: list[str] = []
-        trace_ids: list[str] = []
-        for rel in case.trace_files:
-            trace_path = case.repo_path / rel
-            if trace_path.exists():
-                text = trace_path.read_text(encoding="utf-8", errors="replace")
-                trace_texts.append(text[:max_chars])
-                trace_ids.append(rel)
-
-        if not trace_texts:
+        print(f"  Embedding {len(case.trace_files)} traces for {case.case_id}...")
+        trace_ids, trace_texts, x = _embed_traces(
+            case, embedding_model=embedding_model, max_chars=max_chars, batch_size=batch_size,
+        )
+        if len(trace_ids) == 0:
             continue
 
-        print(f"  Embedding {len(trace_texts)} traces for {case.case_id}...")
+        n = len(trace_ids)
+        if strategy == "high_k":
+            labels, centroids, chosen_k = _cluster_high_k(x)
+        elif strategy == "coherence":
+            labels, centroids, chosen_k = _cluster_coherence(x)
+        else:  # silhouette
+            min_c = max(3, n // 30) if n >= 100 else 3
+            max_c = min(100, max(15, int(n ** 0.5)))
+            labels, centroids, chosen_k = _cluster_silhouette(x, min_c, max_c)
 
-        # Embed in batches.
-        all_embeddings: list[list[float]] = []
-        for start in range(0, len(trace_texts), batch_size):
-            batch = trace_texts[start:start + batch_size]
-            response = client.embeddings.create(model=embedding_model, input=batch)
-            all_embeddings.extend([row.embedding for row in response.data])
-
-        x = np.array(all_embeddings, dtype=float)
-
-        # Choose k via silhouette score.
-        # Scale clusters with corpus size for fine-grained grouping.
-        # Target: average cluster size of ~10-30 traces.
-        n = len(trace_texts)
-        if max_clusters is None:
-            max_clusters = min(100, max(15, int(n ** 0.5)))
-        # For large corpora, ensure minimum cluster count is high enough
-        # that small thematic groups aren't drowned in large clusters.
-        if n >= 100:
-            min_clusters = max(min_clusters, n // 30)
-        eff_max = min(max_clusters, n - 1)
-        eff_min = min(min_clusters, eff_max)
-        if n <= 2 or eff_max <= 1:
-            chosen_k = 1
-            labels = np.zeros(n, dtype=int)
-        else:
-            best_k, best_score = eff_min, -1.0
-            for k in range(eff_min, eff_max + 1):
-                km = KMeans(n_clusters=k, random_state=0, n_init=10)
-                labs = km.fit_predict(x)
-                if len(set(labs)) < 2:
-                    continue
-                score = silhouette_score(x, labs)
-                if score > best_score:
-                    best_score = score
-                    best_k = k
-            chosen_k = best_k
-            km = KMeans(n_clusters=chosen_k, random_state=0, n_init=10)
-            labels = km.fit_predict(x)
-            centroids = km.cluster_centers_
-
-        # Build cluster summary.
-        clusters_info: list[dict[str, Any]] = []
-        for cid in sorted(set(int(v) for v in labels)):
-            members = [i for i in range(n) if labels[i] == cid]
-            # Representative traces (closest to centroid).
-            if chosen_k > 1:
-                dists = [(float(np.linalg.norm(x[i] - centroids[cid])), i) for i in members]
-                dists.sort()
-                reps = [trace_ids[i] for _, i in dists[:3]]
-            else:
-                reps = [trace_ids[i] for i in members[:3]]
-            clusters_info.append({
-                "cluster_id": cid,
-                "size": len(members),
-                "traces": [trace_ids[i] for i in members],
-                "representatives": reps,
-                "preview": [trace_texts[i][:200] for i in members[:2]],
-            })
-
-        payload = {
-            "n_clusters": chosen_k,
-            "n_traces": n,
-            "embedding_model": embedding_model,
-            "clusters": clusters_info,
-            "trace_to_cluster": {trace_ids[i]: int(labels[i]) for i in range(n)},
-        }
+        payload = _build_clusters_payload(
+            trace_ids, trace_texts, x, labels, centroids,
+            embedding_model=embedding_model, strategy=strategy,
+        )
         clusters_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        print(f"  {case.case_id}: {chosen_k} clusters from {n} traces")
+        print(f"  {case.case_id}: {chosen_k} clusters from {n} traces (strategy={strategy})")
 
 
 def _materialize_distributed_misuse_cases(
@@ -3494,6 +3583,13 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--distributed-misuse-clustering-strategy",
+        type=str,
+        choices=["silhouette", "high_k", "coherence"],
+        default="silhouette",
+        help="Clustering strategy: silhouette (default), high_k (k=n/10), coherence (k=n/8 + coherence).",
+    )
+    parser.add_argument(
         "--scorer-model",
         type=str,
         default="openai/gpt-5-mini",
@@ -3901,7 +3997,9 @@ def main() -> None:
         _run_initial_trace_scoring(all_cases, model=args.model)
         print("Initial scoring complete.")
         print("Running trace embedding and clustering...")
-        _run_trace_embedding_and_clustering(all_cases)
+        _run_trace_embedding_and_clustering(
+            all_cases, strategy=args.distributed_misuse_clustering_strategy,
+        )
         print("Clustering complete.")
 
     if args.method in {"judge", "both"}:
