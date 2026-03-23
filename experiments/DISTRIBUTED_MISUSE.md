@@ -45,7 +45,7 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 
 ### Cyber Domain
 
-![ROC Curves](../results/dm_cyber_final_roc.png)
+![ROC and PR Curves](../results/dm_cyber_final_combined.png)
 
 | Setting | Stage 1 AUROC | + Agent AUROC | Brown et al. buffer |
 |---------|---------------|---------------|---------------------|
