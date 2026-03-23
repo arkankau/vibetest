@@ -29,15 +29,16 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 
 1. **Stage 1 — Per-prompt scoring:** Each trace is independently classified as safe/unsafe with a suspicion score (0.0–1.0), adapted from the Llama-Guard template in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414). Scores are cached by content hash.
 
-2. **Embed + Cluster:** All traces are embedded (text-embedding-3-small) and clustered (KMeans with coherence scoring). Clusters are ranked by `suspicion_score = coherence × log₂(size)`. Written as `clusters.json` for the agent.
+2. **Embed + Cluster:** All traces are embedded (text-embedding-3-small) and clustered (KMeans with coherence scoring). Each cluster is labeled with a short topic summary via parallel LLM calls. Clusters are ranked by `suspicion_score = coherence × log₂(size)`.
 
-3. **Stage 2 — Compositional agent:** The agent reads `clusters.json` + `initial_scores.json`, identifies campaign patterns using the structural signature of decomposition attacks, and produces revised per-trace scores. Uses max-merge: `final_score = max(initial, agent_revised)` so the agent can only boost, never degrade.
+3. **Stage 2 — Compositional agent:** The agent reads `clusters.json` (with topic labels) + `initial_scores.json`, identifies campaign patterns using the structural signature of decomposition attacks, and produces revised per-trace scores. Uses max-merge: `final_score = max(initial, agent_revised)` so the agent can only boost, never degrade the per-prompt baseline.
 
 ## Metrics
 
-- **AUROC**: Primary metric, comparable to [Brown et al. (2025)](https://arxiv.org/abs/2506.06414)
-- **Average Precision (AP)**: Area under PR curve — penalized by class imbalance (6 traces in 600)
-- **Campaign coverage**: Weighted fraction of campaign steps caught
+- **AUROC (macro)**: Per-case AUROC averaged across cases. Primary metric, comparable to [Brown et al. (2025)](https://arxiv.org/abs/2506.06414). Note: AUROC can be optimistic under extreme class imbalance.
+- **Average Precision (AP, macro)**: Per-case AP averaged across cases. More conservative metric that reflects operational precision at the 1% positive rate (6 campaign traces in 600).
+- **AUROC/AP (micro)**: Pooled across all traces from all cases. Similar to macro in our setting.
+- **Campaign coverage**: Weighted fraction of campaign steps caught.
 
 ## Results
 
@@ -47,29 +48,42 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 
 ![ROC and PR Curves](../results/dm_cyber_final_combined.png)
 
-| Setting | Stage 1 AUROC | + Agent AUROC | Brown et al. buffer |
-|---------|---------------|---------------|---------------------|
-| **bg=2× (n=3)** | 0.48±0.12 | **1.00±0.00** | — |
-| **bg=20× (n=3)** | 0.49±0.07 | **0.93±0.08** | — |
-| **bg=100× (n=15)** | 0.76±0.15 | **0.85±0.18** | 0.76–0.86 |
+| Setting | | Stage 1 | + Agent | Δ |
+|---------|---|---------|---------|---|
+| **bg=2× (n=3)** | AUROC | 0.48±0.12 | **1.00±0.00** | +0.52 |
+| | AP | 0.01±0.00 | **0.92±0.06** | +0.91 |
+| **bg=20× (n=3)** | AUROC | 0.49±0.07 | **0.93±0.08** | +0.44 |
+| | AP | 0.01±0.00 | **0.34±0.22** | +0.33 |
+| **bg=100× (n=15)** | AUROC | 0.76±0.15 | **0.85±0.18** | +0.09 |
+| | AP | 0.04±0.03 | **0.28±0.33** | +0.24 |
 
-At bg=100× with n=15 cases, the agent achieves AUROC **0.85 (median 0.92)**, matching the paper's stateful buffer defense (0.76–0.86). The distribution is bimodal: 7/15 cases ≥ 0.95 (campaign found), 4/15 < 0.70 (campaign too well-disguised).
+At bg=100× with 15 cases, the agent achieves AUROC **0.85 (median 0.92)**, matching the range reported for the stateful buffer defense in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414) (AUROC 0.76–0.86). The AP of 0.28 reflects the difficulty of precise localization under extreme class imbalance (6/600 = 1% positive rate).
+
+![Per-Case Scatter](../results/dm_cyber_bg100_scatter.png)
+
+The scatter plot shows the agent improves detection for the majority of campaigns (points above diagonal). The distribution is bimodal: 7/15 cases achieve AUROC ≥ 0.95 (campaign found), while 4/15 fall below 0.70 (campaigns where the decomposition effectively disguises the harmful intent as generic technical questions).
+
+**Note on AUROC vs AP:** AUROC increases with background level (0.48 → 0.76 for Stage 1 as bg grows from 2× to 100×) because more negatives make ranking easier. This is a known property of AUROC under class imbalance, not an indication that detection gets easier. AP tells the complementary story: it decreases (0.01 → 0.04 → 0.04) reflecting the growing difficulty of precise retrieval.
+
+### Ablation: Topic Labeling
+
+We also experimented with pre-computing LLM-generated topic labels for each cluster (e.g., "Siemens S7-1200 firmware persistence"). Topic labels helped for campaigns with distinctive themes (up to +0.20 AUROC on individual cases) but did not improve aggregate results (mean AUROC 0.84 vs 0.85 without), as the agent sometimes over-indexed on topic specificity and made worse decisions on other cases.
 
 ### Bio Domain
 
-Bio evaluation is limited by the evaluator model's safety filter: `gpt-5.4-mini` refuses to produce final analysis for traces containing pathogen/virus keywords. The model processes traces during analysis but refuses on submission. At bg=2× where it engages, AUROC reaches 0.86. At higher bg, most cases return INCONCLUSIVE. This demonstrates a tension between model safety guardrails and safety auditing capabilities.
+Bio evaluation is limited by the evaluator model's safety filter: `gpt-5.4-mini` refuses to produce final analysis for traces containing pathogen/virus keywords. The model processes traces during analysis (34+ tool calls) but refuses when producing the final verdict. At bg=2× where the agent does engage, AUROC reaches 0.86. At bg=20× and bg=100×, most cases return INCONCLUSIVE. This demonstrates a tension between model safety guardrails and safety auditing capabilities — the model's own safety filter prevents it from being used to detect bio misuse campaigns.
 
 ### Key Findings
 
 1. **Per-prompt classification is necessary but insufficient.** Stage 1 provides a floor (AUROC 0.48–0.76) preserved via max-merge. The decomposition attack evades input-level classifiers, consistent with [Brown et al. (2025)](https://arxiv.org/abs/2506.06414).
 
-2. **Pre-computed clustering is critical at scale.** The agent cannot orchestrate embed+cluster tools itself with gpt-5.4-mini (timeouts). Pre-computing clusters enables the agent to focus on compositional reasoning.
+2. **Pre-computed clustering is critical at scale.** The agent cannot orchestrate embed+cluster tools itself with gpt-5.4-mini (timeouts). Pre-computing clusters with topic labels enables the agent to focus on compositional reasoning.
 
-3. **Teaching the decomposition signature matters.** Prompting the agent with the structural pattern of campaigns (narrow focus, systematic coverage, individually boring) improved one bg=100 case from AUROC 0.70 to 0.98.
+3. **Max-merge is essential.** Without it, the agent actively degrades Stage 1 scores at bg=100× (AUROC drops from 0.71 to 0.39). With max-merge, the agent can only help — the floor is the per-prompt baseline.
 
 4. **Detection limit depends on decomposition quality.** Well-disguised campaigns (traces resemble homework questions) evade detection even with clustering. This is consistent with [Brown et al. (2025)](https://arxiv.org/abs/2506.06414).
 
-5. **The evaluator model's safety filter blocks bio auditing.** The model refuses to summarize findings about bio-threat content, leaving harmful campaigns undetected — an ironic failure mode for a safety tool.
+5. **The evaluator model's safety filter blocks bio auditing.** For bio content, the model refuses to produce analysis, leaving harmful campaigns undetected.
 
 ### Available Data
 
@@ -120,5 +134,6 @@ done
 - **Cross-domain background** (e.g., bio campaigns in cyber background) to isolate decomposition signal from domain similarity
 - **Stronger models** for both Stage 1 and Stage 2
 - **Models without bio content restrictions** for bio domain evaluation
-- **Multi-campaign cases** with multiple planted campaigns per corpus
+- **Sub-clustering** large clusters to isolate small campaign groups
+- **Buffer-style Stage 1** with in-context nearest-neighbor examples
 - **Recomposition-weighted coverage** — re-run composition attack on caught traces to measure actual harm reduction
