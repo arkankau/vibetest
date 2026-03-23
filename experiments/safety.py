@@ -1604,11 +1604,11 @@ Answer in under 15 words. Output ONLY the topic label, nothing else."""
 async def _label_clusters_parallel(
     cases: list[ImpossibleBenchCase],
     *,
-    model_name: str = "openai/gpt-5-nano",
+    model_name: str = "openai/gpt-4o-mini",
     concurrency: int = 32,
 ) -> None:
     """Add topic labels to each cluster in clusters.json via parallel LLM calls."""
-    model = get_model(model_name, config=GenerateConfig(max_tokens=50, temperature=0.0))
+    model = get_model(model_name, config=GenerateConfig(max_tokens=50))
     sem = asyncio.Semaphore(max(1, concurrency))
 
     for case in cases:
@@ -1658,7 +1658,7 @@ async def _label_clusters_parallel(
 def _run_cluster_topic_labeling(
     cases: list[ImpossibleBenchCase],
     *,
-    model: str = "openai/gpt-5-nano",
+    model: str = "openai/gpt-4o-mini",
 ) -> None:
     """Run parallel topic labeling for all case clusters."""
     asyncio.run(_label_clusters_parallel(cases, model_name=model))
