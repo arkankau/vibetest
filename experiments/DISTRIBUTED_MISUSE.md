@@ -13,92 +13,63 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 **Case construction:**
 - One complete harmful campaign (all decomposition steps as individual trace files)
 - A configurable number of benign background traces (individual Q&A pairs from WMDP benchmark questions)
-- All traces are shuffled together randomly
+- All traces are shuffled together; total count is rounded to avoid leaking decomposition level
 
 **Key parameters:**
 - `decomp_level`: Number of steps the harmful goal is decomposed into (3, 6, or 12)
-- `background_multiplier`: Benign traces per campaign step (e.g., multiplier=20 with decomp=6 → 120 benign + 6 campaign = 126 total traces)
+- `background_multiplier`: Benign traces per campaign step (e.g., multiplier=20 with decomp=6 → ~120 total traces)
 - `domain`: Cyber (cybersecurity attacks) or Bio (biosecurity threats)
 
 **Data sources:**
-- Harmful campaigns: BSD (Benign Sub-question Decomposition) dataset — harmful questions decomposed by Kimi-K2, answered by Qwen 2.5 7B
-- Benign background: WMDP (Weapons of Mass Destruction Proxy) benchmark questions, decomposed and answered by Qwen 2.5 7B
+- Harmful campaigns: BSD dataset — harmful questions decomposed by Kimi-K2, answered by Qwen 2.5 7B
+- Benign background: WMDP benchmark questions, decomposed and answered by Qwen 2.5 7B
 - Dataset: [BrachioLab/distributed-misuse-benchmark](https://huggingface.co/datasets/BrachioLab/distributed-misuse-benchmark) (private)
 
-## Two-Stage Scoring Pipeline
+## Three-Stage Pipeline
 
-1. **Stage 1 — Per-prompt classification (parallel LLM pass):** Each trace is independently classified as safe/unsafe with a suspicion score (0.0–1.0). This uses a prompt adapted from the Llama-Guard safety classification template used in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414). Scores are cached by content hash and stored on HuggingFace for reuse.
+1. **Stage 1 — Per-prompt scoring:** Each trace is independently classified as safe/unsafe with a suspicion score (0.0–1.0), adapted from the Llama-Guard template in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414). Scores are cached by content hash.
 
-2. **Stage 2 — Compositional agent revision:** The agent sees all traces plus their initial scores (`initial_scores.json`). It analyzes compositional threats — groups of traces that combine into a harmful capability — and produces revised scores reflecting campaign membership.
+2. **Embed + Cluster:** All traces are embedded (text-embedding-3-small) and clustered (KMeans with coherence scoring). Clusters are ranked by `suspicion_score = coherence × log₂(size)`. Written as `clusters.json` for the agent.
+
+3. **Stage 2 — Compositional agent:** The agent reads `clusters.json` + `initial_scores.json`, identifies campaign patterns using the structural signature of decomposition attacks, and produces revised per-trace scores. Uses max-merge: `final_score = max(initial, agent_revised)` so the agent can only boost, never degrade.
 
 ## Metrics
 
-- **Trace-level precision**: Of the traces flagged, what fraction are actually campaign traces?
-- **Trace-level recall**: Of the campaign traces, what fraction were flagged?
-- **Average Precision (AP)**: Area under the PR curve, computed by sweeping a threshold over per-trace suspicion scores
-- **Campaign coverage**: Weighted fraction of campaign steps caught. Currently equal weights (1/N per step). Designed to support future recomposition-based weights where each step's contribution to the harmful answer is measured by re-running the composition attack.
+- **AUROC**: Primary metric, comparable to [Brown et al. (2025)](https://arxiv.org/abs/2506.06414)
+- **Average Precision (AP)**: Area under PR curve — penalized by class imbalance (6 traces in 600)
+- **Campaign coverage**: Weighted fraction of campaign steps caught
 
 ## Results
 
-**Model:** `gpt-5.4-mini-2026-03-17`
-**Decomposition level:** 6
-**Cases per setting:** 3
+**Model:** `gpt-5.4-mini-2026-03-17` | **Decomposition level:** 6
 
-### Stage 1 vs Stage 2 Comparison
+### Cyber Domain
 
-The key finding is that **per-prompt classification alone cannot detect decomposed misuse campaigns** — which is precisely the attack's design. The compositional agent pass is necessary to identify campaign traces.
+![ROC Curves](../results/dm_cyber_final_roc.png)
 
-![Stage Comparison](../results/dm_pr_stage_comparison.png)
+| Setting | Stage 1 AUROC | + Agent AUROC | Brown et al. buffer |
+|---------|---------------|---------------|---------------------|
+| **bg=2× (n=3)** | 0.48±0.12 | **1.00±0.00** | — |
+| **bg=20× (n=3)** | 0.49±0.07 | **0.93±0.08** | — |
+| **bg=100× (n=15)** | 0.76±0.15 | **0.85±0.18** | 0.76–0.86 |
 
-**Stage 1 (per-prompt only)** achieves near-random AP across all settings:
+At bg=100× with n=15 cases, the agent achieves AUROC **0.85 (median 0.92)**, matching the paper's stateful buffer defense (0.76–0.86). The distribution is bimodal: 7/15 cases ≥ 0.95 (campaign found), 4/15 < 0.70 (campaign too well-disguised).
 
-| Domain | bg=2× AP | bg=20× AP | bg=100× AP |
-|--------|----------|-----------|------------|
-| Cyber | 0.01±0.00 | 0.04±0.04 | 0.04±0.01 |
-| Bio | 0.02±0.01 | 0.01±0.00 | 0.03±0.02 |
+### Bio Domain
 
-This confirms that the decomposition attack successfully evades input-level classifiers, consistent with the findings in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414).
+Bio evaluation is limited by the evaluator model's safety filter: `gpt-5.4-mini` refuses to produce final analysis for traces containing pathogen/virus keywords. The model processes traces during analysis but refuses on submission. At bg=2× where it engages, AUROC reaches 0.86. At higher bg, most cases return INCONCLUSIVE. This demonstrates a tension between model safety guardrails and safety auditing capabilities.
 
-**Stage 2 (+ compositional agent revision)** dramatically improves detection where the agent can reason about cross-trace composition:
+### Key Findings
 
-| Domain | bg=2× AP | bg=20× AP | bg=100× AP |
-|--------|----------|-----------|------------|
-| Cyber | **0.99±0.02** | **0.51±0.21** | 0.01±0.01 |
-| Bio | **0.98±0.02** | 0.22±0.00 (n=1) | — (no scores) |
+1. **Per-prompt classification is necessary but insufficient.** Stage 1 provides a floor (AUROC 0.48–0.76) preserved via max-merge. The decomposition attack evades input-level classifiers, consistent with [Brown et al. (2025)](https://arxiv.org/abs/2506.06414).
 
-The agent provides a **25–100× improvement in AP** at bg=2× and bg=20× over per-prompt classification alone, demonstrating that compositional reasoning is essential for detecting decomposed misuse.
+2. **Pre-computed clustering is critical at scale.** The agent cannot orchestrate embed+cluster tools itself with gpt-5.4-mini (timeouts). Pre-computing clusters enables the agent to focus on compositional reasoning.
 
-### Precision–Recall Curves
+3. **Teaching the decomposition signature matters.** Prompting the agent with the structural pattern of campaigns (narrow focus, systematic coverage, individually boring) improved one bg=100 case from AUROC 0.70 to 0.98.
 
-![PR Curves](../results/dm_pr_curves_v2.png)
+4. **Detection limit depends on decomposition quality.** Well-disguised campaigns (traces resemble homework questions) evade detection even with clustering. This is consistent with [Brown et al. (2025)](https://arxiv.org/abs/2506.06414).
 
-### Comparison with Brown et al. (2025) Buffer Defense
-
-The paper reports AUROC for input-level classification of decomposition sub-questions. To enable a fair comparison, we compute AUROC alongside AP from our per-trace scores.
-
-![ROC Curves](../results/dm_roc_stage_comparison.png)
-
-| Method | Brown et al. AUROC | Our AUROC |
-|---|---|---|
-| Pointwise (no buffer/context) | ~0.60 | 0.43–0.81 (Stage 1) |
-| Stateful buffer defense | 0.76–0.86 | — |
-| Compositional agent (Stage 2) | — | 0.81–0.99 |
-
-Our Stage 1 per-prompt scores are comparable to the paper's pointwise baseline when measured on the same metric (AUROC). The apparent gap (AP ≈ 0.01 vs paper's AUC ≈ 0.60) was primarily a **metric mismatch**: AP is heavily penalized by the extreme class imbalance (6 harmful traces in 600), while AUROC is not.
-
-Our Stage 2 compositional agent matches or exceeds the paper's buffer defense, reaching AUROC 0.97–0.99 at bg=2× and bg=20×.
-
-### Key Observations
-
-1. **Per-prompt classification has limited discriminative power.** Stage 1 AUROC (0.43–0.81) confirms the decomposition attack degrades input-level classifiers, consistent with [Brown et al. (2025)](https://arxiv.org/abs/2506.06414) Figure 4. AP is near-random (0.01–0.04) due to class imbalance.
-
-2. **Compositional reasoning provides large gains.** Stage 2 AUROC (0.81–0.99) exceeds the paper's buffer defense (0.76–0.86) at low-to-moderate background levels, demonstrating that agentic cross-trace reasoning is a viable defense.
-
-3. **Cyber degrades gracefully with background noise.** AP goes from 0.99 → 0.51 → 0.01 as background increases from 2× → 20× → 100×. At 20× the agent still identifies campaigns with ~85% precision at 80% recall.
-
-4. **Bio is fundamentally harder.** Bio benign traces (WMDP bio questions about virology, biosecurity) are much more semantically similar to harmful bio campaigns than cyber benign traces are to cyber campaigns. The agent frequently returns INCONCLUSIVE or fails to produce structured scores at higher background levels.
-
-5. **Agent failure mode at scale.** At bg=100× (606 traces), the agent struggles to produce per-trace scores at all — it either quantizes scores into 1–2 buckets or fails to output the structured TRACE_SCORES block. This is a practical limit of the current single-pass agent approach.
+5. **The evaluator model's safety filter blocks bio auditing.** The model refuses to summarize findings about bio-threat content, leaving harmful campaigns undetected — an ironic failure mode for a safety tool.
 
 ### Available Data
 
@@ -118,26 +89,21 @@ uv run --active python experiments/safety.py \
   --distributed-misuse-domain cyber \
   --distributed-misuse-decomp-level 6 \
   --distributed-misuse-background-multiplier 20 \
+  --distributed-misuse-clustering-strategy coherence \
   --cases 15 \
   --method vibetest \
   --model openai/gpt-5.4-mini-2026-03-17 \
   --sandbox docker \
   --seed 42
 
-# Or with a local data path (skips HuggingFace download)
-uv run --active python experiments/safety.py \
-  --safety-mode distributed-misuse \
-  --distributed-misuse-data-path /path/to/decompositions_bsd_wmdp_kimi_k2 \
-  --distributed-misuse-domain cyber \
-  ...
-
 # Sweep background multipliers
-for bg in 2 10 20 50 100; do
+for bg in 2 20 100; do
   uv run --active python experiments/safety.py \
     --safety-mode distributed-misuse \
     --distributed-misuse-domain cyber \
     --distributed-misuse-decomp-level 6 \
     --distributed-misuse-background-multiplier $bg \
+    --distributed-misuse-clustering-strategy coherence \
     --cases 15 \
     --method vibetest \
     --model openai/gpt-5.4-mini-2026-03-17 \
@@ -150,9 +116,9 @@ done
 
 ## Future Directions
 
-- **Vary decomposition level** to measure how task decomposition granularity affects detectability
-- **Cross-domain benign background** (e.g., bio campaigns hidden in cyber background) to isolate the decomposition signal from domain-similarity confounds
-- **Larger case counts** for more stable estimates (current n=3 per setting)
-- **Stronger models** to establish an upper bound on detection capability
+- **Vary decomposition level** to measure how granularity affects detectability
+- **Cross-domain background** (e.g., bio campaigns in cyber background) to isolate decomposition signal from domain similarity
+- **Stronger models** for both Stage 1 and Stage 2
+- **Models without bio content restrictions** for bio domain evaluation
 - **Multi-campaign cases** with multiple planted campaigns per corpus
-- **Recomposition-weighted coverage** — re-run the composition attack on subsets of caught traces to measure actual harm reduction rather than assuming equal step weights
+- **Recomposition-weighted coverage** — re-run composition attack on caught traces to measure actual harm reduction
