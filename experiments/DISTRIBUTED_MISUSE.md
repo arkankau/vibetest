@@ -121,7 +121,11 @@ Qwen3.5 does not exhibit the bio refusal problem — **zero refusals** across al
 
 ![Per-Case Scatter (Bio, bg=100×)](../results/dm_bio_qwen35_bg100_scatter.png)
 
-At bg=20×, the agent provides substantial lift (AUROC 0.59 → 0.84, AP 0.13 → 0.57). At bg=100×, the agent does not improve over per-prompt scoring. This suggests that at extreme dilution (6/600 = 1%), the bio campaigns are harder to detect than cyber campaigns — likely because bio decomposition steps (e.g., individual protein purification procedures) blend more naturally with the benign WMDP bio background.
+At bg=20×, the agent provides substantial lift (AUROC 0.59 → 0.84, AP 0.13 → 0.57). At bg=100×, the agent provides marginal improvement (AUROC 0.58 → 0.62 with bio-specific prompting). Bio campaigns are harder to detect than cyber for two structural reasons:
+
+1. **Semantic overlap**: Bio campaign traces (e.g., "RT-PCR assay design for influenza A") are semantically similar to benign WMDP bio questions, making clustering less effective at isolating campaigns. Campaign clusters often rank below larger benign virology clusters in suspicion score.
+
+2. **False positive pressure**: Without domain-specific guidance, the agent flags ~590/600 traces as suspicious (many benign virology traces look dual-use). With stronger bio-specific prompting that reduces false positives, the agent becomes too conservative and misses campaign traces. This precision-recall tradeoff is harder to navigate for bio than cyber.
 
 ### Key Findings
 
