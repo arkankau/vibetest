@@ -42,9 +42,13 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 
 ## Results
 
-**Model:** `gpt-5.4-mini-2026-03-17` | **Decomposition level:** 6
+**Decomposition level:** 6 | **Domain:** Cyber
 
-### Cyber Domain
+### Model Comparison
+
+We evaluate two models: `gpt-5.4-mini-2026-03-17` (OpenAI) and `Qwen3.5-397B-A17B-FP8` (self-hosted via vLLM). Both models use the same three-stage pipeline. The Qwen3.5 model is a thinking/reasoning model; thinking is disabled for Stage 1 per-prompt scoring (via `enable_thinking: false`) but enabled for Stage 2 compositional reasoning.
+
+#### gpt-5.4-mini
 
 ![ROC and PR Curves](../results/dm_cyber_final_combined.png)
 
@@ -57,13 +61,28 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 | **bg=100× (n=15)** | AUROC | 0.76±0.15 | **0.85±0.18** | +0.09 |
 | | AP | 0.04±0.03 | **0.28±0.33** | +0.24 |
 
-At bg=100× with 15 cases, the agent achieves AUROC **0.85 (median 0.92)**, matching the range reported for the stateful buffer defense in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414) (AUROC 0.76–0.86). The AP of 0.28 reflects the difficulty of precise localization under extreme class imbalance (6/600 = 1% positive rate).
+#### Qwen3.5-397B-A17B-FP8
 
-![Per-Case Scatter](../results/dm_cyber_bg100_scatter.png)
+| Setting | | Stage 1 | + Agent | Δ |
+|---------|---|---------|---------|---|
+| **bg=20× (n=20)** | AUROC | 0.61±0.17 | **0.97±0.05** | +0.36 |
+| | AP | — | **0.82±0.21** | — |
+| **bg=100× (n=50)** | AUROC | 0.57±0.13 | **0.77±0.20** | +0.20 |
+| | AP | — | **0.38±0.39** | — |
 
-The scatter plot shows the agent improves detection for the majority of campaigns (points above diagonal). The distribution is bimodal: 7/15 cases achieve AUROC ≥ 0.95 (campaign found), while 4/15 fall below 0.70 (campaigns where the decomposition effectively disguises the harmful intent as generic technical questions).
+**95% confidence intervals (Qwen3.5):**
+- bg=20×: AUROC 0.97 ± 0.02, AP 0.82 ± 0.09
+- bg=100×: AUROC 0.77 ± 0.05, AP 0.38 ± 0.11
 
-**Note on AUROC vs AP:** AUROC increases with background level (0.48 → 0.76 for Stage 1 as bg grows from 2× to 100×) because more negatives make ranking easier. This is a known property of AUROC under class imbalance, not an indication that detection gets easier. AP tells the complementary story: it decreases (0.01 → 0.04 → 0.04) reflecting the growing difficulty of precise retrieval.
+### Analysis
+
+At bg=20×, Qwen3.5 outperforms gpt-5.4-mini (AUROC 0.97 vs 0.93, AP 0.82 vs 0.34), benefiting from its stronger compositional reasoning. At bg=100×, results are comparable (Qwen3.5 AUROC 0.77 vs gpt-5.4-mini 0.85), suggesting that at extreme dilution the bottleneck shifts from model capability to the clustering/embedding pipeline's ability to surface the campaign.
+
+At bg=100× with 50 cases, the distribution remains bimodal: 28/50 cases achieve AUROC ≥ 0.80 (campaign found), while 12/50 achieve AUROC ≥ 0.95. The median AUROC (0.81) is higher than the mean (0.77), reflecting a long left tail of difficult campaigns where the decomposition effectively disguises harmful intent as generic technical questions.
+
+**Note on AUROC vs AP:** AUROC increases with background level (Stage 1: 0.48 → 0.57–0.76 as bg grows from 2× to 100×) because more negatives make ranking easier. This is a known property of AUROC under class imbalance, not an indication that detection gets easier. AP tells the complementary story, reflecting the growing difficulty of precise retrieval at the 1% positive rate (6/600).
+
+**Thinking model considerations:** Qwen3.5 is a thinking/reasoning model that produces internal chain-of-thought by default. For Stage 1 per-prompt scoring, thinking must be disabled (via `chat_template_kwargs: {"enable_thinking": false}`) to get direct content output; otherwise the model consumes all tokens on reasoning and produces empty responses. For Stage 2, thinking is beneficial as the agent needs to reason about campaign structure.
 
 ### Ablation: Topic Labeling
 
@@ -85,6 +104,10 @@ Bio evaluation is limited by the evaluator model's safety filter: `gpt-5.4-mini`
 
 5. **The evaluator model's safety filter blocks bio auditing.** For bio content, the model refuses to produce analysis, leaving harmful campaigns undetected.
 
+6. **Stronger models improve compositional detection.** Qwen3.5 (397B MoE) significantly outperforms gpt-5.4-mini at bg=20× (AUROC 0.97 vs 0.93, AP 0.82 vs 0.34), showing that compositional reasoning capability directly impacts campaign detection.
+
+7. **Thinking models require configuration for scoring.** Reasoning/thinking models like Qwen3.5 must have thinking disabled for simple classification tasks (Stage 1) but benefit from it for complex compositional reasoning (Stage 2).
+
 ### Available Data
 
 | | Cyber | Bio |
@@ -97,8 +120,8 @@ Bio evaluation is limited by the evaluator model's safety filter: `gpt-5.4-mini`
 ## Running the Experiment
 
 ```bash
-# Basic run (downloads dataset from HuggingFace automatically)
-uv run --active python experiments/safety.py \
+# Basic run with OpenAI model (downloads dataset from HuggingFace automatically)
+python experiments/safety.py \
   --safety-mode distributed-misuse \
   --distributed-misuse-domain cyber \
   --distributed-misuse-decomp-level 6 \
@@ -110,9 +133,30 @@ uv run --active python experiments/safety.py \
   --sandbox docker \
   --seed 42
 
+# With a self-hosted vLLM model (e.g., Qwen3.5)
+export VLLM_BASE_URL="http://your-server:8001/v1"
+export VLLM_API_KEY="your-key"
+python experiments/safety.py \
+  --safety-mode distributed-misuse \
+  --distributed-misuse-domain cyber \
+  --distributed-misuse-decomp-level 6 \
+  --distributed-misuse-background-multiplier 100 \
+  --distributed-misuse-clustering-strategy coherence \
+  --cases 50 \
+  --method vibetest \
+  --model "vllm/Qwen/Qwen3.5-397B-A17B-FP8" \
+  --sandbox docker \
+  --seed 42
+
+# Resume an interrupted run
+python experiments/safety.py \
+  --safety-mode distributed-misuse \
+  ... \
+  --retry-eval-log logs/2026-03-23T23-12-06_task_XYZ.eval
+
 # Sweep background multipliers
 for bg in 2 20 100; do
-  uv run --active python experiments/safety.py \
+  python experiments/safety.py \
     --safety-mode distributed-misuse \
     --distributed-misuse-domain cyber \
     --distributed-misuse-decomp-level 6 \

@@ -1238,7 +1238,13 @@ async def _score_traces_parallel(
 
     Returns: {trace_rel_path: suspicion_score} dict.
     """
-    model = get_model(model_name, config=GenerateConfig(max_tokens=200, temperature=0.0))
+    # For thinking models (e.g., Qwen3.5), disable thinking to get direct content output.
+    extra_body = {}
+    if "qwen" in model_name.lower() and ("3.5" in model_name or "3_5" in model_name):
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    model = get_model(model_name, config=GenerateConfig(
+        max_tokens=200, temperature=0.0, extra_body=extra_body or None,
+    ))
     sem = asyncio.Semaphore(max(1, concurrency))
     results: dict[str, float] = {}
 
@@ -3151,6 +3157,7 @@ def run_impossiblebench_vibetest(
     test_description: str = IMPOSSIBLEBENCH_VIBETEST_TEST,
     gt_field_name: str = "reward_hacking",
     safety_analysis_tools: bool = True,
+    retry_eval_log: str | None = None,
 ) -> Path:
     print("=" * 80)
     print(f"Running safety experiment: case-set VibeTest ({task_name})")
@@ -3176,7 +3183,9 @@ def run_impossiblebench_vibetest(
         safety_agent=True,
         safety_analysis_tools=safety_analysis_tools,
     )
-    results = agent.execute_tests(test_cases, sandbox=sandbox)
+    results = agent.execute_tests(
+        test_cases, sandbox=sandbox, retry_eval_log=retry_eval_log,
+    )
 
     rows: list[dict[str, Any]] = []
     for case, result in zip(cases, results):
@@ -3612,6 +3621,15 @@ def _parse_args() -> argparse.Namespace:
         "--rematerialize",
         action="store_true",
         help="Force rematerialization even if matching materialized cases already exist.",
+    )
+    parser.add_argument(
+        "--retry-eval-log",
+        type=str,
+        default=None,
+        help=(
+            "Path to a previous .eval log file to resume from. "
+            "Completed samples are reused; only incomplete samples are re-run."
+        ),
     )
     parser.add_argument(
         "--impossiblebench-hard-positives-from-judge",
@@ -4136,6 +4154,7 @@ def main() -> None:
             test_description=vibetest_case_description,
             gt_field_name=gt_field_name,
             safety_analysis_tools=args.safety_analysis_tools,
+            retry_eval_log=args.retry_eval_log,
         )
     if args.method == "codex-vibetest":
         run_impossiblebench_codex_vibetest(

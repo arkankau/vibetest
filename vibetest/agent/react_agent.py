@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 from inspect_ai import Task, eval
+from inspect_ai.log import read_eval_log
 from inspect_ai.agent import react
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import includes, scorer, Score
@@ -743,7 +744,8 @@ Repository: {test_case.sandbox_path}/repo"""
         return prompt
 
     def execute_tests(
-        self, test_cases: list[TestCase], sandbox: str | None = None
+        self, test_cases: list[TestCase], sandbox: str | None = None,
+        retry_eval_log: str | None = None,
     ) -> list[TestResult]:
         """Execute a test case using the agent.
 
@@ -751,6 +753,8 @@ Repository: {test_case.sandbox_path}/repo"""
             test_case: Test case to execute
             sandbox: Sandbox environment type (e.g., "docker"). If "docker" is specified,
                     vibetest will automatically use its packaged Dockerfile.
+            retry_eval_log: Path to a previous eval log file to resume from.
+                Completed samples are reused; only incomplete samples are re-run.
 
         Returns:
             TestResult with verdict and evidence
@@ -778,10 +782,10 @@ Repository: {test_case.sandbox_path}/repo"""
         for idx, test_case in enumerate(test_cases):
             sample_id = test_case.name
             id_to_test_case[sample_id] = test_case
-            
+
             # Create archive of files and get setup script for extraction
             files_dict, setup_script = create_files_archive(test_case, sandbox_prefix=test_case.sandbox_path)
-            
+
             if test_case.target:
                 samples.append(Sample(
                     input=self._create_prompt(test_case),
@@ -815,17 +819,80 @@ Repository: {test_case.sandbox_path}/repo"""
 
         # Run evaluation
         try:
-            results = eval(
-                tasks=task,
-                model=self.model_name,
-                reasoning_effort="medium",
-                reasoning_summary="auto",
-                log_dir="./logs",  # Must be string, not Path
-                retry_on_error=2,
-                fail_on_error=False,
-                # max_samples=30,
-                # max_connections=30,
-            )
+            if retry_eval_log:
+                # Resume from a previous interrupted eval — completed samples
+                # are reused, only incomplete/errored samples are re-run.
+                prev_log = read_eval_log(retry_eval_log)
+                completed_ids = set()
+                if prev_log.samples:
+                    for s in prev_log.samples:
+                        if s.error is None:
+                            completed_ids.add(s.id)
+                remaining_samples = [
+                    s for s in samples if s.id not in completed_ids
+                ]
+                print(
+                    f"Resuming eval: {len(completed_ids)} completed, "
+                    f"{len(remaining_samples)} remaining out of {len(samples)}"
+                )
+                if remaining_samples:
+                    # Build a new task with only the remaining samples.
+                    if remaining_samples[0].target if remaining_samples else (samples[0].target if samples else False):
+                        resume_task = Task(
+                            dataset=remaining_samples,
+                            solver=self._create_solver(),
+                            scorer=eval_patch(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                            sandbox=sandbox_config,
+                        )
+                    else:
+                        resume_task = Task(
+                            dataset=remaining_samples,
+                            solver=self._create_solver(),
+                            scorer=save_evidence_tar(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                            sandbox=sandbox_config,
+                        )
+                    new_results = eval(
+                        tasks=resume_task,
+                        model=self.model_name,
+                        reasoning_effort="medium",
+                        reasoning_summary="auto",
+                        log_dir="./logs",
+                        retry_on_error=2,
+                        fail_on_error=False,
+                    )
+                    # Merge: parse both the previous log and new results.
+                    prev_results = self._parse_results_from_log(
+                        prev_log, id_to_test_case, completed_ids,
+                    )
+                    new_parsed = self._parse_results(new_results, id_to_test_case)
+                    # Build combined results in the original sample order.
+                    results_by_id: dict[str, "TestResult"] = {}
+                    for r in prev_results:
+                        results_by_id[r.test_case.name] = r
+                    for r in new_parsed:
+                        results_by_id[r.test_case.name] = r
+                    return [
+                        results_by_id[tc.name]
+                        for tc in test_cases
+                        if tc.name in results_by_id
+                    ]
+                else:
+                    # All samples were completed in the previous run.
+                    return self._parse_results_from_log(
+                        prev_log, id_to_test_case, completed_ids,
+                    )
+            else:
+                results = eval(
+                    tasks=task,
+                    model=self.model_name,
+                    reasoning_effort="medium",
+                    reasoning_summary="auto",
+                    log_dir="./logs",  # Must be string, not Path
+                    retry_on_error=2,
+                    fail_on_error=False,
+                    # max_samples=30,
+                    # max_connections=30,
+                )
 
             # Parse results
             return self._parse_results(results, id_to_test_case)
@@ -936,3 +1003,67 @@ Repository: {test_case.sandbox_path}/repo"""
                 ))
 
         return test_results
+
+    def _parse_results_from_log(
+        self,
+        eval_log,
+        id_to_test_case: dict[str, TestCase],
+        completed_ids: set,
+    ) -> list[TestResult]:
+        """Parse results from a previous EvalLog (for resume support).
+
+        Same logic as _parse_results but operates on the log's samples directly.
+        """
+        sample_id_to_result = {}
+        if eval_log.samples:
+            for sample in eval_log.samples:
+                sample_id = sample.id
+                if sample_id not in id_to_test_case or sample_id not in completed_ids:
+                    continue
+                test_case = id_to_test_case[sample_id]
+                output = ""
+                if sample.output and sample.output.completion:
+                    output = sample.output.completion
+                if sample.messages:
+                    for msg in reversed(sample.messages):
+                        if hasattr(msg, 'text') and msg.text:
+                            output = msg.text
+                            break
+                verdict, reason_text, evidence_text = _parse_submission_output(output)
+                if not verdict:
+                    if "VERDICT: PASS" in output.upper():
+                        verdict = "PASS"
+                    elif "VERDICT: FAIL" in output.upper():
+                        verdict = "FAIL"
+                    elif "VERDICT: INCONCLUSIVE" in output.upper():
+                        verdict = "INCONCLUSIVE"
+                    else:
+                        verdict = "INCONCLUSIVE"
+                passed = verdict == "PASS"
+                execution_log = ""
+                if sample.messages:
+                    log_parts = []
+                    for msg in sample.messages:
+                        role = getattr(msg, 'role', 'unknown')
+                        content = getattr(msg, 'text', '') or getattr(msg, 'content', '')
+                        if content:
+                            log_parts.append(f"[{role}] {content[:200]}...")
+                    execution_log = "\n".join(log_parts)
+                sample_id_to_result[sample_id] = TestResult(
+                    test_case=test_case,
+                    passed=passed,
+                    message=output,
+                    execution_log=execution_log,
+                    metadata={
+                        "model": self.model_name,
+                        "test_description": test_case.description,
+                        "verdict": verdict,
+                        "reason_text": reason_text,
+                        "evidence_text": evidence_text,
+                        "score": sample.score.value if sample.score else None,
+                        "total_time": getattr(sample, "total_time", None),
+                        "working_time": getattr(sample, "working_time", None),
+                        **usage_payload_from_sample(sample),
+                    },
+                )
+        return list(sample_id_to_result.values())
