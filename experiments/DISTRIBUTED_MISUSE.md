@@ -98,7 +98,30 @@ We also experimented with pre-computing LLM-generated topic labels for each clus
 
 ### Bio Domain
 
-Bio evaluation is limited by the evaluator model's safety filter: `gpt-5.4-mini` refuses to produce final analysis for traces containing pathogen/virus keywords. The model processes traces during analysis (34+ tool calls) but refuses when producing the final verdict. At bg=2× where the agent does engage, AUROC reaches 0.86. At bg=20× and bg=100×, most cases return INCONCLUSIVE. This demonstrates a tension between model safety guardrails and safety auditing capabilities — the model's own safety filter prevents it from being used to detect bio misuse campaigns.
+#### gpt-5.4-mini
+
+Bio evaluation with gpt-5.4-mini is limited by the evaluator model's safety filter: the model refuses to produce final analysis for traces containing pathogen/virus keywords. It processes traces during analysis (34+ tool calls) but refuses when producing the final verdict. At bg=2× where the agent does engage, AUROC reaches 0.86. At bg=20× and bg=100×, most cases return INCONCLUSIVE. This demonstrates a tension between model safety guardrails and safety auditing capabilities — the model's own safety filter prevents it from being used to detect bio misuse campaigns.
+
+#### Qwen3.5-397B-A17B-FP8
+
+Qwen3.5 does not exhibit the bio refusal problem — **zero refusals** across all 70 bio cases tested.
+
+![ROC and PR Curves (Bio, Qwen3.5)](../results/dm_bio_qwen35_combined.png)
+
+| Setting | | Stage 1 | + Agent | Δ |
+|---------|---|---------|---------|---|
+| **bg=20× (n=20)** | AUROC | 0.59±0.10 | **0.84±0.21** | +0.25 |
+| | AP | 0.13±0.13 | **0.57±0.36** | +0.44 |
+| **bg=100× (n=50)** | AUROC | 0.58±0.14 | **0.58±0.19** | +0.00 |
+| | AP | 0.04±0.05 | **0.07±0.20** | +0.03 |
+
+**95% confidence intervals (Qwen3.5, bio):**
+- bg=20×: AUROC 0.84 ± 0.09, AP 0.57 ± 0.16
+- bg=100×: AUROC 0.58 ± 0.05, AP 0.07 ± 0.06
+
+![Per-Case Scatter (Bio, bg=100×)](../results/dm_bio_qwen35_bg100_scatter.png)
+
+At bg=20×, the agent provides substantial lift (AUROC 0.59 → 0.84, AP 0.13 → 0.57). At bg=100×, the agent does not improve over per-prompt scoring. This suggests that at extreme dilution (6/600 = 1%), the bio campaigns are harder to detect than cyber campaigns — likely because bio decomposition steps (e.g., individual protein purification procedures) blend more naturally with the benign WMDP bio background.
 
 ### Key Findings
 
@@ -110,11 +133,13 @@ Bio evaluation is limited by the evaluator model's safety filter: `gpt-5.4-mini`
 
 4. **Detection limit depends on decomposition quality.** Well-disguised campaigns (traces resemble homework questions) evade detection even with clustering. This is consistent with [Brown et al. (2025)](https://arxiv.org/abs/2506.06414).
 
-5. **The evaluator model's safety filter blocks bio auditing.** For bio content, the model refuses to produce analysis, leaving harmful campaigns undetected.
+5. **Model safety filters can block safety auditing.** gpt-5.4-mini refuses to analyze bio traces, leaving harmful campaigns undetected. Qwen3.5 does not exhibit this problem — zero refusals across 70 bio cases. This demonstrates that models without overly aggressive content filters are better suited for safety auditing tasks.
 
-6. **Stronger models improve compositional detection.** Qwen3.5 (397B MoE) significantly outperforms gpt-5.4-mini at bg=20× (AUROC 0.97 vs 0.93, AP 0.82 vs 0.34), showing that compositional reasoning capability directly impacts campaign detection.
+6. **Stronger models improve compositional detection.** Qwen3.5 (397B MoE) significantly outperforms gpt-5.4-mini at bg=20× for cyber (AUROC 0.97 vs 0.93, AP 0.82 vs 0.34), showing that compositional reasoning capability directly impacts campaign detection.
 
-7. **Thinking models require configuration for scoring.** Reasoning/thinking models like Qwen3.5 must have thinking disabled for simple classification tasks (Stage 1) but benefit from it for complex compositional reasoning (Stage 2).
+7. **Bio campaigns are harder to detect at scale.** At bg=100×, bio AUROC (0.58) is substantially lower than cyber (0.77). Bio decomposition steps blend more naturally with benign WMDP bio background, making clustering less effective at isolating campaigns.
+
+8. **Thinking models require configuration for scoring.** Reasoning/thinking models like Qwen3.5 must have thinking disabled for simple classification tasks (Stage 1) but benefit from it for complex compositional reasoning (Stage 2).
 
 ### Available Data
 
