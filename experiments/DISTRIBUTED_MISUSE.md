@@ -66,9 +66,9 @@ We evaluate two models: `gpt-5.4-mini-2026-03-17` (OpenAI) and `Qwen3.5-397B-A17
 | Setting | | Stage 1 | + Agent | Δ |
 |---------|---|---------|---------|---|
 | **bg=20× (n=20)** | AUROC | 0.61±0.17 | **0.97±0.05** | +0.36 |
-| | AP | — | **0.82±0.21** | — |
+| | AP | 0.17±0.22 | **0.82±0.21** | +0.65 |
 | **bg=100× (n=50)** | AUROC | 0.57±0.13 | **0.77±0.20** | +0.20 |
-| | AP | — | **0.38±0.39** | — |
+| | AP | 0.04±0.05 | **0.38±0.39** | +0.34 |
 
 **95% confidence intervals (Qwen3.5):**
 - bg=20×: AUROC 0.97 ± 0.02, AP 0.82 ± 0.09
@@ -78,9 +78,11 @@ We evaluate two models: `gpt-5.4-mini-2026-03-17` (OpenAI) and `Qwen3.5-397B-A17
 
 At bg=20×, Qwen3.5 outperforms gpt-5.4-mini (AUROC 0.97 vs 0.93, AP 0.82 vs 0.34), benefiting from its stronger compositional reasoning. At bg=100×, results are comparable (Qwen3.5 AUROC 0.77 vs gpt-5.4-mini 0.85), suggesting that at extreme dilution the bottleneck shifts from model capability to the clustering/embedding pipeline's ability to surface the campaign.
 
-At bg=100× with 50 cases, the distribution remains bimodal: 28/50 cases achieve AUROC ≥ 0.80 (campaign found), while 12/50 achieve AUROC ≥ 0.95. The median AUROC (0.81) is higher than the mean (0.77), reflecting a long left tail of difficult campaigns where the decomposition effectively disguises harmful intent as generic technical questions.
+![Per-Case Scatter](../results/dm_cyber_bg100_scatter.png)
 
-**Note on AUROC vs AP:** AUROC increases with background level (Stage 1: 0.48 → 0.57–0.76 as bg grows from 2× to 100×) because more negatives make ranking easier. This is a known property of AUROC under class imbalance, not an indication that detection gets easier. AP tells the complementary story, reflecting the growing difficulty of precise retrieval at the 1% positive rate (6/600).
+At bg=100× with 50 cases (Qwen3.5), the distribution remains bimodal: 28/50 cases achieve AUROC ≥ 0.80 (campaign found), while 12/50 achieve AUROC ≥ 0.95. The median AUROC (0.81) is higher than the mean (0.77), reflecting a long left tail of difficult campaigns where the decomposition effectively disguises harmful intent as generic technical questions. For gpt-5.4-mini (n=15), the scatter plot shows a similar pattern: 7/15 cases achieve AUROC ≥ 0.95, while 4/15 fall below 0.70.
+
+**Note on AUROC vs AP:** AUROC increases with background level (Stage 1: 0.48 → 0.57–0.76 as bg grows from 2× to 100×) because more negatives make ranking easier. This is a known property of AUROC under class imbalance, not an indication that detection gets easier. AP tells the complementary story: it decreases (0.01 → 0.17 → 0.04 for Stage 1) reflecting the growing difficulty of precise retrieval at the 1% positive rate (6/600).
 
 **Thinking model considerations:** Qwen3.5 is a thinking/reasoning model that produces internal chain-of-thought by default. For Stage 1 per-prompt scoring, thinking must be disabled (via `chat_template_kwargs: {"enable_thinking": false}`) to get direct content output; otherwise the model consumes all tokens on reasoning and produces empty responses. For Stage 2, thinking is beneficial as the agent needs to reason about campaign structure.
 
