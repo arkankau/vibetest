@@ -1545,6 +1545,22 @@ def _cluster_coherence(x):
     return labels, km.cluster_centers_, k
 
 
+def _cluster_fine(x):
+    """KMeans with very high k (~4 traces/cluster) for maximum purity.
+    Produces many small clusters; campaigns surface as tight groups of
+    2-3 related micro-clusters with high coherence."""
+    import numpy as np
+    from sklearn.cluster import KMeans
+
+    n = len(x)
+    # Target ~4 traces per cluster — aggressive splitting.
+    k = max(10, n // 4)
+    k = min(k, n - 1, 200)
+    km = KMeans(n_clusters=k, random_state=0, n_init=10)
+    labels = km.fit_predict(x)
+    return labels, km.cluster_centers_, k
+
+
 def _run_trace_embedding_and_clustering(
     cases: list[ImpossibleBenchCase],
     *,
@@ -1579,6 +1595,8 @@ def _run_trace_embedding_and_clustering(
             labels, centroids, chosen_k = _cluster_high_k(x)
         elif strategy == "coherence":
             labels, centroids, chosen_k = _cluster_coherence(x)
+        elif strategy == "fine":
+            labels, centroids, chosen_k = _cluster_fine(x)
         else:  # silhouette
             min_c = max(3, n // 30) if n >= 100 else 3
             max_c = min(100, max(15, int(n ** 0.5)))
@@ -3697,7 +3715,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--distributed-misuse-clustering-strategy",
         type=str,
-        choices=["silhouette", "high_k", "coherence"],
+        choices=["silhouette", "high_k", "coherence", "fine"],
         default="silhouette",
         help="Clustering strategy: silhouette (default), high_k (k=n/10), coherence (k=n/8 + coherence).",
     )
