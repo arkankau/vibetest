@@ -31,7 +31,7 @@ Each **case** consists of a directory of deployment log trace files. The agent m
 
 2. **Embed + Cluster:** All traces are embedded (text-embedding-3-small) and clustered (KMeans with coherence scoring). Each cluster is labeled with a short topic summary via parallel LLM calls. Clusters are ranked by `suspicion_score = coherence × log₂(size)`.
 
-3. **Stage 2 — Compositional agent:** The agent reads `clusters.json` (with topic labels) + `initial_scores.json`, identifies campaign patterns using the structural signature of decomposition attacks, and produces revised per-trace scores. Uses max-merge: `final_score = max(initial, agent_revised)` so the agent can only boost, never degrade the per-prompt baseline.
+3. **Stage 2 — Compositional agent revision:** The agent reads `clusters.json` (with topic labels) plus the initial per-trace scores in `initial_scores.tsv`, identifies campaign patterns using the structural signature of decomposition attacks, and produces revised per-trace scores reflecting campaign membership.
 
 ## Metrics
 
@@ -112,22 +112,16 @@ Qwen3.5 does not exhibit the bio refusal problem — **zero refusals** across al
 |---------|---|---------|---------|---|
 | **bg=20× (n=20)** | AUROC | 0.59±0.10 | **0.84±0.21** | +0.25 |
 | | AP | 0.13±0.13 | **0.57±0.36** | +0.44 |
-| **bg=100× (n=50)** | AUROC | 0.58±0.14 | **0.61±0.19** | +0.03 |
-| | AP | 0.04±0.05 | **0.11±0.22** | +0.07 |
+| **bg=100× (n=50)** | AUROC | 0.58±0.14 | **0.58±0.19** | +0.00 |
+| | AP | 0.04±0.05 | **0.07±0.20** | +0.03 |
 
 **95% confidence intervals (Qwen3.5, bio):**
 - bg=20×: AUROC 0.84 ± 0.09, AP 0.57 ± 0.16
-- bg=100×: AUROC 0.61 ± 0.05, AP 0.11 ± 0.06
-
-The bg=100× bio results use a **two-pass agent strategy** (scan all cluster labels first, then deep-dive into candidates), which improved detection by +0.025 AUROC and +0.032 AP over the single-pass approach. Paired tests across 50 cases (same cases, different prompts): the AUROC improvement is significant by Wilcoxon signed-rank test (p=0.004, 34/50 cases improved) but not by paired t-test (p=0.18); the AP improvement is not significant (Wilcoxon p=0.08).
+- bg=100×: AUROC 0.58 ± 0.05, AP 0.07 ± 0.06
 
 ![Per-Case Scatter (Bio, bg=100×)](../results/dm_bio_qwen35_bg100_scatter.png)
 
-At bg=20×, the agent provides substantial lift (AUROC 0.59 → 0.84, AP 0.13 → 0.57). At bg=100×, the agent provides marginal improvement (AUROC 0.58 → 0.62 with bio-specific prompting). Bio campaigns are harder to detect than cyber for two structural reasons:
-
-1. **Semantic overlap**: Bio campaign traces (e.g., "RT-PCR assay design for influenza A") are semantically similar to benign WMDP bio questions, making clustering less effective at isolating campaigns. Campaign clusters often rank below larger benign virology clusters in suspicion score.
-
-2. **False positive pressure**: Without domain-specific guidance, the agent flags ~590/600 traces as suspicious (many benign virology traces look dual-use). With stronger bio-specific prompting that reduces false positives, the agent becomes too conservative and misses campaign traces. This precision-recall tradeoff is harder to navigate for bio than cyber.
+At bg=20×, the agent provides substantial lift (AUROC 0.59 → 0.84, AP 0.13 → 0.57). At bg=100×, the agent does not improve over per-prompt scoring. This suggests that at extreme dilution (6/600 = 1%), the bio campaigns are harder to detect than cyber campaigns — likely because bio decomposition steps (e.g., individual protein purification procedures) blend more naturally with the benign WMDP bio background.
 
 ### Key Findings
 
