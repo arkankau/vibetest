@@ -4284,6 +4284,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pre-cluster",
+        action="store_true",
+        help=(
+            "Precompute clusters.json for safety case repos using the same embedding, clustering, "
+            "and topic-labeling workflow as distributed-misuse."
+        ),
+    )
+    parser.add_argument(
         "--scorer-model",
         type=str,
         default="openai/gpt-5-mini",
@@ -4724,6 +4732,15 @@ def main() -> None:
         print("Running initial per-trace scoring...")
         _run_initial_trace_scoring(all_cases, model=args.model)
         print("Initial scoring complete.")
+        print("Running trace embedding and clustering...")
+        _run_trace_embedding_and_clustering(
+            all_cases, strategy=args.distributed_misuse_clustering_strategy,
+        )
+        print("Clustering complete.")
+        print("Labeling cluster topics...")
+        _run_cluster_topic_labeling(all_cases)
+        print("Topic labeling complete.")
+    elif args.pre_cluster:
         print("Running trace embedding and clustering...")
         _run_trace_embedding_and_clustering(
             all_cases, strategy=args.distributed_misuse_clustering_strategy,
