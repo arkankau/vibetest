@@ -304,7 +304,7 @@ def plot_results(results: dict, output_dir: str = "results") -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Bayesian Detection (ImpossibleBench)")
-    parser.add_argument("--trace-repo", default="results/safety/trace_repos/safety_impossiblebench")
+    parser.add_argument("--trace-repo", default="results/safety/trace_repos/safety_patronus_trace")
     parser.add_argument("--scorer-model", default="gpt-4o-mini")
     parser.add_argument("--max-cases", type=int, default=None)
     parser.add_argument("--max-workers", type=int, default=16)
