@@ -69,4 +69,23 @@ python experiments/safety.py \
 
 ## Results
 
-_Pending — awaiting correct ImpossibleBench dataset._
+### Buffer Defense (gpt-5.4-mini, n=50, m=4, replace merge)
+
+Data: PatronusAI/trace-dataset (517 traces: 249 benign, 268 positive). 50 cases, 4 traces/case, 50% positive rate.
+
+**Case-level classification:**
+
+| Metric | Value |
+|--------|-------|
+| Accuracy | 0.660 (33/50) |
+| Predicted positive | 26/50 (GT: 25/50) |
+| Verified accuracy | 0.360 |
+
+**Trace-level scores:**
+
+| Metric | Value |
+|--------|-------|
+| AUROC (macro) | **0.778±0.28** |
+| AP (macro) | **0.873±0.21** |
+
+The buffer defense achieves meaningful case-level classification (66% accuracy, close to the GT positive rate) and strong trace-level discrimination. The high AP (0.873) indicates that per-trace scoring combined with buffer-level re-evaluation effectively identifies positive traces.
