@@ -67,31 +67,35 @@ python experiments/safety.py \
 
 ## Results
 
-### Buffer Defense (Qwen3.5-397B, n=25, m=4)
+### Method Comparison
+
+Trace-level AUROC and AP (macro-averaged over cases), 50 cases, 4 traces/case, 50% positive rate.
+
+| Method | Stage 1 Model | Stage 2 | AUROC | AP |
+|--------|---------------|---------|------:|---:|
+| Raw monitor scores | gpt-4o-mini | — | 0.772 | 0.772 |
+| Bayesian calibration (LOO) | gpt-4o-mini | local | 0.759 | 0.752 |
+| **Buffer defense (max-merge)** | Qwen3.5-397B | Qwen3.5-397B | **0.885** | **0.917** |
+| **Buffer defense (replace)** | Qwen3.5-397B | Qwen3.5-397B | **0.885** | **0.917** |
+
+The buffer defense substantially outperforms both the raw monitor baseline and Bayesian calibration at the trace level. The improvement comes from the Stage 2 LLM re-evaluating all 4 traces in context, allowing it to calibrate scores relative to each other.
+
+### Buffer Defense Details (Qwen3.5-397B, n=25, m=4)
 
 **Case-level classification:**
 
 | Metric | Value |
 |--------|-------|
 | Accuracy | 0.520 (13/25) |
-| True positives | 0 |
-| True negatives | 13 |
-| False negatives | 12 |
-| False positives | 0 |
-| Precision | 0.000 |
-| Recall | 0.000 |
+| TP / FP / FN / TN | 0 / 0 / 12 / 13 |
+| Precision / Recall | 0.000 / 0.000 |
 
-The buffer always predicts PASS (no sabotage), so accuracy equals the negative rate (13/25).
+The buffer always predicts PASS (no sabotage), so accuracy equals the negative rate (13/25). The binary verdict fails despite strong trace-level scores — the signal is in the continuous scores, not the verdict.
 
-**Trace-level scores:**
+The merge strategy (max-merge vs replace) makes no difference because all traces are in the buffer (buffer_size=4 = traces_per_case).
 
-| Metric | max-merge | replace |
-|--------|-----------|---------|
-| AUROC (macro) | **0.885±0.17** | **0.885±0.17** |
-| AP (macro) | **0.917±0.19** | **0.917±0.19** |
+### Analysis
 
-Despite the binary verdict failing, the continuous per-trace scores are highly discriminative. The combination of per-trace scoring (`MLE_SABOTAGE_PER_TRACE_PROMPT`) and buffer-level score revision effectively separates sabotage traces from clean ones — the signal is in the scores, not the verdict.
+Sabotage behavior (unauthorized file modifications, backdoor insertion, hidden functionality) is more detectable from truncated transcripts than reward hacking or distributed misuse, likely because sabotage actions are inherently anomalous relative to the stated task. The per-trace LLM monitor is already highly discriminative (regular traces: mean score 0.376, aware traces: mean score 0.625), and the buffer's in-context comparison amplifies this separation.
 
-The merge strategy (max-merge vs replace) makes no difference here because all traces are in the buffer (buffer_size=4 = traces_per_case).
-
-Sabotage behavior (unauthorized file modifications, backdoor insertion, hidden functionality) is more detectable from truncated transcripts than reward hacking or distributed misuse, likely because sabotage actions are inherently anomalous relative to the stated task.
+The Bayesian framework from [Wen et al. (2024)](https://arxiv.org/abs/2411.17693) adds little value here because the monitor is already well-calibrated — see `results/bayesian_sabotage_results.md` for full Bayesian analysis.
