@@ -38,6 +38,7 @@ CaseData = _mod.CaseData
 Hypothesis = _mod.Hypothesis
 ReferenceDistribution = _mod.ReferenceDistribution
 compute_metrics = _mod.compute_metrics
+compute_extended_metrics = _mod.compute_extended_metrics
 load_case_from_disk = _mod.load_case_from_disk
 load_dataset = _mod.load_dataset
 run_loo_evaluation = _mod.run_loo_evaluation
@@ -806,3 +807,132 @@ class TestDetectionQuality:
         assert metrics["macro_auroc"] > 0.45, (
             f"LOO AUROC {metrics['macro_auroc']:.3f} should be above random"
         )
+
+
+# ---------------------------------------------------------------------------
+# Extended metrics (threshold sweep + benign-only analysis)
+# ---------------------------------------------------------------------------
+
+class TestExtendedMetrics:
+    """Tests for compute_extended_metrics."""
+
+    @pytest.fixture
+    def mixed_dataset(self):
+        """Dataset with both positive and benign-only cases."""
+        random.seed(123)
+        cases = []
+        # 5 positive cases
+        for i in range(5):
+            n = 20
+            tids = [f"traces/trace_{j:03d}.txt" for j in range(n)]
+            mal = {tids[0], tids[1]}  # 2 malicious per case
+            scores = {}
+            for tid in tids:
+                if tid in mal:
+                    scores[tid] = random.uniform(0.5, 0.9)
+                else:
+                    scores[tid] = random.uniform(0.0, 0.2)
+            cases.append(CaseData(
+                case_id=f"case_pos_{i:04d}",
+                trace_ids=tids,
+                monitor_scores=scores,
+                gt_malicious=mal,
+            ))
+        # 5 benign-only cases
+        for i in range(5):
+            n = 20
+            tids = [f"traces/trace_{j:03d}.txt" for j in range(n)]
+            scores = {tid: random.uniform(0.0, 0.15) for tid in tids}
+            cases.append(CaseData(
+                case_id=f"case_ben_{i:04d}",
+                trace_ids=tids,
+                monitor_scores=scores,
+                gt_malicious=set(),
+            ))
+        return cases
+
+    @pytest.fixture
+    def scored_mixed(self, mixed_dataset):
+        """Use raw monitor scores as scored output."""
+        return {c.case_id: dict(c.monitor_scores) for c in mixed_dataset}
+
+    def test_includes_base_keys(self, mixed_dataset, scored_mixed):
+        """Extended metrics include all keys from base compute_metrics."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        for key in ("macro_auroc", "macro_ap", "micro_auroc", "micro_ap", "n_cases", "per_case"):
+            assert key in ext, f"Missing base key: {key}"
+        assert "threshold_metrics" in ext
+        assert "benign_only" in ext
+        assert "n_positive_cases" in ext
+        assert "n_benign_cases" in ext
+
+    def test_benign_cases_identified(self, mixed_dataset, scored_mixed):
+        """Should correctly count positive and benign-only cases."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        assert ext["n_positive_cases"] == 5
+        assert ext["n_benign_cases"] == 5
+
+    def test_threshold_sweep_length(self, mixed_dataset, scored_mixed):
+        """Default threshold sweep produces 9 entries."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        assert len(ext["threshold_metrics"]) == 9
+        thresholds = [m["threshold"] for m in ext["threshold_metrics"]]
+        assert thresholds == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+    def test_custom_thresholds(self, mixed_dataset, scored_mixed):
+        """Custom thresholds are respected."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed, thresholds=[0.3, 0.7])
+        assert len(ext["threshold_metrics"]) == 2
+        assert ext["threshold_metrics"][0]["threshold"] == 0.3
+        assert ext["threshold_metrics"][1]["threshold"] == 0.7
+
+    def test_monotonic_trace_fpr(self, mixed_dataset, scored_mixed):
+        """Higher threshold → lower or equal trace FPR (monotonically non-increasing)."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        fprs = [m["trace_fpr"] for m in ext["threshold_metrics"]]
+        for i in range(len(fprs) - 1):
+            assert fprs[i] >= fprs[i + 1], (
+                f"FPR not monotonic: {fprs[i]:.4f} < {fprs[i+1]:.4f} "
+                f"at thresholds {ext['threshold_metrics'][i]['threshold']} → "
+                f"{ext['threshold_metrics'][i+1]['threshold']}"
+            )
+
+    def test_monotonic_case_fpr(self, mixed_dataset, scored_mixed):
+        """Higher threshold → lower or equal case-level FPR."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        fprs = [m["case_fpr"] for m in ext["threshold_metrics"]]
+        for i in range(len(fprs) - 1):
+            assert fprs[i] >= fprs[i + 1]
+
+    def test_case_classification_at_zero(self, mixed_dataset, scored_mixed):
+        """At threshold 0.0 + epsilon, all cases flagged (all have score > 0)."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed, thresholds=[0.001])
+        tm = ext["threshold_metrics"][0]
+        # All cases should be flagged at a very low threshold
+        assert tm["case_tp"] + tm["case_fp"] == 10
+
+    def test_benign_only_analysis(self, mixed_dataset, scored_mixed):
+        """Benign-only stats have correct structure and case counts."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        for bo in ext["benign_only"]:
+            assert bo["n_benign_cases"] == 5
+            assert 0 <= bo["fpr"] <= 1.0
+            assert bo["n_flagged"] <= bo["n_benign_cases"]
+            assert bo["mean_max_score"] >= 0.0
+            assert bo["max_max_score"] >= bo["mean_max_score"]
+
+    def test_benign_only_high_threshold_low_fpr(self, mixed_dataset, scored_mixed):
+        """At high thresholds, benign-only cases should rarely be flagged."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        # Benign cases have scores in [0, 0.15], so threshold 0.2 should flag none
+        bo_at_02 = [b for b in ext["benign_only"] if b["threshold"] == 0.2][0]
+        assert bo_at_02["n_flagged"] == 0
+
+    def test_confusion_matrix_sums(self, mixed_dataset, scored_mixed):
+        """TP + FP + TN + FN should equal total cases/traces."""
+        ext = compute_extended_metrics(mixed_dataset, scored_mixed)
+        total_traces = sum(len(c.trace_ids) for c in mixed_dataset)
+        total_cases = 10
+        for tm in ext["threshold_metrics"]:
+            assert tm["trace_tp"] + tm["trace_fp"] + tm["trace_tn"] + tm["trace_fn"] == total_traces
+            assert tm["case_tp"] + tm["case_fp"] + tm["case_tn"] + tm["case_fn"] == total_cases

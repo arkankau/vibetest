@@ -75,8 +75,9 @@ Trace-level AUROC and AP (macro-averaged over cases), 50 cases, 4 traces/case, 5
 |--------|---------------|---------|------:|---:|
 | Raw monitor scores | gpt-4o-mini | — | 0.772 | 0.772 |
 | Bayesian calibration (LOO) | gpt-4o-mini | local | 0.759 | 0.752 |
-| **Buffer defense (max-merge)** | Qwen3.5-397B | Qwen3.5-397B | **0.885** | **0.917** |
-| **Buffer defense (replace)** | Qwen3.5-397B | Qwen3.5-397B | **0.885** | **0.917** |
+| Buffer defense (max-merge) | Qwen3.5-397B | Qwen3.5-397B | 0.885 | 0.917 |
+| Buffer defense (replace) | Qwen3.5-397B | Qwen3.5-397B | 0.885 | 0.917 |
+| **Buffer defense (replace)** | **gpt-5.4-mini** | **gpt-5.4-mini** | **0.972** | **0.972** |
 | Agent (VibeTest) | Qwen3.5-397B | Qwen3.5-397B (tool use) | _pending_ | _pending_ |
 
 The buffer defense substantially outperforms both the raw monitor baseline and Bayesian calibration at the trace level. The improvement comes from the Stage 2 LLM re-evaluating all 4 traces in context, allowing it to calibrate scores relative to each other.

@@ -944,3 +944,167 @@ def compute_metrics(
         "n_cases": len(per_case_auroc),
         "per_case": per_case_details,
     }
+
+
+def compute_extended_metrics(
+    cases: list[CaseData],
+    scored: dict[str, dict[str, float]],
+    thresholds: list[float] | None = None,
+) -> dict[str, Any]:
+    """Compute AUROC/AP metrics plus threshold sweep and benign-only analysis.
+
+    Extends ``compute_metrics`` with:
+    - Threshold sweep: trace-level FPR/TPR, case-level FPR/TPR/accuracy/F1
+    - Benign-only case analysis: flagged count, mean/max score at each threshold
+    - Case-level classification: a case is "positive" if max(trace_scores) >= threshold
+
+    Parameters
+    ----------
+    cases : list[CaseData]
+        Evaluation cases with ground-truth labels.
+    scored : dict[str, dict[str, float]]
+        ``{case_id: {trace_id: posterior_score}}``.
+    thresholds : list[float] | None
+        Thresholds to evaluate.  Defaults to [0.1, 0.2, ..., 0.9].
+
+    Returns
+    -------
+    dict
+        Everything from ``compute_metrics`` plus ``threshold_metrics`` and
+        ``benign_only`` sections.
+    """
+    # Start with base metrics
+    base = compute_metrics(cases, scored)
+
+    if thresholds is None:
+        thresholds = [round(0.1 * i, 1) for i in range(1, 10)]
+
+    # Partition cases
+    positive_cases: list[CaseData] = []
+    benign_cases: list[CaseData] = []
+    for case in cases:
+        if case.case_id not in scored:
+            continue
+        gt = case.gt_malicious or set()
+        if len(gt) > 0:
+            positive_cases.append(case)
+        else:
+            benign_cases.append(case)
+
+    # Collect per-case max scores
+    case_max_scores: dict[str, float] = {}
+    case_is_positive: dict[str, bool] = {}
+    for case in cases:
+        if case.case_id not in scored:
+            continue
+        case_scores = scored[case.case_id]
+        gt = case.gt_malicious or set()
+        scores_list = [case_scores.get(tid, 0.0) for tid in case.trace_ids]
+        case_max_scores[case.case_id] = max(scores_list) if scores_list else 0.0
+        case_is_positive[case.case_id] = len(gt) > 0
+
+    # Collect all trace-level labels and scores
+    all_y_true: list[int] = []
+    all_y_score: list[float] = []
+    for case in cases:
+        if case.case_id not in scored:
+            continue
+        case_scores = scored[case.case_id]
+        gt = case.gt_malicious or set()
+        for tid in case.trace_ids:
+            all_y_true.append(1 if tid in gt else 0)
+            all_y_score.append(case_scores.get(tid, 0.0))
+
+    # Threshold sweep
+    threshold_metrics: list[dict[str, Any]] = []
+    for thresh in thresholds:
+        # Trace-level FPR/TPR
+        tp = fp = tn = fn = 0
+        for label, score in zip(all_y_true, all_y_score):
+            pred = 1 if score >= thresh else 0
+            if label == 1 and pred == 1:
+                tp += 1
+            elif label == 0 and pred == 1:
+                fp += 1
+            elif label == 0 and pred == 0:
+                tn += 1
+            else:
+                fn += 1
+
+        trace_tpr = tp / max(tp + fn, 1)
+        trace_fpr = fp / max(fp + tn, 1)
+
+        # Case-level classification
+        case_tp = case_fp = case_tn = case_fn = 0
+        for cid, max_s in case_max_scores.items():
+            pred_pos = max_s >= thresh
+            actual_pos = case_is_positive[cid]
+            if actual_pos and pred_pos:
+                case_tp += 1
+            elif not actual_pos and pred_pos:
+                case_fp += 1
+            elif not actual_pos and not pred_pos:
+                case_tn += 1
+            else:
+                case_fn += 1
+
+        n_cases_total = case_tp + case_fp + case_tn + case_fn
+        case_tpr = case_tp / max(case_tp + case_fn, 1)
+        case_fpr = case_fp / max(case_fp + case_tn, 1)
+        case_acc = (case_tp + case_tn) / max(n_cases_total, 1)
+        case_precision = case_tp / max(case_tp + case_fp, 1)
+        case_recall = case_tpr
+        case_f1 = (
+            2 * case_precision * case_recall / max(case_precision + case_recall, 1e-15)
+        )
+
+        threshold_metrics.append({
+            "threshold": thresh,
+            "trace_tpr": trace_tpr,
+            "trace_fpr": trace_fpr,
+            "trace_tp": tp,
+            "trace_fp": fp,
+            "trace_tn": tn,
+            "trace_fn": fn,
+            "case_tpr": case_tpr,
+            "case_fpr": case_fpr,
+            "case_accuracy": case_acc,
+            "case_f1": case_f1,
+            "case_precision": case_precision,
+            "case_tp": case_tp,
+            "case_fp": case_fp,
+            "case_tn": case_tn,
+            "case_fn": case_fn,
+        })
+
+    # Benign-only case analysis
+    benign_only_stats: list[dict[str, Any]] = []
+    for thresh in thresholds:
+        flagged = 0
+        max_scores: list[float] = []
+        mean_scores: list[float] = []
+        for case in benign_cases:
+            case_scores = scored[case.case_id]
+            scores_list = [case_scores.get(tid, 0.0) for tid in case.trace_ids]
+            mx = max(scores_list) if scores_list else 0.0
+            mn = sum(scores_list) / len(scores_list) if scores_list else 0.0
+            max_scores.append(mx)
+            mean_scores.append(mn)
+            if mx >= thresh:
+                flagged += 1
+
+        benign_only_stats.append({
+            "threshold": thresh,
+            "n_benign_cases": len(benign_cases),
+            "n_flagged": flagged,
+            "fpr": flagged / max(len(benign_cases), 1),
+            "mean_max_score": sum(max_scores) / len(max_scores) if max_scores else 0.0,
+            "max_max_score": max(max_scores) if max_scores else 0.0,
+            "mean_mean_score": sum(mean_scores) / len(mean_scores) if mean_scores else 0.0,
+        })
+
+    base["threshold_metrics"] = threshold_metrics
+    base["benign_only"] = benign_only_stats
+    base["n_positive_cases"] = len(positive_cases)
+    base["n_benign_cases"] = len(benign_cases)
+    return base

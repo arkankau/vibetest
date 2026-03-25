@@ -2151,6 +2151,31 @@ def _run_cluster_topic_labeling(
     asyncio.run(_label_clusters_parallel(cases, model_name=model))
 
 
+def _run_bayesian_boost_prescoring(
+    cases: list[ImpossibleBenchCase],
+) -> None:
+    """Run Bayesian LOO pre-scoring and write per-case bayesian_scores.json.
+
+    Derives the trace repo directory from the case repo paths and delegates to
+    ``bayesian_loo_scorer.run_bayesian_loo_scoring`` which implements the exact
+    same LOO + cluster-enhanced Bayesian detector used in the standalone
+    experiments.
+    """
+    from vibetest.baselines.bayesian_loo_scorer import run_bayesian_loo_scoring
+
+    # Derive unique trace repo dirs from case paths.
+    # repo_path is e.g. .../trace_repos/<repo>/distributed-misuse-sets/case_0000
+    # The trace repo dir is the grandparent of the sets dir.
+    trace_repo_dirs: dict[str, Path] = {}
+    for case in cases:
+        repo_dir = case.repo_path.parent.parent
+        trace_repo_dirs[str(repo_dir)] = repo_dir
+
+    for repo_dir in trace_repo_dirs.values():
+        print(f"  Bayesian LOO scoring: {repo_dir.name}")
+        run_bayesian_loo_scoring(repo_dir)
+
+
 def _materialize_distributed_misuse_cases(
     *,
     dataset_name: str,
@@ -4250,6 +4275,15 @@ def _parse_args() -> argparse.Namespace:
         help="Clustering strategy: silhouette (default), high_k (k=n/10), coherence (k=n/8 + coherence).",
     )
     parser.add_argument(
+        "--bayesian-boost",
+        action="store_true",
+        help=(
+            "Run Bayesian LOO pre-scoring before the agent. Writes bayesian_scores.json "
+            "and bayesian_meta.json per case for the agent to discover via its tools. "
+            "Only applicable to distributed-misuse mode."
+        ),
+    )
+    parser.add_argument(
         "--scorer-model",
         type=str,
         default="openai/gpt-5-mini",
@@ -4416,6 +4450,8 @@ def main() -> None:
 
     if args.safety_mode != "distributed-misuse" and args.distributed_misuse_data_path is not None:
         raise SystemExit("--distributed-misuse-data-path is only valid for --safety-mode distributed-misuse.")
+    if args.safety_mode != "distributed-misuse" and args.bayesian_boost:
+        raise SystemExit("--bayesian-boost is only valid for --safety-mode distributed-misuse.")
     if args.safety_mode != "impossiblebench" and args.impossiblebench_hard_positives_from_judge:
         raise SystemExit("--impossiblebench-hard-positives-from-judge is only valid for --safety-mode impossiblebench.")
     if args.safety_mode != "mle-sabotage" and args.mle_sabotage_hard_split_from_judge:
@@ -4696,6 +4732,11 @@ def main() -> None:
         print("Labeling cluster topics...")
         _run_cluster_topic_labeling(all_cases)
         print("Topic labeling complete.")
+
+        if args.bayesian_boost:
+            print("Running Bayesian LOO pre-scoring (bayesian-boost)...")
+            _run_bayesian_boost_prescoring(all_cases)
+            print("Bayesian boost pre-scoring complete.")
 
     if args.method in {"judge", "both"}:
         run_impossiblebench_judge(
