@@ -117,17 +117,10 @@ SETTINGS = {
         "traces_per_case": 600,
         "loader": "dm",
         "agent_results": "results/dm_cyber_d6_bg100_qwen35_n50.jsonl",
+        "bayesian_boost_agent_results": "results/safety_dm_cyber_d6_bg100_qwen35_bayesian_boost_AT-Qwen3.5-397B-A17B-FP8.jsonl",
         "methods": {
             "initial_scores": {"desc": "Raw monitor scores", "mode": "raw"},
-            "bayesian_default": {
-                "desc": "Bayesian default (LOO)",
-                "mode": "loo",
-                "kwargs": {
-                    "bucket_size": 0.1, "smoothing": 1.0,
-                    "n_bootstraps": 5, "prior_benign": 0.5,
-                    "use_cluster_features": False,
-                },
-            },
+            "agent": {"desc": "Agent pipeline (safety.py)", "mode": "agent"},
             "bayesian_cluster": {
                 "desc": "Bayesian + clusters (LOO)",
                 "mode": "loo",
@@ -136,6 +129,14 @@ SETTINGS = {
                     "n_bootstraps": 5, "prior_benign": 0.5,
                     "use_cluster_features": True,
                 },
+            },
+            "bayesian_boost_agent": {
+                "desc": "Agent w/ Bayesian boost (safety.py --bayesian-boost)",
+                "mode": "bayesian_boost_agent",
+            },
+            "max_merge": {
+                "desc": "max(initial, bayesian, agent) post-hoc",
+                "mode": "max_merge",
             },
             "bayesian_unsupervised": {
                 "desc": "Unsupervised Bayesian",
@@ -155,17 +156,10 @@ SETTINGS = {
         "traces_per_case": 600,
         "loader": "dm",
         "agent_results": "results/dm_bio_d6_bg100_qwen35_v4_n50.jsonl",
+        "bayesian_boost_agent_results": "results/safety_dm_bio_d6_bg100_qwen35_bayesian_boost_AT-Qwen3.5-397B-A17B-FP8.jsonl",
         "methods": {
             "initial_scores": {"desc": "Raw monitor scores", "mode": "raw"},
-            "bayesian_default": {
-                "desc": "Bayesian default (LOO)",
-                "mode": "loo",
-                "kwargs": {
-                    "bucket_size": 0.1, "smoothing": 1.0,
-                    "n_bootstraps": 5, "prior_benign": 0.5,
-                    "use_cluster_features": False,
-                },
-            },
+            "agent": {"desc": "Agent pipeline (safety.py)", "mode": "agent"},
             "bayesian_cluster": {
                 "desc": "Bayesian + clusters (LOO)",
                 "mode": "loo",
@@ -174,6 +168,14 @@ SETTINGS = {
                     "n_bootstraps": 5, "prior_benign": 0.5,
                     "use_cluster_features": True,
                 },
+            },
+            "bayesian_boost_agent": {
+                "desc": "Agent w/ Bayesian boost (safety.py --bayesian-boost)",
+                "mode": "bayesian_boost_agent",
+            },
+            "max_merge": {
+                "desc": "max(initial, bayesian, agent) post-hoc",
+                "mode": "max_merge",
             },
             "bayesian_unsupervised": {
                 "desc": "Unsupervised Bayesian",
@@ -265,10 +267,20 @@ def run_method(
     method_cfg: dict,
     cases: list[CaseData],
     setting_cfg: dict,
+    scored_cache: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> dict[str, dict[str, float]]:
-    """Run a single detection method and return scored dict."""
+    """Run a single detection method and return scored dict.
+
+    Parameters
+    ----------
+    scored_cache : dict
+        Cache of already-computed scores keyed by method_key, used by
+        composite methods (max_merge) to avoid re-computation.
+    """
     mode = method_cfg["mode"]
     kwargs = method_cfg.get("kwargs", {})
+    if scored_cache is None:
+        scored_cache = {}
 
     if mode == "raw":
         return {c.case_id: dict(c.monitor_scores) for c in cases}
@@ -276,6 +288,31 @@ def run_method(
     elif mode == "agent":
         agent_path = setting_cfg.get("agent_results", "")
         return load_agent_results(agent_path)
+
+    elif mode == "bayesian_boost_agent":
+        bb_path = setting_cfg.get("bayesian_boost_agent_results", "")
+        return load_agent_results(bb_path)
+
+    elif mode == "max_merge":
+        # Three-way max-merge: max(initial, bayesian_cluster, agent) per trace.
+        # Uses cached scores from prior method runs when available.
+        raw_scored = scored_cache.get("initial_scores") or {
+            c.case_id: dict(c.monitor_scores) for c in cases
+        }
+        bayesian_scored = scored_cache.get("bayesian_cluster", {})
+        agent_scored = scored_cache.get("agent", {})
+
+        merged: dict[str, dict[str, float]] = {}
+        for case in cases:
+            cid = case.case_id
+            case_merged: dict[str, float] = {}
+            for tid in case.trace_ids:
+                s_raw = raw_scored.get(cid, {}).get(tid, 0.0)
+                s_bay = bayesian_scored.get(cid, {}).get(tid, 0.0)
+                s_agt = agent_scored.get(cid, {}).get(tid, 0.0)
+                case_merged[tid] = max(s_raw, s_bay, s_agt)
+            merged[cid] = case_merged
+        return merged
 
     elif mode == "calibrated_loo":
         return run_calibrated_loo(cases, calibrator_kwargs=kwargs)
@@ -345,7 +382,9 @@ def run_setting(
         "methods": {},
     }
 
-    # Run each method
+    # Run each method, caching scored dicts for composite methods (max_merge)
+    scored_cache: dict[str, dict[str, dict[str, float]]] = {}
+
     for method_key, method_cfg in cfg["methods"].items():
         print(f"\n  [{method_key}] {method_cfg['desc']}...")
         random.seed(42)
@@ -353,7 +392,10 @@ def run_setting(
         t0 = time.time()
 
         try:
-            scored = run_method(method_key, method_cfg, cases, cfg)
+            scored = run_method(method_key, method_cfg, cases, cfg, scored_cache)
+
+            # Cache for composite methods
+            scored_cache[method_key] = scored
 
             # Filter cases to those that were scored
             scored_cases = [c for c in cases if c.case_id in scored]
