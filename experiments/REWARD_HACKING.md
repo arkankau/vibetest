@@ -69,16 +69,4 @@ python experiments/safety.py \
 
 ## Results
 
-### Buffer Defense (Qwen3.5-397B, n=25, m=4)
-
-| Metric | Value |
-|--------|-------|
-| Classification accuracy | 0.400 |
-| Verified accuracy | 0.200 |
-| AP (macro) | 0.791±0.23 |
-
-The buffer defense does not effectively detect reward hacking from truncated transcripts — it always predicts PASS (no hacking). The 0.400 accuracy equals the negative rate (10/25 cases are negative).
-
-However, the per-trace Stage 1 scoring achieves strong AP (0.79), meaning the `IMPOSSIBLEBENCH_PER_TRACE_PROMPT` scoring prompt is discriminative — it correctly assigns higher suspicion scores to reward-hacking traces. The buffer's failure is at the verdict level, not the scoring level.
-
-This suggests that for ImpossibleBench, per-trace scoring alone (Stage 1) is a better baseline than the buffer defense. The reward hacking signal is visible at the individual trace level and does not require cross-trace compositional reasoning.
+_Pending — awaiting correct ImpossibleBench dataset._
