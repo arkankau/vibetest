@@ -1868,6 +1868,7 @@ async def _run_buffer_defense_case(
     buffer_size: int = 30,
     max_trace_chars: int = 1500,
     buffer_prompt_template: str = "",
+    merge_strategy: str = "max",
 ) -> dict[str, Any]:
     """Run buffer defense on a single case.
 
@@ -1940,10 +1941,17 @@ async def _run_buffer_defense_case(
     # Parse trace scores from response.
     revised_scores = _extract_trace_scores_from_text(raw)
 
-    # Max-merge: final_score = max(initial, buffer_revised).
+    # Merge initial and revised scores.
+    buffer_trace_set = set(t[0] for t in buffer_traces)
     merged_scores = dict(initial_scores)
-    for k, v in revised_scores.items():
-        merged_scores[k] = max(merged_scores.get(k, 0.0), v)
+    if merge_strategy == "replace":
+        # Replace: use revised scores for buffered traces, initial for the rest.
+        for k in buffer_trace_set:
+            merged_scores[k] = revised_scores.get(k, initial_scores.get(k, 0.0))
+    else:
+        # Max-merge: final_score = max(initial, buffer_revised).
+        for k, v in revised_scores.items():
+            merged_scores[k] = max(merged_scores.get(k, 0.0), v)
 
     # Determine predicted trace files (those boosted above a threshold by the buffer).
     predicted_files = []
@@ -1987,6 +1995,7 @@ def run_buffer_defense(
     gt_field_name: str = "distributed_misuse",
     buffer_prompt_template: str = "",
     max_trace_chars: int = 1500,
+    merge_strategy: str = "max",
 ) -> Path:
     """Run stateful buffer defense on all cases.
 
@@ -1997,7 +2006,7 @@ def run_buffer_defense(
     4. Get per-trace revised scores + campaign verdict
     """
     print("=" * 80)
-    print(f"Running buffer defense ({task_name}), buffer_size={buffer_size}")
+    print(f"Running buffer defense ({task_name}), buffer_size={buffer_size}, merge={merge_strategy}")
     print("=" * 80)
 
     async def _run_all() -> list[dict[str, Any]]:
@@ -2011,6 +2020,7 @@ def run_buffer_defense(
                     case, model_name=model, buffer_size=buffer_size,
                     max_trace_chars=max_trace_chars,
                     buffer_prompt_template=buffer_prompt_template,
+                    merge_strategy=merge_strategy,
                 )
 
         await asyncio.gather(*[_run_one(i, c) for i, c in enumerate(cases)])
@@ -3818,6 +3828,17 @@ def _parse_args() -> argparse.Namespace:
         help="Number of top-scoring traces to include in the buffer defense (default: 30).",
     )
     parser.add_argument(
+        "--buffer-merge",
+        type=str,
+        choices=["max", "replace"],
+        default="max",
+        help=(
+            "Score merge strategy for buffer defense. "
+            "'max': final = max(initial, revised) — buffer can only boost. "
+            "'replace': use revised scores for buffered traces, initial for the rest."
+        ),
+    )
+    parser.add_argument(
         "--data-path",
         type=Path,
         default=Path("data/safety/iquest_traj.json"),
@@ -4775,6 +4796,7 @@ def main() -> None:
             gt_field_name=gt_field_name,
             buffer_prompt_template=buf_prompt,
             max_trace_chars=buf_trace_chars,
+            merge_strategy=args.buffer_merge,
         )
 
 

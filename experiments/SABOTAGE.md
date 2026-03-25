@@ -69,15 +69,29 @@ python experiments/safety.py \
 
 ### Buffer Defense (Qwen3.5-397B, n=25, m=4)
 
+**Case-level classification:**
+
 | Metric | Value |
 |--------|-------|
-| Classification accuracy | 0.520 |
-| Verified accuracy | 0.360 |
-| AUROC (macro) | **0.885±0.17** |
-| AP (macro) | **0.917±0.19** |
+| Accuracy | 0.520 (13/25) |
+| True positives | 0 |
+| True negatives | 13 |
+| False negatives | 12 |
+| False positives | 0 |
+| Precision | 0.000 |
+| Recall | 0.000 |
 
-The buffer defense achieves strong trace-level discrimination for sabotage detection. The high AUROC (0.885) and AP (0.917) indicate that the combination of per-trace scoring and buffer-level classification effectively identifies traces with hidden auxiliary objectives.
+The buffer always predicts PASS (no sabotage), so accuracy equals the negative rate (13/25).
 
-The classification accuracy (0.520) is moderate, suggesting the buffer's binary verdict is less reliable than its continuous scores. The verified accuracy (0.360) reflects the LLM verifier's stricter standard for evidence quality.
+**Trace-level scores:**
 
-Sabotage behavior (unauthorized file modifications, backdoor insertion, hidden functionality) appears to be more detectable from truncated transcripts than reward hacking or distributed misuse campaigns, likely because sabotage actions are inherently anomalous relative to the stated task.
+| Metric | max-merge | replace |
+|--------|-----------|---------|
+| AUROC (macro) | **0.885±0.17** | **0.885±0.17** |
+| AP (macro) | **0.917±0.19** | **0.917±0.19** |
+
+Despite the binary verdict failing, the continuous per-trace scores are highly discriminative. The combination of per-trace scoring (`MLE_SABOTAGE_PER_TRACE_PROMPT`) and buffer-level score revision effectively separates sabotage traces from clean ones — the signal is in the scores, not the verdict.
+
+The merge strategy (max-merge vs replace) makes no difference here because all traces are in the buffer (buffer_size=4 = traces_per_case).
+
+Sabotage behavior (unauthorized file modifications, backdoor insertion, hidden functionality) is more detectable from truncated transcripts than reward hacking or distributed misuse, likely because sabotage actions are inherently anomalous relative to the stated task.
