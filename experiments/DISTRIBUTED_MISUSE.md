@@ -112,12 +112,14 @@ Qwen3.5 does not exhibit the bio refusal problem — **zero refusals** across al
 |---------|---|---------|---------|---|
 | **bg=20× (n=20)** | AUROC | 0.59±0.10 | **0.84±0.21** | +0.25 |
 | | AP | 0.13±0.13 | **0.57±0.36** | +0.44 |
-| **bg=100× (n=50)** | AUROC | 0.58±0.14 | **0.58±0.19** | +0.00 |
-| | AP | 0.04±0.05 | **0.07±0.20** | +0.03 |
+| **bg=100× (n=50)** | AUROC | 0.58±0.14 | **0.61±0.19** | +0.03 |
+| | AP | 0.04±0.05 | **0.11±0.22** | +0.07 |
 
 **95% confidence intervals (Qwen3.5, bio):**
 - bg=20×: AUROC 0.84 ± 0.09, AP 0.57 ± 0.16
-- bg=100×: AUROC 0.58 ± 0.05, AP 0.07 ± 0.06
+- bg=100×: AUROC 0.61 ± 0.05, AP 0.11 ± 0.06
+
+The bg=100× bio results use a **two-pass agent strategy** (scan all cluster labels first, then deep-dive into candidates), which improved detection by +0.025 AUROC and +0.032 AP over the single-pass approach.
 
 ![Per-Case Scatter (Bio, bg=100×)](../results/dm_bio_qwen35_bg100_scatter.png)
 
