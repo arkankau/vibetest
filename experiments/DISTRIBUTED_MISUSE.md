@@ -211,6 +211,67 @@ for bg in 2 20 100; do
 done
 ```
 
+### Buffer Defense
+
+The **buffer defense** is a simpler alternative to the full agent pipeline, adapted from the stateful buffer defense in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414). It replaces Stages 2-3 (embed+cluster+agent) with a single in-context LLM call:
+
+1. **Reuse Stage 1** per-prompt scores (`initial_scores.json`)
+2. **Build buffer**: Select top-m most suspicious traces ordered by Stage 1 score
+3. **Single LLM call**: Feed the buffer in-context to an LLM classifier
+4. **Max-merge**: `final_score = max(initial, buffer_revised)`
+
+**Advantages:**
+- No embedding or clustering required — skips the most expensive preprocessing
+- Single LLM call per case vs. multi-turn agent with tool use
+- Estimated 10-100x cheaper per case than the full agent pipeline
+- Same output format — compatible with existing analysis scripts
+
+**Tradeoffs:**
+- No tool use or sandbox — the LLM must reason from truncated trace content only
+- Buffer size is limited by context window — at bg=100x, only top-30 of 600 traces are examined
+- No clustering signal — the LLM must discover campaign structure from raw traces
+
+```bash
+# Run buffer defense
+python experiments/safety.py \
+  --safety-mode distributed-misuse \
+  --distributed-misuse-domain cyber \
+  --distributed-misuse-decomp-level 6 \
+  --distributed-misuse-background-multiplier 100 \
+  --method buffer \
+  --buffer-size 30 \
+  --model "vllm/Qwen/Qwen3.5-397B-A17B-FP8" \
+  --cases 15 \
+  --seed 42
+```
+
+#### Results
+
+| Setting | Model | m | Cls Acc | AUROC | AP |
+|---------|-------|---|---------|-------|-----|
+| **Cyber bg=100×** | Qwen3.5 | 30 | 0.133 | 0.54±0.11 | 0.04±0.06 |
+| **Cyber bg=100×** | Qwen3.5 | 60 | 0.200 | 0.54±0.11 | 0.06±0.10 |
+| **Cyber bg=100×** | gpt-5.4-mini | 30 | **0.933** | **0.75±0.17** | **0.10±0.24** |
+| **Bio bg=100×** | Qwen3.5 | 30 | **0.867** | 0.59±0.15 | 0.06±0.09 |
+| **Bio bg=100×** | Qwen3.5 | 60 | 0.800 | 0.59±0.14 | 0.05±0.05 |
+
+For comparison, the full agent (Stages 1-3) achieves:
+- Cyber bg=100× (Qwen3.5, n=50): AUROC 0.77±0.20, AP 0.38±0.39
+- Bio bg=100× (Qwen3.5, n=50): AUROC 0.61±0.19, AP 0.11±0.22
+- Cyber bg=100× (gpt-5.4-mini, n=15): AUROC 0.85±0.18, AP 0.28±0.33
+
+#### Analysis
+
+The buffer defense is substantially cheaper (single LLM call vs. multi-turn tool-using agent) but performs worse at trace-level discrimination. Key observations:
+
+1. **gpt-5.4-mini outperforms Qwen3.5 on cyber buffer**: gpt-5.4-mini's weaker Stage 1 scores (mostly 0.0) paradoxically help — campaign traces are included in the buffer because nothing outranks them. Qwen3.5's better Stage 1 scoring pushes many benign-but-suspicious traces above the campaign traces, so campaigns don't make it into the top-30 buffer.
+
+2. **Buffer size (m=30 vs m=60) has minimal effect**: The bottleneck is not buffer coverage but the model's ability to identify the narrow campaign subset within a buffer dominated by diverse benign traces.
+
+3. **Bio works better than cyber**: Qwen3.5 detects 87% of bio campaigns (vs 13% cyber). Bio campaigns may have more distinctive vocabulary that stands out even without clustering.
+
+4. **The clustering pipeline is critical**: The agent's embed+cluster stage pre-groups related traces, making it much easier to spot the narrow, coherent campaign cluster. The buffer defense asks the LLM to discover this structure from raw traces — a much harder task at bg=100×.
+
 ## Future Directions
 
 - **Vary decomposition level** to measure how granularity affects detectability
@@ -218,5 +279,4 @@ done
 - **Stronger models** for both Stage 1 and Stage 2
 - **Models without bio content restrictions** for bio domain evaluation
 - **Sub-clustering** large clusters to isolate small campaign groups
-- **Buffer-style Stage 1** with in-context nearest-neighbor examples
 - **Recomposition-weighted coverage** — re-run composition attack on caught traces to measure actual harm reduction

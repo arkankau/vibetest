@@ -33,7 +33,7 @@ def standardized_results_path(
     model_suffix = _model_suffix(model_name)
 
     include_model = model_suffix is not None and (
-        method_slug.upper() == "AT" or method_slug in {"codex"}
+        method_slug.upper() == "AT" or method_slug in {"codex", "buffer"}
     )
     filename = f"{dataset_slug}_{method_slug}"
     if include_model and model_suffix:

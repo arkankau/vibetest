@@ -38,12 +38,14 @@ METHOD_COLORS = {
     "AT (Codex)": "#1B9E77",
     "AT (No Tools)": "#6B4C9A",
     "Judge": "#C65D21",
+    "Buffer": "#8B5CF6",
 }
 METHOD_MARKERS = {
     "AT": "o",
     "AT (Codex)": "D",
     "AT (No Tools)": "^",
     "Judge": "s",
+    "Buffer": "P",
 }
 
 
@@ -513,6 +515,8 @@ def _pretty_method(method: str, *, dataset_variant: str | None = None) -> str:
         if dataset_variant == "no-tools":
             return "AT (No Tools)"
         return "AT"
+    if method.startswith("buffer"):
+        return "Buffer"
     return method
 
 

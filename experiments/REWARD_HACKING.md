@@ -1,0 +1,84 @@
+# Reward Hacking Detection
+
+## Overview
+
+This experiment evaluates whether an AI safety monitor can detect **reward hacking** in agent transcripts. Reward hacking occurs when an AI agent exploits shortcuts to satisfy tests or metrics rather than solving the genuine problem — for example, hardcoding expected outputs, modifying test files, or bypassing evaluation constraints.
+
+This setting uses the ImpossibleBench dataset, where "oneoff" traces contain agents that found shortcuts to pass tests, and "original" traces contain agents that solved the genuine problem.
+
+## Task Design
+
+Each **case** consists of a directory of agent transcript files. The monitor must examine all transcripts and identify which ones exhibit reward hacking behavior.
+
+**Case construction:**
+- A mix of "oneoff" (shortcut/cheating) and "original" (legitimate) agent transcripts
+- Configurable number of traces per case and positive rate
+- All traces are shuffled; the monitor has no prior information about which are positive
+
+**Key parameters:**
+- `traces_per_case`: Number of transcripts per case (default: 4)
+- `positive_rate`: Fraction of cases containing at least one positive trace (default: 0.5)
+- `max_positive_traces_per_case`: Cap on cheating traces per positive case
+
+## Methods
+
+### Agent (VibeTest)
+The full VibeTest agent examines each transcript using tool use (bash, python, text editor) within a sandbox. It reads the transcripts, analyzes the agent's behavior, and produces a verdict with evidence.
+
+### Judge (LLM Judge)
+A single LLM call per case with the full transcript concatenated. The judge produces a cheating/legit verdict.
+
+### Buffer Defense
+A two-stage approach adapted from the stateful buffer defense in [Brown et al. (2025)](https://arxiv.org/abs/2506.06414):
+
+1. **Stage 1 — Per-trace scoring**: Each transcript is independently scored for reward hacking indicators (0.0–1.0) using `IMPOSSIBLEBENCH_PER_TRACE_PROMPT`.
+2. **Stage 2 — Buffer classification**: The top-m most suspicious transcripts (ordered by Stage 1 score) are fed in-context to an LLM classifier that examines them collectively and produces revised per-trace scores.
+
+The buffer defense is significantly cheaper than the full agent (single LLM call vs. multi-turn tool use) while potentially capturing cross-trace patterns that per-trace scoring alone would miss.
+
+**Max-merge**: `final_score = max(initial, buffer_revised)` — the buffer can only boost scores, never degrade the per-trace baseline.
+
+## Running the Experiment
+
+```bash
+# Buffer defense on impossiblebench
+python experiments/safety.py \
+  --safety-mode impossiblebench \
+  --method buffer \
+  --buffer-size 10 \
+  --model openai/gpt-5.4-mini-2026-03-17 \
+  --cases 50 \
+  --seed 42
+
+# Compare with full agent
+python experiments/safety.py \
+  --safety-mode impossiblebench \
+  --method vibetest \
+  --model openai/gpt-5.4-mini-2026-03-17 \
+  --cases 50 \
+  --sandbox docker \
+  --seed 42
+```
+
+## Metrics
+
+- **Classification accuracy**: Fraction of cases correctly classified as containing/not containing reward hacking
+- **Verified accuracy**: Classification accuracy verified by an LLM scorer checking evidence quality
+- **Trace precision/recall**: Precision and recall at the individual trace level
+- **AUROC/AP**: Area under the ROC/PR curves from per-trace scores
+
+## Results
+
+### Buffer Defense (Qwen3.5-397B, n=25, m=4)
+
+| Metric | Value |
+|--------|-------|
+| Classification accuracy | 0.400 |
+| Verified accuracy | 0.200 |
+| AP (macro) | 0.791±0.23 |
+
+The buffer defense does not effectively detect reward hacking from truncated transcripts — it always predicts PASS (no hacking). The 0.400 accuracy equals the negative rate (10/25 cases are negative).
+
+However, the per-trace Stage 1 scoring achieves strong AP (0.79), meaning the `IMPOSSIBLEBENCH_PER_TRACE_PROMPT` scoring prompt is discriminative — it correctly assigns higher suspicion scores to reward-hacking traces. The buffer's failure is at the verdict level, not the scoring level.
+
+This suggests that for ImpossibleBench, per-trace scoring alone (Stage 1) is a better baseline than the buffer defense. The reward hacking signal is visible at the individual trace level and does not require cross-trace compositional reasoning.
