@@ -119,7 +119,7 @@ Qwen3.5 does not exhibit the bio refusal problem — **zero refusals** across al
 - bg=20×: AUROC 0.84 ± 0.09, AP 0.57 ± 0.16
 - bg=100×: AUROC 0.61 ± 0.05, AP 0.11 ± 0.06
 
-The bg=100× bio results use a **two-pass agent strategy** (scan all cluster labels first, then deep-dive into candidates), which improved detection by +0.025 AUROC and +0.032 AP over the single-pass approach.
+The bg=100× bio results use a **two-pass agent strategy** (scan all cluster labels first, then deep-dive into candidates), which improved detection by +0.025 AUROC and +0.032 AP over the single-pass approach. Paired tests across 50 cases (same cases, different prompts): the AUROC improvement is significant by Wilcoxon signed-rank test (p=0.004, 34/50 cases improved) but not by paired t-test (p=0.18); the AP improvement is not significant (Wilcoxon p=0.08).
 
 ![Per-Case Scatter (Bio, bg=100×)](../results/dm_bio_qwen35_bg100_scatter.png)
 
