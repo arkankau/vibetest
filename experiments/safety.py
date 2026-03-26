@@ -4259,17 +4259,18 @@ def main() -> None:
         if args.impossiblebench_oneoff_eval and args.impossiblebench_original_eval:
             pos_eval = args.impossiblebench_oneoff_eval
             neg_eval = args.impossiblebench_original_eval
-        elif args.method == "buffer":
-            # Buffer defense can reuse already-materialized cases; eval files are only
-            # needed if cases must be (re-)materialized from scratch.
-            pos_eval = None  # type: ignore[assignment]
-            neg_eval = None  # type: ignore[assignment]
         else:
-            impossiblebench_data_path = _resolve_impossiblebench_data_path(
-                args.data_path,
-                args.impossiblebench_source_model,
-            )
-            pos_eval, neg_eval = _find_impossiblebench_eval_files(impossiblebench_data_path)
+            # Try to find eval files; if not found, set None and rely on
+            # pre-materialized cases (lenient loader).
+            try:
+                impossiblebench_data_path = _resolve_impossiblebench_data_path(
+                    args.data_path,
+                    args.impossiblebench_source_model,
+                )
+                pos_eval, neg_eval = _find_impossiblebench_eval_files(impossiblebench_data_path)
+            except SystemExit:
+                pos_eval = None  # type: ignore[assignment]
+                neg_eval = None  # type: ignore[assignment]
         default_dataset_name = "safety_impossiblebench"
         if args.impossiblebench_source_model:
             default_dataset_name = (
@@ -4285,11 +4286,12 @@ def main() -> None:
         if args.mle_sabotage_regular_eval and args.mle_sabotage_aware_eval:
             neg_eval = args.mle_sabotage_regular_eval
             pos_eval = args.mle_sabotage_aware_eval
-        elif args.method == "buffer":
-            pos_eval = None  # type: ignore[assignment]
-            neg_eval = None  # type: ignore[assignment]
         else:
-            neg_eval, pos_eval = _find_mle_sabotage_eval_files(args.data_path)
+            try:
+                neg_eval, pos_eval = _find_mle_sabotage_eval_files(args.data_path)
+            except SystemExit:
+                pos_eval = None  # type: ignore[assignment]
+                neg_eval = None  # type: ignore[assignment]
         default_dataset_name = "safety_mle-sabotage"
         pos_label = "aware"
         neg_label = "regular"
@@ -4536,9 +4538,9 @@ def main() -> None:
         print(f"Traces per case: {traces_per_case}")
 
         if args.safety_mode == "impossiblebench":
-            # Buffer defense can reuse existing cases without eval files.
+            # Reuse existing cases without eval files when pos_eval is None.
             # Uses a lenient loader that tolerates [TRUNCATED] traces.
-            if args.method == "buffer" and pos_eval is None:
+            if pos_eval is None:
                 cases_root = (
                     args.trace_repos_dir / materialize_dataset_name / "impossiblebench-sets"
                 )
@@ -4593,7 +4595,7 @@ def main() -> None:
                     sandbox=args.sandbox,
                 )
         elif args.safety_mode == "mle-sabotage":
-            if args.method == "buffer" and pos_eval is None:
+            if pos_eval is None:
                 cases_root = (
                     args.trace_repos_dir / materialize_dataset_name / "mle-sabotage-sets"
                 )
