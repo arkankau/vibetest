@@ -17,6 +17,7 @@ import json
 import random
 import re
 import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -235,6 +236,13 @@ def _normalize_judge_label(value: Any) -> str:
     return ""
 _CASE_SCORE_RE = re.compile(r"CASE_SCORE:\s*([01](?:\.\d+)?|0?\.\d+)\b", re.IGNORECASE)
 _INITIAL_SCORES_FILENAME = "initial_scores.tsv"
+_NO_TOOLS_SUFFIX = "_no_tools"
+_HIDDEN_REPO_ARTIFACT_FILENAMES = {
+    _INITIAL_SCORES_FILENAME,
+    "clusters.json",
+    "bayesian_scores.json",
+    "bayesian_meta.json",
+}
 
 
 @dataclass(frozen=True)
@@ -449,6 +457,10 @@ def _initial_scores_path(repo_path: Path) -> Path:
     return repo_path / _INITIAL_SCORES_FILENAME
 
 
+def _no_tools_dataset_name(dataset_name: str) -> str:
+    return f"{dataset_name}{_NO_TOOLS_SUFFIX}"
+
+
 def _write_initial_trace_scores(
     case: ImpossibleBenchCase,
     case_scores: dict[str, dict[str, Any]],
@@ -546,6 +558,27 @@ def _materialize_initial_trace_scores_from_judge_results(
         f"Materialized initial trace scores for {len(cases)} case(s) from judge results: {judge_results_path}"
     )
     return loaded
+
+
+def _prepare_case_repo_views(
+    *,
+    cases: list[ImpossibleBenchCase],
+    include_analysis_artifacts: bool,
+) -> tuple[dict[str, Path], tempfile.TemporaryDirectory[str] | None]:
+    if include_analysis_artifacts:
+        return {case.case_id: case.repo_path for case in cases}, None
+
+    temp_root = tempfile.TemporaryDirectory(prefix="vibetest_no_tools_")
+    repo_views: dict[str, Path] = {}
+    for case in cases:
+        view_path = Path(temp_root.name) / case.case_id
+        shutil.copytree(case.repo_path, view_path)
+        for filename in _HIDDEN_REPO_ARTIFACT_FILENAMES:
+            artifact_path = view_path / filename
+            if artifact_path.exists():
+                artifact_path.unlink()
+        repo_views[case.case_id] = view_path
+    return repo_views, temp_root
 
 
 def _default_hard_positive_cache_path(
@@ -3217,6 +3250,7 @@ def run_vibetest(
     trace_repos_dir: Path,
     output_path: Path | None,
     safety_analysis_tools: bool,
+    safety_repo_artifacts: bool,
 ) -> Path:
     print("=" * 80)
     print("Running safety experiment: VibeTest")
@@ -3244,10 +3278,11 @@ def run_vibetest(
         static=not dynamic,
         safety_agent=True,
         safety_analysis_tools=safety_analysis_tools,
+        safety_repo_artifacts=safety_repo_artifacts,
     )
     results = agent.execute_tests(test_cases, sandbox=sandbox)
 
-    output_dataset_name = dataset_name if safety_analysis_tools else f"{dataset_name}_no-tools"
+    output_dataset_name = dataset_name if safety_repo_artifacts else _no_tools_dataset_name(dataset_name)
     out_path = output_path or standardized_results_path(
         output_dataset_name,
         "AT",
@@ -3667,45 +3702,53 @@ def run_impossiblebench_vibetest(
     prompt_template: str | None = None,
     gt_field_name: str = "reward_hacking",
     safety_analysis_tools: bool = True,
+    safety_repo_artifacts: bool = True,
     retry_eval_log: str | None = None,
 ) -> Path:
     print("=" * 80)
     print(f"Running safety experiment: case-set VibeTest ({task_name})")
     print("=" * 80)
 
-    judge_results_path = judge_output_path or standardized_results_path(
-        dataset_name,
-        "llmjudge",
-        model_name=model or "openai/gpt-5-mini",
-    )
-    initial_trace_scores = _materialize_initial_trace_scores_from_judge_results(
-        judge_results_path=judge_results_path,
-        cases=cases,
-    )
-    if initial_trace_scores is None:
-        run_impossiblebench_judge(
-            cases,
-            dataset_name=dataset_name,
-            model=model or "openai/gpt-5-mini",
-            max_tokens=judge_max_tokens,
-            temperature=judge_temperature,
-            sandbox=sandbox,
-            scorer_model=scorer_model,
-            scorer_concurrency=scorer_concurrency,
-            output_path=judge_results_path,
-            task_name=task_name,
-            prompt_template=prompt_template,
-            gt_field_name=gt_field_name,
-            property_text=test_description,
+    initial_trace_scores: dict[str, dict[str, float]] = {}
+    if safety_repo_artifacts:
+        judge_results_path = judge_output_path or standardized_results_path(
+            dataset_name,
+            "llmjudge",
+            model_name=model or "openai/gpt-5-mini",
         )
         initial_trace_scores = _materialize_initial_trace_scores_from_judge_results(
             judge_results_path=judge_results_path,
             cases=cases,
         )
         if initial_trace_scores is None:
-            raise SystemExit(
-                f"Failed to load initial trace scores from judge results: {judge_results_path}"
+            run_impossiblebench_judge(
+                cases,
+                dataset_name=dataset_name,
+                model=model or "openai/gpt-5-mini",
+                max_tokens=judge_max_tokens,
+                temperature=judge_temperature,
+                sandbox=sandbox,
+                scorer_model=scorer_model,
+                scorer_concurrency=scorer_concurrency,
+                output_path=judge_results_path,
+                task_name=task_name,
+                prompt_template=prompt_template,
+                gt_field_name=gt_field_name,
+                property_text=test_description,
             )
+            initial_trace_scores = _materialize_initial_trace_scores_from_judge_results(
+                judge_results_path=judge_results_path,
+                cases=cases,
+            )
+            if initial_trace_scores is None:
+                raise SystemExit(
+                    f"Failed to load initial trace scores from judge results: {judge_results_path}"
+                )
+
+    repo_views, repo_views_tempdir = _prepare_case_repo_views(
+        cases=cases,
+        include_analysis_artifacts=safety_repo_artifacts,
+    )
 
     test_cases: list[TestCase] = []
     for case in cases:
@@ -3713,7 +3756,7 @@ def run_impossiblebench_vibetest(
             TestCase(
                 name=f"safety_{case.case_id}",
                 description=test_description,
-                repo_path=case.repo_path,
+                repo_path=repo_views[case.case_id],
                 metadata={
                     "trace_set_id": case.case_id,
                     "trace_files": case.trace_files,
@@ -3726,10 +3769,15 @@ def run_impossiblebench_vibetest(
         static=not dynamic,
         safety_agent=True,
         safety_analysis_tools=safety_analysis_tools,
+        safety_repo_artifacts=safety_repo_artifacts,
     )
-    results = agent.execute_tests(
-        test_cases, sandbox=sandbox, retry_eval_log=retry_eval_log,
-    )
+    try:
+        results = agent.execute_tests(
+            test_cases, sandbox=sandbox, retry_eval_log=retry_eval_log,
+        )
+    finally:
+        if repo_views_tempdir is not None:
+            repo_views_tempdir.cleanup()
 
     rows: list[dict[str, Any]] = []
     for case, result in zip(cases, results):
@@ -3808,7 +3856,7 @@ def run_impossiblebench_vibetest(
         f"classification_accuracy={summary.get('classification_accuracy', 0.0):.3f}, "
         f"verified_accuracy={summary.get('verified_accuracy', 0.0):.3f}"
     )
-    output_dataset_name = dataset_name if safety_analysis_tools else f"{dataset_name}_no-tools"
+    output_dataset_name = dataset_name if safety_repo_artifacts else _no_tools_dataset_name(dataset_name)
     out_path = output_path or standardized_results_path(
         output_dataset_name,
         "AT",
@@ -4022,11 +4070,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--safety-analysis-tools",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Enable the extra safety-analysis tools for VibeTest "
-            "(parallel scanner, embeddings, clustering). Use --no-safety-analysis-tools "
-            "to run AT with only the baseline bash/python/text-editor toolset."
+            "(parallel scanner, embeddings, clustering-query tools). "
+            "By default VibeTest still uses initial_scores.tsv and clusters.json without these extra tools."
+        ),
+    )
+    parser.add_argument(
+        "--no-tools",
+        action="store_true",
+        help=(
+            "Run VibeTest without precomputed safety artifacts such as initial_scores.tsv and "
+            "clusters.json. Results are saved under a _no_tools dataset variant."
         ),
     )
 
@@ -4288,7 +4344,8 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Precompute clusters.json for safety case repos using the same embedding, clustering, "
-            "and topic-labeling workflow as distributed-misuse."
+            "and topic-labeling workflow as distributed-misuse. This is already enabled by "
+            "default for VibeTest unless --no-tools is used."
         ),
     )
     parser.add_argument(
@@ -4365,7 +4422,8 @@ def main() -> None:
                 sandbox=args.sandbox,
                 trace_repos_dir=args.trace_repos_dir,
                 output_path=args.vibetest_output_path,
-                safety_analysis_tools=args.safety_analysis_tools,
+                safety_analysis_tools=vibetest_uses_extra_tools,
+                safety_repo_artifacts=not args.no_tools,
             )
         if args.method == "codex-vibetest":
             run_codex_vibetest(
@@ -4728,6 +4786,33 @@ def main() -> None:
     print("=" * 80)
 
     # Run initial per-trace scoring and embedding+clustering for distributed-misuse mode.
+    if args.pre_cluster and args.method in {"vibetest", "both"} and args.no_tools:
+        print("Ignoring --pre-cluster because --no-tools disables clustering artifacts for VibeTest.")
+    if args.no_tools and args.safety_analysis_tools:
+        print("Ignoring --safety-analysis-tools because --no-tools disables the extra safety-analysis toolset.")
+
+    vibetest_uses_repo_artifacts = (
+        args.method in {"vibetest", "both"} and not args.no_tools
+    )
+    vibetest_uses_extra_tools = (
+        args.method in {"vibetest", "both"} and args.safety_analysis_tools and not args.no_tools
+    )
+
+    should_precluster = (
+        args.safety_mode == "distributed-misuse"
+        or (
+            args.pre_cluster
+            and (
+                args.method not in {"vibetest", "both"}
+                or not args.no_tools
+            )
+        )
+        or (
+            vibetest_uses_repo_artifacts
+            and args.safety_mode in {"impossiblebench", "mle-sabotage", "trace"}
+        )
+    )
+
     if args.safety_mode == "distributed-misuse":
         print("Running initial per-trace scoring...")
         _run_initial_trace_scoring(all_cases, model=args.model)
@@ -4740,7 +4825,7 @@ def main() -> None:
         print("Labeling cluster topics...")
         _run_cluster_topic_labeling(all_cases)
         print("Topic labeling complete.")
-    elif args.pre_cluster:
+    elif should_precluster:
         print("Running trace embedding and clustering...")
         _run_trace_embedding_and_clustering(
             all_cases, strategy=args.distributed_misuse_clustering_strategy,
@@ -4789,7 +4874,8 @@ def main() -> None:
             test_description=vibetest_case_description,
             prompt_template=judge_prompt_template,
             gt_field_name=gt_field_name,
-            safety_analysis_tools=args.safety_analysis_tools,
+            safety_analysis_tools=vibetest_uses_extra_tools,
+            safety_repo_artifacts=not args.no_tools,
             retry_eval_log=args.retry_eval_log,
         )
     if args.method == "codex-vibetest":

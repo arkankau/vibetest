@@ -854,9 +854,11 @@ def _method_label(path: Path) -> str:
 
 def _strip_method_variant(method: str) -> tuple[str, str | None]:
     method_variant: str | None = None
-    if method.endswith("_no-tools"):
-        method_variant = "no-tools"
-        method = method[: -len("_no-tools")]
+    for suffix in ("_no-tools", "_no_tools"):
+        if method.endswith(suffix):
+            method_variant = "no-tools"
+            method = method[: -len(suffix)]
+            break
     return method, method_variant
 
 
@@ -1442,8 +1444,9 @@ def _infer_dataset_and_method_from_file(file_path: str) -> tuple[str, str]:
 
 
 def _split_dataset_variant(dataset: str) -> tuple[str, str | None]:
-    if dataset.endswith("_no-tools"):
-        return dataset[: -len("_no-tools")], "no-tools"
+    for suffix in ("_no-tools", "_no_tools"):
+        if dataset.endswith(suffix):
+            return dataset[: -len(suffix)], "no-tools"
     return dataset, None
 
 
