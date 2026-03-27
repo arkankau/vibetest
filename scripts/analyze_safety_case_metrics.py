@@ -58,7 +58,7 @@ METHOD_HATCHES = {
     "llmjudge": "////",
 }
 # ALLOWED_EVAL_MODELS = {"gpt-5-mini", "gpt-5.4-mini", "gpt-5.4", "Qwen-3.5", "MiniMax-M2.5"}
-ALLOWED_EVAL_MODELS = {"Qwen-3.5"}
+ALLOWED_EVAL_MODELS = {"Qwen-3.5", "gpt-5.4-mini"}
 OVERALL_DATASET_LABELS = {
     # "impossiblebench_gpt-5-mini": "ImpossibleBench",
     "mle-sabotage": "MLE-Sabotage",
@@ -161,41 +161,26 @@ def _bootstrap_mean_ci(
 def _average_precision_from_pairs(pairs: list[tuple[int, float]]) -> float | None:
     if not pairs:
         return None
-    positives = sum(1 for label, _ in pairs if int(label) == 1)
+    values = [(int(label), float(score)) for label, score in pairs]
+    positives = sum(1 for label, _ in values if label == 1)
     if positives <= 0:
         return None
-    ranked = sorted(
-        ((int(label), float(score)) for label, score in pairs),
-        key=lambda item: (-item[1], -item[0]),
-    )
-    tp = 0
+    thresholds = sorted({score for _, score in values}, reverse=True)
     ap_accum = 0.0
-    for rank, (label, _) in enumerate(ranked, start=1):
-        if label != 1:
-            continue
-        tp += 1
-        ap_accum += tp / rank
-    return ap_accum / positives
+    prev_recall = 0.0
+    for thresh in thresholds:
+        predicted = [label for label, score in values if score >= thresh]
+        tp = sum(1 for label in predicted if label == 1)
+        fp = len(predicted) - tp
+        recall = tp / positives
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+        ap_accum += (recall - prev_recall) * precision
+        prev_recall = recall
+    return ap_accum
 
 
 def _average_precision_flat_pairs(pairs: list[tuple[int, float]]) -> float | None:
-    if not pairs:
-        return None
-    positives = sum(1 for label, _ in pairs if int(label) == 1)
-    if positives <= 0:
-        return None
-    ranked = sorted(
-        ((int(label), float(score)) for label, score in pairs),
-        key=lambda item: (-item[1], -item[0]),
-    )
-    tp = 0
-    ap_accum = 0.0
-    for rank, (label, _) in enumerate(ranked, start=1):
-        if label != 1:
-            continue
-        tp += 1
-        ap_accum += tp / rank
-    return ap_accum / positives
+    return _average_precision_from_pairs(pairs)
 
 
 def _case_average_precision(case_pairs: list[list[tuple[int, float]]]) -> float | None:
@@ -2480,6 +2465,18 @@ def _generate_figures(
             dataset_labels=TRACE_SCORE_DATASET_LABELS,
             ylabel="Trace-level AP",
             out_base=figures_dir / "safety_overall_trace_average_precision_by_dataset",
+            formats=formats,
+        )
+    )
+    out_paths.extend(
+        _grouped_overall_metric_bar_plot(
+            rows=trace_ap_rows,
+            metric_key="case_average_precision",
+            metric_low_key="case_average_precision_ci_low",
+            metric_high_key="case_average_precision_ci_high",
+            dataset_labels=TRACE_SCORE_DATASET_LABELS,
+            ylabel="Case-level AP",
+            out_base=figures_dir / "safety_overall_case_average_precision_by_dataset",
             formats=formats,
         )
     )
