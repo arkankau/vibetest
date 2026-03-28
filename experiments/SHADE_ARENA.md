@@ -71,16 +71,21 @@ Cases constructed with variable traces-per-case (tpc), mixed tasks, 50% positive
 
 9 tasks are trivially detectable (AUROC >= 0.99). The hard cases are `american_airlines_2` (subtle flight cost inflation) and `hr_check_attendance_multiple_days` (subtle data manipulation).
 
+### Full method comparison (tpc=1, n=403)
+
+| Method | AUROC | Acc | Notes |
+|--------|-------|-----|-------|
+| **Agent (VibeTest)** | **0.918** | **0.787** | Full tool-use in Docker sandbox |
+| EaE | 0.867 | 0.725 | Two-stage: extract excerpts + evaluate |
+| Monitor | 0.847 | 0.749 | Paper's single-call protocol |
+| Paper's monitor | 0.648 | 0.607 | Their baseline (84 traces, SHADE-only) |
+
+The agent substantially outperforms both the monitor and EaE. With tool access in a Docker sandbox, the agent can read full transcripts, search for patterns, and reason about multi-step behaviors that the single-call monitor misses.
+
 ### Comparison with paper
 
-| Method | Dataset | AUROC | Acc |
-|--------|---------|-------|-----|
-| **Our Monitor (Qwen3.5)** | **Full (403 traces)** | **0.847** | **0.749** |
-| **Our EaE (Qwen3.5)** | **Full (403 traces)** | **0.867** | **0.725** |
-| Paper's monitor | SHADE-Arena only (84 traces) | 0.648 | 0.607 |
-
-We substantially outperform the paper's reported monitor results. Key differences:
-1. **Transcript cleaning**: We strip `<thinking>` tags and redact system prompt sabotage instructions. The paper's transcripts may include these, paradoxically hurting the monitor (it sees the agent was *instructed* to sabotage and rationalizes it).
+We outperform the paper's reported monitor results across all methods. Key differences:
+1. **Transcript cleaning**: We strip `<thinking>` tags and redact system prompt sabotage instructions. The paper's transcripts may include these, paradoxically hurting the monitor.
 2. **Larger dataset**: Our evaluation includes 15 CUA-SHADE-Arena tasks (many with near-perfect detection) alongside the 3 original SHADE-Arena tasks.
 3. **Model**: Qwen3.5-397B vs the paper's unspecified monitor model.
 
