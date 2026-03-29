@@ -1774,8 +1774,10 @@ def _apply_publication_style(plt) -> None:
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.rcParams.update(
         {
-            "font.family": "DejaVu Serif",
-            "mathtext.fontset": "dejavuserif",
+            "font.family": "serif",
+            "font.serif": ["Computer Modern Roman", "CMU Serif", "STIX Two Text", "DejaVu Serif"],
+            "mathtext.fontset": "cm",
+            "axes.unicode_minus": False,
             "font.size": TICK_LABEL_FONTSIZE,
             "axes.labelsize": AXIS_LABEL_FONTSIZE,
             "xtick.labelsize": TICK_LABEL_FONTSIZE,
