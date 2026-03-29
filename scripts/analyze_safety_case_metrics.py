@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from functools import lru_cache
 import json
 import math
 import random
@@ -34,16 +35,22 @@ GRID_ALPHA = 0.55
 SPINE_COLOR = "#666666"
 TEXT_COLOR = "#222222"
 METHOD_COLORS = {
-    "AT": "#0072B2",
-    "AT (Codex)": "#009E73",
-    "AT (No Tools)": "#CC79A7",
-    "Judge": "#D55E00",
+    "Meerkat": "#0072B2",
+    "Meerkat + Max Merge": "#005B8E",
+    "Meerkat (Codex)": "#009E73",
+    "Meerkat (Claude)": "#E69F00",
+    "Naive Agent": "#CC79A7",
+    "Naive Agent + Max Merge": "#9A4F83",
+    "Per-trace Monitor": "#D55E00",
 }
 METHOD_MARKERS = {
-    "AT": "o",
-    "AT (Codex)": "D",
-    "AT (No Tools)": "^",
-    "Judge": "s",
+    "Meerkat": "o",
+    "Meerkat + Max Merge": "D",
+    "Meerkat (Codex)": "D",
+    "Meerkat (Claude)": "P",
+    "Naive Agent": "^",
+    "Naive Agent + Max Merge": "v",
+    "Per-trace Monitor": "s",
 }
 MODEL_COLORS = {
     "gpt-5-mini": "#0072B2",
@@ -55,6 +62,7 @@ MODEL_COLORS = {
 METHOD_HATCHES = {
     "AT": "",
     "AT-codex": "",
+    "AT-claude": "",
     "llmjudge": "////",
 }
 # ALLOWED_EVAL_MODELS = {"gpt-5-mini", "gpt-5.4-mini", "gpt-5.4", "Qwen-3.5", "MiniMax-M2.5"}
@@ -491,6 +499,102 @@ def _roc_curve_from_flat_pairs(pairs: list[tuple[int, float]]) -> list[dict[str,
     return curve
 
 
+def _calibration_from_pairs(
+    pairs: list[tuple[int, float]],
+    *,
+    max_bins: int = 10,
+    min_bin_size: int = 20,
+) -> tuple[list[dict[str, float]], float | None, float | None]:
+    if not pairs:
+        return [], None, None
+
+    normalized: list[tuple[int, float]] = []
+    for label, score in pairs:
+        try:
+            normalized.append((1 if int(label) else 0, max(0.0, min(1.0, float(score)))))
+        except Exception:
+            continue
+    if not normalized:
+        return [], None, None
+
+    total = len(normalized)
+    brier = sum((score - float(label)) ** 2 for label, score in normalized) / total
+    normalized.sort(key=lambda item: item[1])
+    points: list[dict[str, float]] = []
+    ece = 0.0
+    score_rows: list[dict[str, float]] = []
+    idx = 0
+    while idx < len(normalized):
+        score = normalized[idx][1]
+        j = idx + 1
+        positives = int(normalized[idx][0])
+        while j < len(normalized) and normalized[j][1] == score:
+            positives += int(normalized[j][0])
+            j += 1
+        score_rows.append(
+            {
+                "score": score,
+                "count": float(j - idx),
+                "positives": float(positives),
+            }
+        )
+        idx = j
+
+    unique_scores = len(score_rows)
+    max_supported_bins = max(1, len(normalized) // max(1, min_bin_size))
+    bin_count = max(2, min(max_bins, unique_scores, max_supported_bins)) if unique_scores >= 2 else 1
+    bucket_ranges: list[tuple[int, int]] = []
+    for bucket_idx in range(bin_count):
+        start = int(math.floor(bucket_idx * unique_scores / bin_count))
+        end = int(math.floor((bucket_idx + 1) * unique_scores / bin_count))
+        if end <= start:
+            continue
+        bucket_ranges.append((start, end))
+
+    merged = True
+    while merged and len(bucket_ranges) > 1:
+        merged = False
+        for bucket_idx, (start, end) in enumerate(bucket_ranges):
+            count = sum(score_rows[i]["count"] for i in range(start, end))
+            if count >= min_bin_size:
+                continue
+            if bucket_idx == 0:
+                next_start, next_end = bucket_ranges[1]
+                bucket_ranges[1] = (start, next_end)
+                del bucket_ranges[0]
+            else:
+                prev_start, _ = bucket_ranges[bucket_idx - 1]
+                bucket_ranges[bucket_idx - 1] = (prev_start, end)
+                del bucket_ranges[bucket_idx]
+            merged = True
+            break
+
+    for start, end in bucket_ranges:
+        bucket_rows = score_rows[start:end]
+        count = int(sum(row["count"] for row in bucket_rows))
+        if count <= 0:
+            continue
+        positives = int(sum(row["positives"] for row in bucket_rows))
+        mean_score = sum(row["score"] * row["count"] for row in bucket_rows) / count
+        positive_rate = positives / count
+        _, positive_low, positive_high = _wilson_ci(positives, count)
+        score_low = min(float(row["score"]) for row in bucket_rows)
+        score_high = max(float(row["score"]) for row in bucket_rows)
+        ece += (count / total) * abs(positive_rate - mean_score)
+        points.append(
+            {
+                "bin_low": score_low,
+                "bin_high": score_high,
+                "mean_score": mean_score,
+                "positive_rate": positive_rate,
+                "positive_rate_low": positive_low if positive_low is not None else positive_rate,
+                "positive_rate_high": positive_high if positive_high is not None else positive_rate,
+                "count": float(count),
+            }
+        )
+    return points, ece, brier
+
+
 def _f1_from_outcomes(outcomes: list[tuple[bool, bool | None]]) -> float | None:
     tp = fp = fn = 0
     for gt_pos, pred_pos in outcomes:
@@ -849,6 +953,22 @@ def _strip_method_variant(method: str) -> tuple[str, str | None]:
 
 def _split_method_parts(method: str) -> tuple[str, str | None]:
     method = str(method or "").strip()
+    if method.startswith("AT-codex-"):
+        return "AT-codex", method[len("AT-codex-") :] if len(method) > len("AT-codex-") else None
+    if method == "AT-codex":
+        return "AT-codex", None
+    if method.startswith("AT-claude-"):
+        return "AT-claude", method[len("AT-claude-") :] if len(method) > len("AT-claude-") else None
+    if method == "AT-claude":
+        return "AT-claude", None
+    if method.startswith("vibetest-codex-"):
+        return "AT-codex", method[len("vibetest-codex-") :] if len(method) > len("vibetest-codex-") else None
+    if method == "vibetest-codex":
+        return "AT-codex", None
+    if method.startswith("vibetest-claude-"):
+        return "AT-claude", method[len("vibetest-claude-") :] if len(method) > len("vibetest-claude-") else None
+    if method == "vibetest-claude":
+        return "AT-claude", None
     if method.startswith("AT-"):
         return "AT", method[3:] if len(method) > 3 else None
     if method.startswith("llmjudge"):
@@ -864,6 +984,10 @@ def _display_model_name(model: str | None) -> str | None:
     text = str(model or "").strip()
     if not text:
         return None
+    for prefix in ("codex-", "claude-"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
     if text == "MiniMaxAI-MiniMax-M2.5":
         return "MiniMax-M2.5"
     lowered = text.lower()
@@ -890,28 +1014,42 @@ def _pretty_method(
     model = _display_model_name(method_model or model)
     if family == "llmjudge":
         if model:
-            return f"Judge ({model})"
-        return "Judge"
+            return f"Per-trace Monitor ({model})"
+        return "Per-trace Monitor"
 
-    if family == "AT":
-        method_variant_parts = []
-        if dataset_variant == "no-tools" or method_variant == "no-tools":
-            method_variant_parts.append("No Tools")
-
-        if method.startswith("AT-codex-") or method.startswith("AT-codex"):
-            family_name = "AT (Codex)"
-            model = model[len("codex-") :] if model and model.startswith("codex-") else model
-        else:
-            family_name = "AT"
-
-        if method_variant_parts:
-            variant_text = ", ".join(method_variant_parts)
-            if model:
-                return f"{family_name} ({variant_text}, {model})"
-            return f"{family_name} ({variant_text})"
+    if family in {"AT", "AT-codex", "AT-claude"}:
+        family_name = _presentation_method_label(
+            method_base=family,
+            dataset_variant=dataset_variant,
+            method_variant=method_variant,
+        )
         if model:
             return f"{family_name} ({model})"
         return family_name
+
+
+def _presentation_method_label(
+    *,
+    method_base: str | None,
+    dataset_variant: str | None = None,
+    method_variant: str | None = None,
+) -> str:
+    base = str(method_base or "").strip()
+    variant = str(method_variant or "").strip()
+    dataset_variant = str(dataset_variant or "").strip()
+    if base == "llmjudge":
+        return "Per-trace Monitor"
+    if variant == "max-merge":
+        return "Meerkat + Max Merge"
+    if dataset_variant == "no-tools" or variant == "no-tools":
+        return "Naive Agent"
+    if base == "AT-codex":
+        return "Meerkat (Codex)"
+    if base == "AT-claude":
+        return "Meerkat (Claude)"
+    if base == "AT":
+        return "Meerkat"
+    return str(method_base or "Unknown").strip() or "Unknown"
 
     if method_model:
         return f"{family} ({method_model})"
@@ -961,46 +1099,101 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _row_trace_score_pairs(row: dict[str, Any]) -> list[tuple[int, float]]:
+@lru_cache(maxsize=4096)
+def _load_initial_trace_scores_from_repo(repo_path: str) -> dict[str, float]:
+    repo = Path(str(repo_path or "")).expanduser()
+    if not repo:
+        return {}
+    scores_path = repo / "initial_scores.tsv"
+    if not scores_path.is_file():
+        return {}
+    scores: dict[str, float] = {}
+    try:
+        with scores_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 2:
+                    continue
+                trace_ref = _normalize_trace_ref(parts[0])
+                if not trace_ref:
+                    continue
+                try:
+                    score = float(parts[1])
+                except Exception:
+                    continue
+                scores[trace_ref] = max(0.0, min(1.0, score))
+    except OSError:
+        return {}
+    return scores
+
+
+def _row_trace_scores(row: dict[str, Any], *, max_merge: bool = False) -> dict[str, float]:
     tests = row.get("tests") or []
     metadata = (tests[0] or {}).get("metadata") if tests else {}
     if not isinstance(metadata, dict):
         metadata = {}
     raw_scores = metadata.get("trace_scores") or (row.get("scoring") or {}).get("trace_scores") or {}
     if not isinstance(raw_scores, dict):
-        return []
-    gt_positive = {str(x).strip() for x in _ground_truth_positive_trace_files(row) if str(x).strip()}
-    pairs: list[tuple[int, float]] = []
-    seen: set[str] = set()
+        raw_scores = {}
+    scores: dict[str, float] = {}
     for trace_file, raw_score in raw_scores.items():
-        trace_key = str(trace_file).strip()
-        if not trace_key or trace_key in seen:
+        trace_key = _normalize_trace_ref(trace_file)
+        if not trace_key:
             continue
         try:
             score = float(raw_score)
         except Exception:
             continue
-        seen.add(trace_key)
-        pairs.append((1 if trace_key in gt_positive else 0, max(0.0, min(1.0, score))))
+        scores[trace_key] = max(0.0, min(1.0, score))
+    if not max_merge:
+        return scores
+    initial_scores = _load_initial_trace_scores_from_repo(str(row.get("repo") or ""))
+    if not initial_scores:
+        return scores
+    merged = dict(initial_scores)
+    for trace_key, score in scores.items():
+        merged[trace_key] = max(float(merged.get(trace_key, 0.0)), score)
+    return merged
+
+
+def _row_trace_score_pairs(row: dict[str, Any], *, max_merge: bool = False) -> list[tuple[int, float]]:
+    scores = _row_trace_scores(row, max_merge=max_merge)
+    if not scores:
+        return []
+    gt_positive = {_normalize_trace_ref(x) for x in _ground_truth_positive_trace_files(row)}
+    pairs: list[tuple[int, float]] = []
+    for trace_key, score in scores.items():
+        if not trace_key:
+            continue
+        pairs.append((1 if trace_key in gt_positive else 0, max(0.0, min(1.0, float(score)))))
     return pairs
 
 
-def _row_case_score_pair(row: dict[str, Any]) -> tuple[int, float] | None:
+def _row_case_score_pair(row: dict[str, Any], *, max_merge: bool = False) -> tuple[int, float] | None:
+    if max_merge:
+        trace_scores = _row_trace_scores(row, max_merge=True)
+        if trace_scores:
+            raw_score = max(float(v) for v in trace_scores.values())
+        else:
+            raw_score = None
+    else:
+        raw_score = None
     scoring = row.get("scoring") or {}
-    raw_score = scoring.get("case_score")
     if raw_score is None:
-        tests = row.get("tests") or []
-        metadata = (tests[0] or {}).get("metadata") if tests else {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        raw_score = metadata.get("case_score")
-    if raw_score is None:
-        trace_scores = scoring.get("trace_scores") or {}
-        if isinstance(trace_scores, dict) and trace_scores:
-            try:
-                raw_score = max(float(v) for v in trace_scores.values())
-            except Exception:
-                raw_score = None
+        raw_score = scoring.get("case_score")
+        if raw_score is None:
+            tests = row.get("tests") or []
+            metadata = (tests[0] or {}).get("metadata") if tests else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            raw_score = metadata.get("case_score")
+        if raw_score is None:
+            trace_scores = scoring.get("trace_scores") or {}
+            if isinstance(trace_scores, dict) and trace_scores:
+                try:
+                    raw_score = max(float(v) for v in trace_scores.values())
+                except Exception:
+                    raw_score = None
     if raw_score is None:
         return None
     try:
@@ -1010,11 +1203,22 @@ def _row_case_score_pair(row: dict[str, Any]) -> tuple[int, float] | None:
     return (1 if _gt_positive(row) else 0, score)
 
 
-def _init_metric_row(label: str, file_path: Path, group_key: str) -> dict[str, Any]:
+def _init_metric_row(
+    label: str,
+    file_path: Path,
+    group_key: str,
+    *,
+    score_mode: str = "original",
+    method_base_override: str | None = None,
+    method_variant_override: str | None = None,
+) -> dict[str, Any]:
     return {
         "method": label,
         "file": str(file_path),
         "group": group_key,
+        "score_mode": score_mode,
+        "method_base_override": method_base_override,
+        "method_variant_override": method_variant_override,
         "total_cases": 0,
         "classification_correct": 0,
         "verified_correct": 0,
@@ -1096,10 +1300,11 @@ def _update_metric_row(metric: dict[str, Any], row: dict[str, Any], *, fallback_
         metric["trace_case_recall_sum"] += case_trace_recall
         metric["trace_case_f1_sum"] += case_trace_f1
         metric["_trace_case_f1_pos_values"].append(case_trace_f1)
-    trace_score_pairs = _row_trace_score_pairs(row)
+    use_max_merge_scores = str(metric.get("score_mode") or "") == "max-merge"
+    trace_score_pairs = _row_trace_score_pairs(row, max_merge=use_max_merge_scores)
     if trace_score_pairs:
         metric["_trace_score_cases"].append(trace_score_pairs)
-    case_score_pair = _row_case_score_pair(row)
+    case_score_pair = _row_case_score_pair(row, max_merge=use_max_merge_scores)
     if case_score_pair is not None:
         metric["_case_score_pairs"].append(case_score_pair)
 
@@ -1274,8 +1479,10 @@ def _collect_metrics(
             fallback_model = model_name
             break
 
-    _, method = _infer_dataset_and_method_from_file(str(path))
-    _, method_model = _split_method_parts(method)
+    dataset_name, method = _infer_dataset_and_method_from_file(str(path))
+    _, dataset_variant = _split_dataset_variant(dataset_name)
+    stripped_method, stripped_method_variant = _strip_method_variant(method)
+    method_base, method_model = _split_method_parts(stripped_method)
     eval_model = _display_model_name(method_model or fallback_model)
     if not _should_include_eval_model(eval_model):
         return [], [], []
@@ -1283,15 +1490,50 @@ def _collect_metrics(
     overall = _init_metric_row(label, path, "overall")
     by_case_size: dict[str, dict[str, Any]] = {}
     by_positive_pct: dict[str, dict[str, Any]] = {}
+    effective_variant = str(stripped_method_variant or dataset_variant or "").strip()
+    include_max_merge = method_base == "AT" and effective_variant in {"", "no-tools"}
+    max_variant_override: str | None = None
+    if include_max_merge:
+        if effective_variant == "no-tools":
+            max_variant_override = "no-tools-max-merge"
+        else:
+            max_variant_override = "max-merge"
+    overall_max = (
+        _init_metric_row(
+            f"{label}-max-merge",
+            path,
+            "overall",
+            score_mode="max-merge",
+            method_base_override=method_base,
+            method_variant_override=max_variant_override,
+        )
+        if include_max_merge
+        else None
+    )
+    by_case_size_max: dict[str, dict[str, Any]] = {}
+    by_positive_pct_max: dict[str, dict[str, Any]] = {}
 
     for row in rows:
         _update_metric_row(overall, row, fallback_model=fallback_model)
+        if overall_max is not None:
+            _update_metric_row(overall_max, row, fallback_model=fallback_model)
 
         case_size = _to_int(row.get("traces_per_case"))
         case_key = str(case_size) if case_size > 0 else "unknown"
         if case_key not in by_case_size:
             by_case_size[case_key] = _init_metric_row(label, path, case_key)
         _update_metric_row(by_case_size[case_key], row, fallback_model=fallback_model)
+        if overall_max is not None:
+            if case_key not in by_case_size_max:
+                by_case_size_max[case_key] = _init_metric_row(
+                    f"{label}-max-merge",
+                    path,
+                    case_key,
+                    score_mode="max-merge",
+                    method_base_override=method_base,
+                    method_variant_override=max_variant_override,
+                )
+            _update_metric_row(by_case_size_max[case_key], row, fallback_model=fallback_model)
 
         pos_count = _gt_positive_count(row)
         if case_size > 0:
@@ -1302,9 +1544,24 @@ def _collect_metrics(
         if pct_key not in by_positive_pct:
             by_positive_pct[pct_key] = _init_metric_row(label, path, pct_key)
         _update_metric_row(by_positive_pct[pct_key], row, fallback_model=fallback_model)
+        if overall_max is not None:
+            if pct_key not in by_positive_pct_max:
+                by_positive_pct_max[pct_key] = _init_metric_row(
+                    f"{label}-max-merge",
+                    path,
+                    pct_key,
+                    score_mode="max-merge",
+                    method_base_override=method_base,
+                    method_variant_override=max_variant_override,
+                )
+            _update_metric_row(by_positive_pct_max[pct_key], row, fallback_model=fallback_model)
 
     overall_rows = [_finalize_metric_row(overall)]
+    if overall_max is not None:
+        overall_rows.append(_finalize_metric_row(overall_max))
     case_rows = [_finalize_metric_row(v) for _, v in sorted(by_case_size.items(), key=lambda kv: kv[0])]
+    if by_case_size_max:
+        case_rows.extend(_finalize_metric_row(v) for _, v in sorted(by_case_size_max.items(), key=lambda kv: kv[0]))
     def _pct_bucket_sort_key(label_text: str) -> tuple[int, float]:
         if label_text == "unknown":
             return (2, 999.0)
@@ -1320,6 +1577,11 @@ def _collect_metrics(
         _finalize_metric_row(v)
         for _, v in sorted(by_positive_pct.items(), key=lambda kv: _pct_bucket_sort_key(kv[0]))
     ]
+    if by_positive_pct_max:
+        pct_rows.extend(
+            _finalize_metric_row(v)
+            for _, v in sorted(by_positive_pct_max.items(), key=lambda kv: _pct_bucket_sort_key(kv[0]))
+        )
     return overall_rows, case_rows, pct_rows
 
 
@@ -1400,6 +1662,76 @@ def _print_table(title: str, rows: list[dict[str, Any]], *, include_group: bool)
             else:
                 cells.append(str(v))
         print(" | ".join(cells))
+
+
+def _include_in_paper_outputs(row: dict[str, Any]) -> bool:
+    dataset = str(row.get("dataset") or "").strip()
+    if dataset != "trace-dataset":
+        return False
+    method_base = str(row.get("method_base") or "").strip()
+    method_variant = str(row.get("method_variant") or "").strip()
+    if method_base == "llmjudge":
+        return True
+    if method_base == "AT" and method_variant in {"", "no-tools", "max-merge"}:
+        return True
+    return False
+
+
+def _paper_method_rank(row: dict[str, Any]) -> int:
+    method_base = str(row.get("method_base") or "").strip()
+    method_variant = str(row.get("method_variant") or "").strip()
+    if method_base == "llmjudge":
+        return 0
+    if method_base == "AT" and method_variant == "":
+        return 1
+    if method_base == "AT" and method_variant == "max-merge":
+        return 2
+    if method_base == "AT" and method_variant == "no-tools":
+        return 3
+    return 99
+
+
+def _print_paper_table(rows: list[dict[str, Any]]) -> None:
+    grouped_rows = [
+        row
+        for dataset_rows in _group_plot_rows_by_dataset(rows).values()
+        for row in dataset_rows
+    ]
+    paper_rows = [row for row in grouped_rows if _include_in_paper_outputs(row)]
+    if not paper_rows:
+        print("\n## TRACE Paper Table\n(no rows)")
+        return
+
+    paper_rows = sorted(
+        paper_rows,
+        key=lambda row: (
+            _display_model_name(str(row.get("method_model") or "")) or "",
+            _paper_method_rank(row),
+        ),
+    )
+    cols = [
+        ("model", "model"),
+        ("method", "method"),
+        ("verified_macro_f1", "verified_macro_f1"),
+        ("case_average_precision", "case_ap"),
+        ("trace_average_precision", "trace_ap"),
+    ]
+    print("\n## TRACE Paper Table")
+    print(" | ".join(label for _, label in cols))
+    print(" | ".join("---" for _ in cols))
+    for row in paper_rows:
+        values = {
+            "model": _display_model_name(str(row.get("method_model") or "")) or "",
+            "method": _presentation_method_label(
+                method_base=str(row.get("method_base") or ""),
+                dataset_variant=str(row.get("dataset_variant") or ""),
+                method_variant=str(row.get("method_variant") or ""),
+            ),
+            "verified_macro_f1": _fmt(row.get("verified_macro_f1"), digits=4),
+            "case_average_precision": _fmt(row.get("case_average_precision"), digits=4),
+            "trace_average_precision": _fmt(row.get("trace_average_precision"), digits=4),
+        }
+        print(" | ".join(str(values[key]) for key, _ in cols))
 
 
 def _slug(text: str) -> str:
@@ -1498,6 +1830,20 @@ def _lighten_color(color: str, amount: float = 0.35) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+def _darken_color(color: str, amount: float = 0.2) -> str:
+    color = str(color or "").strip()
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+        return color
+    amount = max(0.0, min(1.0, float(amount)))
+    r = int(color[1:3], 16)
+    g = int(color[3:5], 16)
+    b = int(color[5:7], 16)
+    r = int(round(r * (1.0 - amount)))
+    g = int(round(g * (1.0 - amount)))
+    b = int(round(b * (1.0 - amount)))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 def _method_hatch(method_base: str | None) -> str:
     return METHOD_HATCHES.get(str(method_base or "").strip(), "")
 
@@ -1507,10 +1853,16 @@ def _method_variant_marker(method_base: str | None, method_variant: str | None) 
     variant = str(method_variant or "").strip()
     if base == "llmjudge":
         return "s"
+    if variant == "max-merge":
+        return "D"
+    if variant == "no-tools-max-merge":
+        return "v"
     if variant == "no-tools":
         return "^"
     if base == "AT-codex":
         return "D"
+    if base == "AT-claude":
+        return "P"
     if base == "AT":
         return "o"
     return _method_marker(base or variant or "AT")
@@ -1518,18 +1870,33 @@ def _method_variant_marker(method_base: str | None, method_variant: str | None) 
 
 def _method_variant_linestyle(method_base: str | None, method_variant: str | None) -> str:
     base = str(method_base or "").strip()
+    variant = str(method_variant or "").strip()
     if base == "llmjudge":
         return "--"
+    if variant in {"max-merge", "no-tools-max-merge"}:
+        return "-."
+    if variant == "no-tools":
+        return ":"
     return "-"
 
 
 def _method_fill_color(
     method_model: str | None,
+    method_base: str | None,
     method_variant: str | None,
     fallback_index: int,
     palette: list[str],
 ) -> str:
     color = _model_color(method_model, fallback_index, palette)
+    base = str(method_base or "").strip()
+    if base == "AT-codex":
+        return _darken_color(color, amount=0.18)
+    if base == "AT-claude":
+        return _lighten_color(color, amount=0.18)
+    if str(method_variant or "").strip() == "max-merge":
+        return _darken_color(color, amount=0.18)
+    if str(method_variant or "").strip() == "no-tools-max-merge":
+        return _darken_color(_lighten_color(color, amount=0.38), amount=0.15)
     if str(method_variant or "").strip() == "no-tools":
         return _lighten_color(color, amount=0.38)
     return color
@@ -1565,17 +1932,42 @@ def _group_plot_rows_by_dataset(rows: list[dict[str, Any]]) -> dict[str, list[di
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         dataset, method = _infer_dataset_and_method_from_file(str(row.get("file") or ""))
-        dataset_base, dataset_variant = _split_dataset_variant(dataset)
-        method, method_variant = _strip_method_variant(method)
-        method_base, method_model = _split_method_parts(method)
+        inferred_dataset_base, inferred_dataset_variant = _split_dataset_variant(dataset)
+        stripped_method, inferred_method_variant = _strip_method_variant(method)
+        inferred_method_base, inferred_method_model = _split_method_parts(stripped_method)
+        dataset_base = row.get("dataset_override")
+        if dataset_base is None or str(dataset_base).strip() == "":
+            dataset_base = inferred_dataset_base
+        else:
+            dataset_base = str(dataset_base)
+        dataset_variant = row.get("dataset_variant_override")
+        if dataset_variant is None or str(dataset_variant).strip() == "":
+            dataset_variant = inferred_dataset_variant
+        else:
+            dataset_variant = str(dataset_variant)
+        method_base = row.get("method_base_override")
+        if method_base is None or str(method_base).strip() == "":
+            method_base = inferred_method_base
+        else:
+            method_base = str(method_base)
+        method_model = row.get("method_model_override")
+        if method_model is None or str(method_model).strip() == "":
+            method_model = inferred_method_model
+        else:
+            method_model = str(method_model)
+        method_variant = row.get("method_variant_override")
+        if method_variant is None:
+            method_variant = inferred_method_variant or dataset_variant
+        elif str(method_variant).strip() == "":
+            method_variant = inferred_method_variant or dataset_variant
         out = dict(row)
         out["dataset"] = dataset_base
         out["dataset_variant"] = dataset_variant
-        out["method_key"] = method
+        out["method_key"] = stripped_method
         out["method_model"] = method_model
-        out["method_variant"] = method_variant or dataset_variant
+        out["method_variant"] = method_variant
         out["method_label"] = _pretty_method(
-            method,
+            stripped_method,
             method_model=method_model,
             dataset_variant=dataset_variant,
             method_variant=method_variant,
@@ -1648,7 +2040,7 @@ def _line_plot(
         if not xs:
             continue
         method_model, method_base, method_variant = (method_info_by_label or {}).get(method, (None, None, None))
-        color = _method_fill_color(method_model, method_variant, i, palette)
+        color = _method_fill_color(method_model, method_base, method_variant, i, palette)
         if yerr_by_method is not None:
             ax.fill_between(
                 xs,
@@ -1688,11 +2080,15 @@ def _line_plot(
         display_model = _display_model_name(method_model)
         if display_model and display_model not in present_models:
             present_models.append(display_model)
-        method_label = "Judge" if method_base == "llmjudge" else "AT"
-        if method_variant == "no-tools":
-            method_label = "AT (No Tools)"
-        elif method_base == "AT-codex":
-            method_label = "AT (Codex)"
+        method_label = _presentation_method_label(method_base=method_base, method_variant=method_variant)
+        if method_label not in {
+            "Meerkat",
+            "Meerkat + Max Merge",
+            "Naive Agent",
+            "Naive Agent + Max Merge",
+            "Per-trace Monitor",
+        }:
+            continue
         style_key = (
             method_label,
             _method_variant_marker(method_base, method_variant),
@@ -1761,13 +2157,13 @@ def _line_plot(
     out_base.parent.mkdir(parents=True, exist_ok=True)
     for ext in formats:
         out_path = out_base.with_suffix(f".{ext}")
-        fig.savefig(out_path, dpi=300)
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
         out_paths.append(out_path)
     plt.close(fig)
     return out_paths
 
 
-def _auprc_by_case_size_plot(
+def _ap_by_case_size_plot(
     *,
     dataset: str,
     x_values: list[Any],
@@ -1776,10 +2172,6 @@ def _auprc_by_case_size_plot(
     case_ap_err_by_method: dict[str, list[tuple[float, float] | None]],
     trace_ap_by_method: dict[str, list[float | None]],
     trace_ap_err_by_method: dict[str, list[tuple[float, float] | None]],
-    case_roc_by_method: dict[str, list[float | None]],
-    case_roc_err_by_method: dict[str, list[tuple[float, float] | None]],
-    trace_roc_by_method: dict[str, list[float | None]],
-    trace_roc_err_by_method: dict[str, list[tuple[float, float] | None]],
     method_info_by_label: dict[str, tuple[str | None, str | None, str | None]] | None,
     out_base: Path,
     formats: list[str],
@@ -1792,18 +2184,23 @@ def _auprc_by_case_size_plot(
         return []
 
     _apply_publication_style(plt)
-    fig, axes = plt.subplots(2, 2, figsize=(FIGURE_WIDTH_IN * 2.0, LINE_FIGURE_HEIGHT_IN * 1.8), constrained_layout=False)
-    fig.subplots_adjust(left=0.10, right=0.99, bottom=0.10, top=0.72, wspace=0.28, hspace=0.32)
+    fig, axes = plt.subplots(1, 2, figsize=(FIGURE_WIDTH_IN * 2.2, LINE_FIGURE_HEIGHT_IN * 1.16), constrained_layout=False)
+    fig.subplots_adjust(left=0.10, right=0.99, bottom=0.19, top=0.76, wspace=0.32)
     palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
 
     panels = [
-        (axes[0][0], "Case-Level AUPRC", case_ap_by_method, case_ap_err_by_method),
-        (axes[0][1], "Trace-Level AUPRC", trace_ap_by_method, trace_ap_err_by_method),
-        (axes[1][0], "Case-Level AUROC", case_roc_by_method, case_roc_err_by_method),
-        (axes[1][1], "Trace-Level AUROC", trace_roc_by_method, trace_roc_err_by_method),
+        (axes[0], "Case AP", case_ap_by_method, case_ap_err_by_method),
+        (axes[1], "Trace AP", trace_ap_by_method, trace_ap_err_by_method),
     ]
     for ax, ylabel, y_by_method, yerr_by_method in panels:
         for i, (method, ys) in enumerate(sorted(y_by_method.items(), key=lambda kv: kv[0])):
+            method_model, method_base, method_variant = (method_info_by_label or {}).get(method, (None, None, None))
+            if _presentation_method_label(method_base=method_base, method_variant=method_variant) not in {
+                "Meerkat",
+                "Per-trace Monitor",
+                "Naive Agent",
+            }:
+                continue
             xs = []
             vals = []
             lower_bounds = []
@@ -1828,8 +2225,7 @@ def _auprc_by_case_size_plot(
                     upper_bounds.append(y_val + high_delta)
             if not xs:
                 continue
-            method_model, method_base, method_variant = (method_info_by_label or {}).get(method, (None, None, None))
-            color = _method_fill_color(method_model, method_variant, i, palette)
+            color = _method_fill_color(method_model, method_base, method_variant, i, palette)
             ax.fill_between(xs, lower_bounds, upper_bounds, color=color, alpha=0.12, linewidth=0.0, zorder=1)
             ax.plot(
                 xs,
@@ -1845,6 +2241,7 @@ def _auprc_by_case_size_plot(
         ax.set_xlabel("Traces per Case", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
         ax.set_xticks(list(range(len(x_values))))
         ax.set_xticklabels(x_labels, rotation=0)
+        ax.set_ylim(0.0, 1.0)
         ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
         ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
@@ -1860,11 +2257,9 @@ def _auprc_by_case_size_plot(
         display_model = _display_model_name(method_model)
         if display_model and display_model not in present_models:
             present_models.append(display_model)
-        method_label = "Judge" if method_base == "llmjudge" else "AT"
-        if method_variant == "no-tools":
-            method_label = "AT (No Tools)"
-        elif method_base == "AT-codex":
-            method_label = "AT (Codex)"
+        method_label = _presentation_method_label(method_base=method_base, method_variant=method_variant)
+        if method_label not in {"Meerkat", "Per-trace Monitor", "Naive Agent"}:
+            continue
         style_key = (
             method_label,
             _method_variant_marker(method_base, method_variant),
@@ -1905,7 +2300,7 @@ def _auprc_by_case_size_plot(
         fig.legend(
             handles=model_handles,
             loc="upper center",
-            bbox_to_anchor=(0.47, 0.98),
+            bbox_to_anchor=(0.47, 0.99),
             ncol=max(1, min(3, len(model_handles))),
             title="Model",
             title_fontsize=LEGEND_FONTSIZE,
@@ -1926,7 +2321,7 @@ def _auprc_by_case_size_plot(
     out_base.parent.mkdir(parents=True, exist_ok=True)
     for ext in formats:
         out_path = out_base.with_suffix(f".{ext}")
-        fig.savefig(out_path, dpi=300)
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
         out_paths.append(out_path)
     plt.close(fig)
     return out_paths
@@ -1951,12 +2346,12 @@ def _precision_recall_plot(
 
     _apply_publication_style(plt)
     fig, axes = plt.subplots(2, 1, figsize=(FIGURE_WIDTH_IN, LINE_FIGURE_HEIGHT_IN * 1.8), constrained_layout=False)
-    fig.subplots_adjust(left=0.16, right=0.98, bottom=0.10, top=0.70, hspace=0.32)
+    fig.subplots_adjust(left=0.16, right=0.995, bottom=0.10, top=0.70, hspace=0.32)
     palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
 
     for i, method in enumerate(sorted(set(curves_by_method) | set(roc_curves_by_method), key=lambda x: x)):
         method_model, method_base, method_variant = (method_info_by_label or {}).get(method, (None, None, None))
-        color = _method_fill_color(method_model, method_variant, i, palette)
+        color = _method_fill_color(method_model, method_base, method_variant, i, palette)
         pr_curve = curves_by_method.get(method) or []
         if pr_curve:
             recalls = [float(point.get("recall", 0.0)) for point in pr_curve]
@@ -2030,6 +2425,8 @@ def _precision_recall_plot(
             method_label = "AT (No Tools)"
         elif method_base == "AT-codex":
             method_label = "AT (Codex)"
+        elif method_base == "AT-claude":
+            method_label = "AT (Claude)"
         style_key = (
             method_label,
             _method_variant_marker(method_base, method_variant),
@@ -2076,7 +2473,7 @@ def _precision_recall_plot(
         model_legend = fig.legend(
             handles=model_handles,
             loc="upper center",
-            bbox_to_anchor=(0.62, 0.985),
+            bbox_to_anchor=(0.50, 0.995),
             ncol=max(1, min(2, len(model_handles))),
             title="Model",
             title_fontsize=LEGEND_FONTSIZE,
@@ -2087,11 +2484,304 @@ def _precision_recall_plot(
         fig.legend(
             handles=method_handles,
             loc="upper center",
-            bbox_to_anchor=(0.64, 0.845),
+            bbox_to_anchor=(0.50, 0.90),
             ncol=max(1, min(3, len(method_handles))),
             title="Method",
             title_fontsize=LEGEND_FONTSIZE,
             **legend_kwargs,
+        )
+
+    out_paths: list[Path] = []
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in formats:
+        out_path = out_base.with_suffix(f".{ext}")
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
+        out_paths.append(out_path)
+    plt.close(fig)
+    return out_paths
+
+
+def _calibration_plot(
+    *,
+    case_curves_by_method: dict[str, list[dict[str, float]]],
+    case_metrics_by_method: dict[str, tuple[float | None, float | None]],
+    trace_curves_by_method: dict[str, list[dict[str, float]]],
+    trace_metrics_by_method: dict[str, tuple[float | None, float | None]],
+    method_info_by_label: dict[str, tuple[str | None, str | None, str | None]] | None,
+    out_base: Path,
+    formats: list[str],
+) -> list[Path]:
+    if not case_curves_by_method and not trace_curves_by_method:
+        return []
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ImportError:
+        print("Skipping figure generation: matplotlib is not installed.")
+        return []
+
+    _apply_publication_style(plt)
+    fig, axes = plt.subplots(1, 2, figsize=(FIGURE_WIDTH_IN * 2.05, LINE_FIGURE_HEIGHT_IN * 1.02), constrained_layout=False)
+    fig.subplots_adjust(left=0.09, right=0.995, bottom=0.17, top=0.80, wspace=0.24)
+    palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
+    method_order = sorted(set(case_curves_by_method) | set(trace_curves_by_method), key=lambda x: x)
+    legend_handles: list[Line2D] = []
+    seen_handles: set[str] = set()
+
+    panels = [
+        (
+            axes[0],
+            "Case-Level Calibration",
+            case_curves_by_method,
+            case_metrics_by_method,
+        ),
+        (
+            axes[1],
+            "Trace-Level Calibration",
+            trace_curves_by_method,
+            trace_metrics_by_method,
+        ),
+    ]
+
+    for ax, title, curves_by_method, metrics_by_method in panels:
+        ax.plot([0.0, 1.0], [0.0, 1.0], color="#999999", linewidth=0.9, linestyle=":", zorder=1)
+        for i, method in enumerate(method_order):
+            curve = curves_by_method.get(method) or []
+            if not curve:
+                continue
+            method_model, method_base, method_variant = (method_info_by_label or {}).get(method, (None, None, None))
+            color = _method_fill_color(method_model, method_base, method_variant, i, palette)
+            xs = [float(point.get("mean_score", 0.0)) for point in curve]
+            ys = [float(point.get("positive_rate", 0.0)) for point in curve]
+            ylow = [float(point.get("positive_rate_low", point.get("positive_rate", 0.0))) for point in curve]
+            yhigh = [float(point.get("positive_rate_high", point.get("positive_rate", 0.0))) for point in curve]
+            ax.plot(
+                xs,
+                ys,
+                color=color,
+                linewidth=0.95,
+                linestyle=_method_variant_linestyle(method_base, method_variant),
+                alpha=0.75,
+                zorder=2,
+            )
+            ax.fill_between(
+                xs,
+                ylow,
+                yhigh,
+                color=color,
+                alpha=0.12,
+                linewidth=0.0,
+                zorder=1.5,
+            )
+            ax.scatter(
+                xs,
+                ys,
+                s=22.0,
+                color=color,
+                marker=_method_variant_marker(method_base, method_variant),
+                edgecolors="white",
+                linewidths=0.5,
+                alpha=0.95,
+                zorder=3,
+            )
+            if method not in seen_handles:
+                seen_handles.add(method)
+                legend_handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=color,
+                        lw=LINE_WIDTH,
+                        marker=_method_variant_marker(method_base, method_variant),
+                        markersize=max(5.0, MARKER_SIZE - 0.5),
+                        linestyle=_method_variant_linestyle(method_base, method_variant),
+                        label=method,
+                    )
+                )
+        ax.set_title(title, fontsize=AXIS_LABEL_FONTSIZE, pad=4)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_xlabel("Mean Predicted Score", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+        ax.set_ylabel("Empirical Positive Rate", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+        ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color(SPINE_COLOR)
+        ax.spines["bottom"].set_color(SPINE_COLOR)
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.98),
+            ncol=max(1, min(2, len(legend_handles))),
+            frameon=False,
+            fontsize=max(6.2, LEGEND_FONTSIZE - 0.2),
+            handlelength=1.7,
+            handletextpad=0.45,
+            columnspacing=0.9,
+        )
+
+    out_paths: list[Path] = []
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in formats:
+        out_path = out_base.with_suffix(f".{ext}")
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
+        out_paths.append(out_path)
+    plt.close(fig)
+    return out_paths
+
+
+def _overall_calibration_grid_plot(
+    *,
+    case_curves_by_dataset: dict[str, dict[str, list[dict[str, float]]]],
+    case_metrics_by_dataset: dict[str, dict[str, tuple[float | None, float | None]]],
+    trace_curves_by_dataset: dict[str, dict[str, list[dict[str, float]]]],
+    trace_metrics_by_dataset: dict[str, dict[str, tuple[float | None, float | None]]],
+    method_info_by_dataset: dict[str, dict[str, tuple[str | None, str | None, str | None]]],
+    dataset_labels: dict[str, str],
+    out_base: Path,
+    formats: list[str],
+) -> list[Path]:
+    datasets = [
+        dataset
+        for dataset in dataset_labels
+        if (case_curves_by_dataset.get(dataset) or trace_curves_by_dataset.get(dataset))
+    ]
+    if not datasets:
+        return []
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ImportError:
+        print("Skipping figure generation: matplotlib is not installed.")
+        return []
+
+    _apply_publication_style(plt)
+    fig, axes = plt.subplots(
+        len(datasets),
+        2,
+        figsize=(FIGURE_WIDTH_IN * 2.05, max(3.1, 2.05 * len(datasets))),
+        constrained_layout=False,
+        squeeze=False,
+    )
+    fig.subplots_adjust(left=0.10, right=0.995, bottom=0.10, top=0.83, wspace=0.20, hspace=0.38)
+    palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
+
+    method_order = sorted(
+        {
+            method
+            for dataset in datasets
+            for method in (
+                set(case_curves_by_dataset.get(dataset, {})) | set(trace_curves_by_dataset.get(dataset, {}))
+            )
+        }
+    )
+    legend_handles: list[Line2D] = []
+    seen_handles: set[str] = set()
+
+    for row_idx, dataset in enumerate(datasets):
+        panels = [
+            (
+                axes[row_idx][0],
+                "Case-Level Calibration",
+                case_curves_by_dataset.get(dataset) or {},
+                case_metrics_by_dataset.get(dataset) or {},
+            ),
+            (
+                axes[row_idx][1],
+                "Trace-Level Calibration",
+                trace_curves_by_dataset.get(dataset) or {},
+                trace_metrics_by_dataset.get(dataset) or {},
+            ),
+        ]
+        for col_idx, (ax, panel_title, curves_by_method, metrics_by_method) in enumerate(panels):
+            ax.plot([0.0, 1.0], [0.0, 1.0], color="#999999", linewidth=0.9, linestyle=":", zorder=1)
+            for i, method in enumerate(method_order):
+                curve = curves_by_method.get(method) or []
+                if not curve:
+                    continue
+                method_model, method_base, method_variant = (method_info_by_dataset.get(dataset) or {}).get(
+                    method, (None, None, None)
+                )
+                color = _method_fill_color(method_model, method_base, method_variant, i, palette)
+                xs = [float(point.get("mean_score", 0.0)) for point in curve]
+                ys = [float(point.get("positive_rate", 0.0)) for point in curve]
+                ylow = [float(point.get("positive_rate_low", point.get("positive_rate", 0.0))) for point in curve]
+                yhigh = [float(point.get("positive_rate_high", point.get("positive_rate", 0.0))) for point in curve]
+                ax.plot(
+                    xs,
+                    ys,
+                    color=color,
+                    linewidth=0.95,
+                    linestyle=_method_variant_linestyle(method_base, method_variant),
+                    alpha=0.75,
+                    zorder=2,
+                )
+                ax.fill_between(
+                    xs,
+                    ylow,
+                    yhigh,
+                    color=color,
+                    alpha=0.12,
+                    linewidth=0.0,
+                    zorder=1.5,
+                )
+                ax.scatter(
+                    xs,
+                    ys,
+                    s=20.0,
+                    color=color,
+                    marker=_method_variant_marker(method_base, method_variant),
+                    edgecolors="white",
+                    linewidths=0.45,
+                    alpha=0.95,
+                    zorder=3,
+                )
+                if method not in seen_handles:
+                    seen_handles.add(method)
+                    legend_handles.append(
+                        Line2D(
+                            [0],
+                            [0],
+                            color=color,
+                            lw=LINE_WIDTH,
+                            marker=_method_variant_marker(method_base, method_variant),
+                            markersize=max(5.0, MARKER_SIZE - 0.6),
+                            linestyle=_method_variant_linestyle(method_base, method_variant),
+                            label=method,
+                        )
+                    )
+
+            title = f"{dataset_labels.get(dataset, dataset)} — {'Case' if col_idx == 0 else 'Trace'}"
+            ax.set_title(title, fontsize=max(6.6, AXIS_LABEL_FONTSIZE - 0.2), pad=4)
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            if row_idx == len(datasets) - 1:
+                ax.set_xlabel("Mean Predicted Score", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.3)
+            else:
+                ax.set_xlabel("")
+            if col_idx == 0:
+                ax.set_ylabel("Empirical Positive Rate", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.3)
+            else:
+                ax.set_ylabel("")
+            ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_color(SPINE_COLOR)
+            ax.spines["bottom"].set_color(SPINE_COLOR)
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.98),
+            ncol=max(1, min(2, len(legend_handles))),
+            frameon=False,
+            fontsize=max(6.1, LEGEND_FONTSIZE - 0.2),
+            handlelength=1.7,
+            handletextpad=0.45,
+            columnspacing=0.9,
         )
 
     out_paths: list[Path] = []
@@ -2132,7 +2822,7 @@ def _bar_plot_with_ci(
     hatches: list[str] = []
     for i, label in enumerate(method_labels):
         method_model, method_base, method_variant = (method_info_by_label or {}).get(label, (None, None, None))
-        colors.append(_method_fill_color(method_model, method_variant, i, palette))
+        colors.append(_method_fill_color(method_model, method_base, method_variant, i, palette))
         hatches.append(_method_hatch(method_base))
     x = list(range(len(method_labels)))
     bars = ax.bar(
@@ -2224,10 +2914,12 @@ def _grouped_overall_metric_bar_plot(
         if any((info[0] and _display_model_name(info[0]) == model_name) for info in method_style.values())
     ]
     seen_method_order: list[str] = []
-    for method in ("AT", "AT (No Tools)", "Judge"):
+    for method in ("AT", "AT (Codex)", "AT (Claude)", "AT (No Tools)", "Judge"):
         if any(
             (
                 (info[1] == "AT" and method == "AT" and info[2] != "no-tools")
+                or (info[1] == "AT-codex" and method == "AT (Codex)")
+                or (info[1] == "AT-claude" and method == "AT (Claude)")
                 or (info[1] == "AT" and method == "AT (No Tools)" and info[2] == "no-tools")
                 or (info[1] == "llmjudge" and method == "Judge")
             )
@@ -2238,12 +2930,14 @@ def _grouped_overall_metric_bar_plot(
     def _overall_method_rank(method_base: str | None, method_variant: str | None) -> int:
         if method_base == "AT" and method_variant != "no-tools":
             return 0
-        if method_base == "AT" and method_variant == "no-tools":
-            return 1
-        if method_base == "llmjudge":
-            return 2
         if method_base == "AT-codex":
+            return 1
+        if method_base == "AT-claude":
+            return 2
+        if method_base == "AT" and method_variant == "no-tools":
             return 3
+        if method_base == "llmjudge":
+            return 4
         return 99
 
     methods = sorted(
@@ -2321,7 +3015,7 @@ def _grouped_overall_metric_bar_plot(
         if not xs:
             continue
         method_model, method_base, method_variant = method_style.get(method, (None, None, None))
-        bar_color = _method_fill_color(method_model, method_variant, method_idx, palette)
+        bar_color = _method_fill_color(method_model, method_base, method_variant, method_idx, palette)
         ax.bar(
             xs,
             heights,
@@ -2361,13 +3055,21 @@ def _grouped_overall_metric_bar_plot(
         method_handles.append(
             Patch(facecolor="#BEBEBE", edgecolor=SPINE_COLOR, linewidth=0.6, label="AT")
         )
+    if "AT (Codex)" in seen_method_order:
+        method_handles.append(
+            Patch(facecolor="#BEBEBE", edgecolor=SPINE_COLOR, linewidth=0.6, label="AT (Codex)")
+        )
+    if "AT (Claude)" in seen_method_order:
+        method_handles.append(
+            Patch(facecolor="#BEBEBE", edgecolor=SPINE_COLOR, linewidth=0.6, label="AT (Claude)")
+        )
     if "AT (No Tools)" in seen_method_order:
         method_handles.append(
             Patch(facecolor="#E0E0E0", edgecolor=SPINE_COLOR, linewidth=0.6, label="AT (No Tools)")
         )
     if "Judge" in seen_method_order:
         method_handles.append(
-            Patch(facecolor="#BEBEBE", edgecolor=SPINE_COLOR, linewidth=0.6, hatch="///", label="Judge")
+            Patch(facecolor="#BEBEBE", edgecolor=SPINE_COLOR, linewidth=0.6, hatch="///", label="Per-trace Monitor")
         )
 
     legend_kwargs = dict(
@@ -2409,86 +3111,337 @@ def _grouped_overall_metric_bar_plot(
     return out_paths
 
 
-def _discover_safety_result_files() -> list[Path]:
-    return sorted(
-        path
-        for path in Path("results").glob("safety_*.jsonl")
-        if path.is_file()
-    )
-
-
-def _generate_figures(
+def _overall_ap_by_model_plot(
     *,
-    overall_rows: list[dict[str, Any]],
-    case_rows: list[dict[str, Any]],
-    pct_rows: list[dict[str, Any]],
-    figures_dir: Path,
+    rows: list[dict[str, Any]],
+    out_base: Path,
     formats: list[str],
 ) -> list[Path]:
-    out_paths: list[Path] = []
-    out_paths.extend(
-        _grouped_overall_metric_bar_plot(
-            rows=overall_rows,
-            metric_key="verified_macro_f1",
-            metric_low_key="verified_macro_f1_ci_low",
-            metric_high_key="verified_macro_f1_ci_high",
-            dataset_labels=OVERALL_DATASET_LABELS,
-            ylabel="Verified Macro F1",
-            out_base=figures_dir / "safety_overall_verified_macro_f1_by_dataset",
-            formats=formats,
-        )
-    )
-    out_paths.extend(
-        _grouped_overall_metric_bar_plot(
-            rows=overall_rows,
-            metric_key="witness_precision",
-            metric_low_key=None,
-            metric_high_key=None,
-            dataset_labels=OVERALL_DATASET_LABELS,
-            ylabel="Witness Precision",
-            out_base=figures_dir / "safety_overall_witness_precision_by_dataset",
-            formats=formats,
-        )
-    )
-    trace_ap_rows = [
-        row
-        for dataset_rows in _group_plot_rows_by_dataset(overall_rows).values()
-        for row in dataset_rows
-        if str(row.get("dataset") or "") in TRACE_SCORE_DATASET_LABELS
-    ]
-    out_paths.extend(
-        _grouped_overall_metric_bar_plot(
-            rows=trace_ap_rows,
-            metric_key="trace_average_precision",
-            metric_low_key="trace_average_precision_ci_low",
-            metric_high_key="trace_average_precision_ci_high",
-            dataset_labels=TRACE_SCORE_DATASET_LABELS,
-            ylabel="Trace-level AP",
-            out_base=figures_dir / "safety_overall_trace_average_precision_by_dataset",
-            formats=formats,
-        )
-    )
-    out_paths.extend(
-        _grouped_overall_metric_bar_plot(
-            rows=trace_ap_rows,
-            metric_key="case_average_precision",
-            metric_low_key="case_average_precision_ci_low",
-            metric_high_key="case_average_precision_ci_high",
-            dataset_labels=TRACE_SCORE_DATASET_LABELS,
-            ylabel="Case-level AP",
-            out_base=figures_dir / "safety_overall_case_average_precision_by_dataset",
-            formats=formats,
-        )
-    )
-    by_dataset_case = _group_plot_rows_by_dataset(case_rows)
-    by_dataset_pct = _group_plot_rows_by_dataset(pct_rows)
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+    except ImportError:
+        print("Skipping figure generation: matplotlib is not installed.")
+        return []
 
-    pr_curve_groups: dict[str, dict[str, list[dict[str, float]]]] = {}
-    roc_curve_groups: dict[str, dict[str, list[dict[str, float]]]] = {}
-    case_pr_curve_groups: dict[str, dict[str, list[dict[str, float]]]] = {}
-    case_roc_curve_groups: dict[str, dict[str, list[dict[str, float]]]] = {}
-    pr_method_info: dict[str, dict[str, tuple[str | None, str | None, str | None]]] = {}
-    for row in trace_ap_rows:
+    plot_rows = [
+        row
+        for row in rows
+        if str(row.get("dataset") or "") == "trace-dataset"
+        and _include_in_paper_outputs(row)
+        and str(row.get("method_variant") or "").strip() not in {"max-merge", "no-tools-max-merge"}
+    ]
+    if not plot_rows:
+        return []
+
+    method_rank = {
+        "Meerkat": 0,
+        "Naive Agent": 1,
+        "Per-trace Monitor": 2,
+    }
+    model_order = ["Qwen-3.5", "gpt-5.4-mini"]
+    grouped: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in plot_rows:
+        model_name = _display_model_name(str(row.get("method_model") or ""))
+        method_label = _presentation_method_label(
+            method_base=str(row.get("method_base") or ""),
+            method_variant=str(row.get("method_variant") or ""),
+            dataset_variant=str(row.get("dataset_variant") or ""),
+        )
+        if not model_name or method_label not in method_rank:
+            continue
+        grouped.setdefault(model_name, {})[method_label] = row
+    model_names = [m for m in model_order if m in grouped] + [m for m in grouped if m not in model_order]
+    if not model_names:
+        return []
+
+    _apply_publication_style(plt)
+    fig, axes = plt.subplots(1, 2, figsize=(FIGURE_WIDTH_IN * 2.15, BAR_FIGURE_HEIGHT_IN * 1.35), constrained_layout=False)
+    fig.subplots_adjust(left=0.10, right=0.99, bottom=0.17, top=0.72, wspace=0.28)
+
+    panel_specs = [
+        (axes[0], "Case AP", "case_average_precision", "case_average_precision_ci_low", "case_average_precision_ci_high"),
+        (axes[1], "Trace AP", "trace_average_precision", "trace_average_precision_ci_low", "trace_average_precision_ci_high"),
+    ]
+    bar_width = 0.22
+    model_gap = 0.30
+    method_sequence = ["Meerkat", "Naive Agent", "Per-trace Monitor"]
+    x_positions: list[float] = []
+    x_labels: list[str] = []
+    group_centers: list[float] = []
+    cursor = 0.0
+    for model_name in model_names:
+        start = cursor
+        for method_label in method_sequence:
+            x_positions.append(cursor)
+            x_labels.append("" if method_label != "Meerkat" else model_name)
+            cursor += bar_width
+        group_centers.append(start + bar_width)
+        cursor += model_gap
+
+    for ax, ylabel, metric_key, low_key, high_key in panel_specs:
+        idx = 0
+        for model_name in model_names:
+            model_color = _model_color(model_name, 0, [])
+            for method_label in method_sequence:
+                row = grouped.get(model_name, {}).get(method_label)
+                x = x_positions[idx]
+                idx += 1
+                if row is None:
+                    continue
+                value = _to_float(row.get(metric_key))
+                if value is None:
+                    continue
+                low = _to_float(row.get(low_key))
+                high = _to_float(row.get(high_key))
+                lower_err = max(0.0, value - low) if low is not None else 0.0
+                upper_err = max(0.0, high - value) if high is not None else 0.0
+                face = _method_fill_color(
+                    method_model=model_name,
+                    method_base=str(row.get("method_base") or ""),
+                    method_variant=str(row.get("method_variant") or ""),
+                    fallback_index=0,
+                    palette=[],
+                )
+                hatch = ""
+                if method_label == "Per-trace Monitor":
+                    hatch = "////"
+                elif method_label == "Naive Agent":
+                    hatch = ".."
+                ax.bar(
+                    x,
+                    value,
+                    width=bar_width * 0.88,
+                    color=face,
+                    edgecolor=SPINE_COLOR,
+                    linewidth=0.6,
+                    hatch=hatch,
+                    yerr=[[lower_err], [upper_err]],
+                    capsize=2.0,
+                    ecolor="black",
+                    zorder=3,
+                )
+        ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.0)
+        ax.set_xticks(group_centers)
+        ax.set_xticklabels(model_names)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, which="major", axis="y", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color(SPINE_COLOR)
+        ax.spines["bottom"].set_color(SPINE_COLOR)
+
+    method_handles = [
+        Patch(facecolor="#777777", edgecolor=SPINE_COLOR, label="Meerkat"),
+        Patch(facecolor="#BBBBBB", edgecolor=SPINE_COLOR, hatch="..", label="Naive Agent"),
+        Patch(facecolor="#DDDDDD", edgecolor=SPINE_COLOR, hatch="////", label="Per-trace Monitor"),
+    ]
+    fig.legend(
+        handles=method_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.98),
+        ncol=3,
+        title="Method",
+        title_fontsize=LEGEND_FONTSIZE,
+        frameon=False,
+        borderaxespad=0.0,
+        handlelength=1.1,
+        columnspacing=1.0,
+        handletextpad=0.4,
+    )
+
+    out_paths: list[Path] = []
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in formats:
+        out_path = out_base.with_suffix(f".{ext}")
+        fig.savefig(out_path, dpi=300)
+        out_paths.append(out_path)
+    plt.close(fig)
+    return out_paths
+
+
+def _judge_vs_at_ap_scatter_plot(
+    *,
+    rows: list[dict[str, Any]],
+    dataset_labels: dict[str, str],
+    out_base: Path,
+    formats: list[str],
+) -> list[Path]:
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ImportError:
+        print("Skipping figure generation: matplotlib is not installed.")
+        return []
+
+    grouped = _group_plot_rows_by_dataset(rows)
+    points_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for dataset, dataset_rows in grouped.items():
+        if dataset not in dataset_labels:
+            continue
+        judge_by_model: dict[str, dict[str, Any]] = {}
+        for row in dataset_rows:
+            if str(row.get("method_base") or "") != "llmjudge":
+                continue
+            display_model = _display_model_name(str(row.get("method_model") or ""))
+            if not display_model:
+                continue
+            judge_by_model[display_model] = row
+        for row in dataset_rows:
+            if str(row.get("method_base") or "") != "AT":
+                continue
+            method_variant = str(row.get("method_variant") or "").strip()
+            if method_variant != "":
+                continue
+            display_model = _display_model_name(str(row.get("method_model") or ""))
+            if not display_model:
+                continue
+            judge_row = judge_by_model.get(display_model)
+            if judge_row is None:
+                continue
+            judge_file = Path(str(judge_row.get("file") or "")).expanduser()
+            at_file = Path(str(row.get("file") or "")).expanduser()
+            if not judge_file.is_file() or not at_file.is_file():
+                continue
+            judge_cases = {
+                str(case_row.get("case_id") or ""): case_row
+                for case_row in _load_rows(judge_file)
+                if case_row.get("case_id")
+            }
+            at_cases = {
+                str(case_row.get("case_id") or ""): case_row
+                for case_row in _load_rows(at_file)
+                if case_row.get("case_id")
+            }
+            for case_id, judge_case in judge_cases.items():
+                at_case = at_cases.get(case_id)
+                if at_case is None:
+                    continue
+                if not _ground_truth_positive_trace_files(judge_case):
+                    continue
+                judge_ap = _average_precision_from_pairs(_row_trace_score_pairs(judge_case))
+                at_ap = _average_precision_from_pairs(_row_trace_score_pairs(at_case))
+                if judge_ap is None or at_ap is None:
+                    continue
+                points_by_dataset.setdefault(dataset, []).append(
+                    {
+                        "dataset": dataset,
+                        "model": display_model,
+                        "case_id": case_id,
+                        "judge_ap": float(judge_ap),
+                        "at_ap": float(at_ap),
+                    }
+                )
+
+    datasets = [dataset for dataset in sorted(dataset_labels) if points_by_dataset.get(dataset)]
+    if not datasets:
+        return []
+
+    _apply_publication_style(plt)
+    fig, axes = plt.subplots(
+        1,
+        len(datasets),
+        figsize=(FIGURE_WIDTH_IN * max(1.0, 1.02 * len(datasets)), LINE_FIGURE_HEIGHT_IN * 0.98),
+        constrained_layout=False,
+    )
+    if not isinstance(axes, (list, tuple)):
+        try:
+            axes = list(axes.ravel())
+        except Exception:
+            axes = [axes]
+    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.18, top=0.87, wspace=0.24)
+    palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
+    for ax, dataset in zip(axes, datasets):
+        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, color="#999999", alpha=0.8, zorder=1)
+        for point in points_by_dataset.get(dataset, []):
+            color = _model_color(str(point["model"]), 0, palette)
+            ax.scatter(
+                [float(point["judge_ap"])],
+                [float(point["at_ap"])],
+                s=18,
+                marker="o",
+                facecolors=color,
+                edgecolors="#333333",
+                linewidths=0.45,
+                alpha=0.72,
+                zorder=3,
+            )
+        ax.set_xlabel("Per-trace Monitor AP", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+        ax.set_ylabel("Meerkat AP", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color(SPINE_COLOR)
+        ax.spines["bottom"].set_color(SPINE_COLOR)
+
+    model_handles: list[Line2D] = []
+    seen_models: set[str] = set()
+    for dataset in datasets:
+        for point in points_by_dataset.get(dataset, []):
+            model = str(point["model"])
+            if model in seen_models:
+                continue
+            seen_models.add(model)
+            model_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="None",
+                    markerfacecolor=_model_color(model, 0, palette),
+                    markeredgecolor=_model_color(model, 0, palette),
+                    markersize=5.2,
+                    label=model,
+                )
+            )
+
+    legend_kwargs = dict(
+        frameon=False,
+        borderaxespad=0.0,
+        handlelength=1.2,
+        columnspacing=0.8,
+        handletextpad=0.4,
+    )
+    if model_handles:
+        model_legend = fig.legend(
+            handles=model_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.34, 0.99),
+            ncol=max(1, min(3, len(model_handles))),
+            title="Model",
+            title_fontsize=LEGEND_FONTSIZE,
+            **legend_kwargs,
+        )
+        fig.add_artist(model_legend)
+
+    out_paths: list[Path] = []
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in formats:
+        out_path = out_base.with_suffix(f".{ext}")
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
+        out_paths.append(out_path)
+    plt.close(fig)
+    return out_paths
+
+
+def _build_calibration_groups(
+    rows: list[dict[str, Any]],
+) -> tuple[
+    dict[str, dict[str, list[dict[str, float]]]],
+    dict[str, dict[str, tuple[float | None, float | None]]],
+    dict[str, dict[str, list[dict[str, float]]]],
+    dict[str, dict[str, tuple[float | None, float | None]]],
+    dict[str, dict[str, tuple[str | None, str | None, str | None]]],
+]:
+    raw_case_pairs: dict[str, dict[str, list[tuple[int, float]]]] = {}
+    raw_trace_pairs: dict[str, dict[str, list[tuple[int, float]]]] = {}
+    method_info: dict[str, dict[str, tuple[str | None, str | None, str | None]]] = {}
+
+    for row in rows:
         dataset = str(row.get("dataset") or "")
         if dataset not in TRACE_SCORE_DATASET_LABELS:
             continue
@@ -2496,49 +3449,125 @@ def _generate_figures(
         if not file_path.is_file():
             continue
         source_rows = _load_rows(file_path)
-        case_pairs: list[list[tuple[int, float]]] = []
-        case_score_pairs: list[tuple[int, float]] = []
+        trace_pairs: list[tuple[int, float]] = []
+        case_pairs: list[tuple[int, float]] = []
         for source_row in source_rows:
-            row_pairs = _row_trace_score_pairs(source_row)
-            if row_pairs:
-                case_pairs.append(row_pairs)
+            trace_pairs.extend(_row_trace_score_pairs(source_row))
             case_pair = _row_case_score_pair(source_row)
             if case_pair is not None:
-                case_score_pairs.append(case_pair)
-        if not case_pairs:
+                case_pairs.append(case_pair)
+        if not trace_pairs and not case_pairs:
             continue
-        pr_curve_groups.setdefault(dataset, {})[str(row.get("method_label") or "")] = _precision_recall_curve_from_cases(case_pairs)
-        roc_curve_groups.setdefault(dataset, {})[str(row.get("method_label") or "")] = _roc_curve_from_cases(case_pairs)
-        case_pr_curve_groups.setdefault(dataset, {})[str(row.get("method_label") or "")] = _precision_recall_curve_from_flat_pairs(case_score_pairs)
-        case_roc_curve_groups.setdefault(dataset, {})[str(row.get("method_label") or "")] = _roc_curve_from_flat_pairs(case_score_pairs)
-        pr_method_info.setdefault(dataset, {})[str(row.get("method_label") or "")] = (
+        method_label = str(row.get("method_label") or "")
+        if trace_pairs:
+            raw_trace_pairs.setdefault(dataset, {})[method_label] = trace_pairs
+        if case_pairs:
+            raw_case_pairs.setdefault(dataset, {})[method_label] = case_pairs
+        method_info.setdefault(dataset, {})[method_label] = (
             str(row.get("method_model") or "").strip() or None,
             str(row.get("method_base") or "").strip() or None,
             str(row.get("method_variant") or "").strip() or None,
         )
 
-    for dataset, curves_by_method in sorted(pr_curve_groups.items(), key=lambda kv: kv[0]):
-        dataset_slug = _slug(dataset)
-        out_paths.extend(
-            _precision_recall_plot(
-                curves_by_method=curves_by_method,
-                roc_curves_by_method=roc_curve_groups.get(dataset) or {},
-                method_info_by_label=pr_method_info.get(dataset) or {},
-                out_base=figures_dir / f"safety_{dataset_slug}_trace_precision_recall_curve",
-                formats=formats,
-            )
-        )
-        out_paths.extend(
-            _precision_recall_plot(
-                curves_by_method=case_pr_curve_groups.get(dataset) or {},
-                roc_curves_by_method=case_roc_curve_groups.get(dataset) or {},
-                method_info_by_label=pr_method_info.get(dataset) or {},
-                out_base=figures_dir / f"safety_{dataset_slug}_case_precision_recall_curve",
-                formats=formats,
-            )
+    case_curves: dict[str, dict[str, list[dict[str, float]]]] = {}
+    case_metrics: dict[str, dict[str, tuple[float | None, float | None]]] = {}
+    trace_curves: dict[str, dict[str, list[dict[str, float]]]] = {}
+    trace_metrics: dict[str, dict[str, tuple[float | None, float | None]]] = {}
+
+    datasets = sorted(set(raw_case_pairs) | set(raw_trace_pairs))
+    for dataset in datasets:
+        for method_label, pairs in (raw_case_pairs.get(dataset) or {}).items():
+            curve, ece, brier = _calibration_from_pairs(pairs)
+            case_curves.setdefault(dataset, {})[method_label] = curve
+            case_metrics.setdefault(dataset, {})[method_label] = (ece, brier)
+        for method_label, pairs in (raw_trace_pairs.get(dataset) or {}).items():
+            curve, ece, brier = _calibration_from_pairs(pairs)
+            trace_curves.setdefault(dataset, {})[method_label] = curve
+            trace_metrics.setdefault(dataset, {})[method_label] = (ece, brier)
+
+    return case_curves, case_metrics, trace_curves, trace_metrics, method_info
+
+
+def _print_calibration_table(overall_rows: list[dict[str, Any]]) -> None:
+    grouped_rows = _group_plot_rows_by_dataset(overall_rows)
+    flat_rows = [row for dataset_rows in grouped_rows.values() for row in dataset_rows]
+    case_curves, case_metrics, trace_curves, trace_metrics, _ = _build_calibration_groups(flat_rows)
+
+    table_rows: list[tuple[str, str, float | None, float | None, float | None, float | None]] = []
+    for dataset in sorted(set(case_metrics) | set(trace_metrics)):
+        methods = sorted(set(case_metrics.get(dataset, {})) | set(trace_metrics.get(dataset, {})))
+        for method in methods:
+            case_ece, case_brier = (case_metrics.get(dataset, {}) or {}).get(method, (None, None))
+            trace_ece, trace_brier = (trace_metrics.get(dataset, {}) or {}).get(method, (None, None))
+            table_rows.append((dataset, method, case_ece, case_brier, trace_ece, trace_brier))
+
+    if not table_rows:
+        print("\n## Calibration\n(no rows)")
+        return
+
+    print("\n## Calibration")
+    print("dataset | method | case_ece | case_brier | trace_ece | trace_brier")
+    print("--- | --- | --- | --- | --- | ---")
+    for dataset, method, case_ece, case_brier, trace_ece, trace_brier in table_rows:
+        print(
+            f"{dataset} | {method} | {_fmt(case_ece, 4)} | {_fmt(case_brier, 4)} | {_fmt(trace_ece, 4)} | {_fmt(trace_brier, 4)}"
         )
 
+
+def _discover_safety_result_files() -> list[Path]:
+    discovered: list[Path] = []
+    for path in sorted(Path("results").glob("safety_*.jsonl")):
+        if not path.is_file():
+            continue
+        dataset, method = _infer_dataset_and_method_from_file(str(path))
+        dataset_base, _ = _split_dataset_variant(dataset)
+        if dataset_base != "trace-dataset":
+            continue
+        method, _ = _strip_method_variant(method)
+        _, method_model = _split_method_parts(method)
+        if not _should_include_eval_model(method_model):
+            continue
+        discovered.append(path)
+    return discovered
+
+
+def _generate_figures(
+    overall_rows: list[dict[str, Any]],
+    case_rows: list[dict[str, Any]],
+    pct_rows: list[dict[str, Any]],
+    figures_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    del pct_rows
+    out_paths: list[Path] = []
+
+    trace_ap_rows = [
+        row
+        for dataset_rows in _group_plot_rows_by_dataset(overall_rows).values()
+        for row in dataset_rows
+        if str(row.get("dataset") or "") in TRACE_SCORE_DATASET_LABELS and _include_in_paper_outputs(row)
+    ]
+    out_paths.extend(
+        _judge_vs_at_ap_scatter_plot(
+            rows=trace_ap_rows,
+            dataset_labels=TRACE_SCORE_DATASET_LABELS,
+            out_base=figures_dir / "safety_trace_judge_vs_meerkat_trace_ap",
+            formats=formats,
+        )
+    )
+    out_paths.extend(
+        _overall_ap_by_model_plot(
+            rows=trace_ap_rows,
+            out_base=figures_dir / "safety_trace_overall_ap_by_model",
+            formats=formats,
+        )
+    )
+
+    by_dataset_case = _group_plot_rows_by_dataset(case_rows)
     for dataset, rows in sorted(by_dataset_case.items(), key=lambda kv: kv[0]):
+        if dataset != "trace-dataset":
+            continue
+        rows = [row for row in rows if _include_in_paper_outputs(row)]
         method_info = _method_info_by_label(rows)
         numeric_groups = sorted(
             {int(r["group"]) for r in rows if str(r.get("group", "")).isdigit()}
@@ -2549,56 +3578,24 @@ def _generate_figures(
         x_labels = [str(x) for x in x_vals]
 
         methods = sorted({str(r.get("method_label") or "") for r in rows})
-        y_verified_macro_f1: dict[str, list[float | None]] = {m: [] for m in methods}
-        y_verified_macro_f1_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
-        y_cost: dict[str, list[float | None]] = {m: [] for m in methods}
-        y_cost_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
         y_case_ap: dict[str, list[float | None]] = {m: [] for m in methods}
         y_case_ap_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
         y_trace_ap: dict[str, list[float | None]] = {m: [] for m in methods}
         y_trace_ap_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
-        y_case_roc: dict[str, list[float | None]] = {m: [] for m in methods}
-        y_case_roc_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
-        y_trace_roc: dict[str, list[float | None]] = {m: [] for m in methods}
-        y_trace_roc_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
         row_lookup = {
-            (str(r.get("method_label") or ""), int(str(r.get("group") or "0"))): r for r in rows if str(r.get("group", "")).isdigit()
+            (str(r.get("method_label") or ""), int(str(r.get("group") or "0"))): r
+            for r in rows
+            if str(r.get("group", "")).isdigit()
         }
         for m in methods:
             for x in x_vals:
                 row = row_lookup.get((m, x))
                 if row is None:
-                    y_verified_macro_f1[m].append(None)
-                    y_verified_macro_f1_ci[m].append(None)
-                    y_cost[m].append(None)
-                    y_cost_ci[m].append(None)
                     y_case_ap[m].append(None)
                     y_case_ap_ci[m].append(None)
                     y_trace_ap[m].append(None)
                     y_trace_ap_ci[m].append(None)
-                    y_case_roc[m].append(None)
-                    y_case_roc_ci[m].append(None)
-                    y_trace_roc[m].append(None)
-                    y_trace_roc_ci[m].append(None)
                     continue
-                macro_f1 = _to_float(row.get("verified_macro_f1"))
-                macro_f1_low = _to_float(row.get("verified_macro_f1_ci_low"))
-                macro_f1_high = _to_float(row.get("verified_macro_f1_ci_high"))
-                y_verified_macro_f1[m].append(macro_f1)
-                if macro_f1 is None or macro_f1_low is None or macro_f1_high is None:
-                    y_verified_macro_f1_ci[m].append(None)
-                else:
-                    y_verified_macro_f1_ci[m].append(
-                        (max(0.0, macro_f1 - macro_f1_low), max(0.0, macro_f1_high - macro_f1))
-                    )
-                cost = _to_float(row.get("avg_cost_usd_per_case"))
-                cost_low = _to_float(row.get("avg_cost_usd_per_case_ci_low"))
-                cost_high = _to_float(row.get("avg_cost_usd_per_case_ci_high"))
-                y_cost[m].append(cost)
-                if cost is None or cost_low is None or cost_high is None:
-                    y_cost_ci[m].append(None)
-                else:
-                    y_cost_ci[m].append((max(0.0, cost - cost_low), max(0.0, cost_high - cost)))
                 case_ap = _to_float(row.get("case_average_precision"))
                 case_ap_low = _to_float(row.get("case_average_precision_ci_low"))
                 case_ap_high = _to_float(row.get("case_average_precision_ci_high"))
@@ -2606,9 +3603,8 @@ def _generate_figures(
                 if case_ap is None or case_ap_low is None or case_ap_high is None:
                     y_case_ap_ci[m].append(None)
                 else:
-                    y_case_ap_ci[m].append(
-                        (max(0.0, case_ap - case_ap_low), max(0.0, case_ap_high - case_ap))
-                    )
+                    y_case_ap_ci[m].append((max(0.0, case_ap - case_ap_low), max(0.0, case_ap_high - case_ap)))
+
                 trace_ap = _to_float(row.get("trace_average_precision"))
                 trace_ap_low = _to_float(row.get("trace_average_precision_ci_low"))
                 trace_ap_high = _to_float(row.get("trace_average_precision_ci_high"))
@@ -2616,63 +3612,11 @@ def _generate_figures(
                 if trace_ap is None or trace_ap_low is None or trace_ap_high is None:
                     y_trace_ap_ci[m].append(None)
                 else:
-                    y_trace_ap_ci[m].append(
-                        (max(0.0, trace_ap - trace_ap_low), max(0.0, trace_ap_high - trace_ap))
-                    )
-                case_roc = _to_float(row.get("case_roc_auc"))
-                case_roc_low = _to_float(row.get("case_roc_auc_ci_low"))
-                case_roc_high = _to_float(row.get("case_roc_auc_ci_high"))
-                y_case_roc[m].append(case_roc)
-                if case_roc is None or case_roc_low is None or case_roc_high is None:
-                    y_case_roc_ci[m].append(None)
-                else:
-                    y_case_roc_ci[m].append(
-                        (max(0.0, case_roc - case_roc_low), max(0.0, case_roc_high - case_roc))
-                    )
-                trace_roc = _to_float(row.get("trace_roc_auc"))
-                trace_roc_low = _to_float(row.get("trace_roc_auc_ci_low"))
-                trace_roc_high = _to_float(row.get("trace_roc_auc_ci_high"))
-                y_trace_roc[m].append(trace_roc)
-                if trace_roc is None or trace_roc_low is None or trace_roc_high is None:
-                    y_trace_roc_ci[m].append(None)
-                else:
-                    y_trace_roc_ci[m].append(
-                        (max(0.0, trace_roc - trace_roc_low), max(0.0, trace_roc_high - trace_roc))
-                    )
+                    y_trace_ap_ci[m].append((max(0.0, trace_ap - trace_ap_low), max(0.0, trace_ap_high - trace_ap)))
 
         dataset_slug = _slug(dataset)
         out_paths.extend(
-            _line_plot(
-                title=f"Safety ({dataset}) - Verified Macro F1 vs Case Size",
-                x_values=x_vals,
-                x_labels=x_labels,
-                y_by_method=y_verified_macro_f1,
-                yerr_by_method=y_verified_macro_f1_ci,
-                method_info_by_label=method_info,
-                ylabel="Verified Macro F1",
-                xlabel="Traces per Case",
-                x_label_rotation=0,
-                out_base=figures_dir / f"safety_{dataset_slug}_verified_macro_f1_by_case_size",
-                formats=formats,
-            )
-        )
-        out_paths.extend(
-            _line_plot(
-                title=f"Safety ({dataset}) - Avg Cost (USD) vs Case Size",
-                x_values=x_vals,
-                x_labels=x_labels,
-                y_by_method=y_cost,
-                yerr_by_method=y_cost_ci,
-                method_info_by_label=method_info,
-                ylabel="Avg Cost per Case (USD)",
-                xlabel="Traces per Case",
-                x_label_rotation=0,
-                out_base=figures_dir / f"safety_{dataset_slug}_avg_cost_by_case_size",
-                formats=formats,
-            )
-        )
-        out_paths.extend(
-            _auprc_by_case_size_plot(
+            _ap_by_case_size_plot(
                 dataset=dataset,
                 x_values=x_vals,
                 x_labels=x_labels,
@@ -2680,110 +3624,13 @@ def _generate_figures(
                 case_ap_err_by_method=y_case_ap_ci,
                 trace_ap_by_method=y_trace_ap,
                 trace_ap_err_by_method=y_trace_ap_ci,
-                case_roc_by_method=y_case_roc,
-                case_roc_err_by_method=y_case_roc_ci,
-                trace_roc_by_method=y_trace_roc,
-                trace_roc_err_by_method=y_trace_roc_ci,
                 method_info_by_label=method_info,
-                out_base=figures_dir / f"safety_{dataset_slug}_auprc_by_case_size",
-                formats=formats,
-            )
-        )
-
-    for dataset, rows in sorted(by_dataset_pct.items(), key=lambda kv: kv[0]):
-        method_info = _method_info_by_label(rows)
-        groups = sorted({str(r.get("group") or "") for r in rows}, key=_pct_bucket_sort_key)
-        positive_groups = [g for g in groups if g not in {"0%", "unknown"}]
-        if not positive_groups:
-            continue
-        x_vals = positive_groups
-        x_labels = positive_groups
-        methods = sorted({str(r.get("method_label") or "") for r in rows})
-        y_recall: dict[str, list[float | None]] = {m: [] for m in methods}
-        y_recall_ci: dict[str, list[tuple[float, float] | None]] = {m: [] for m in methods}
-        row_lookup = {(str(r.get("method_label") or ""), str(r.get("group") or "")): r for r in rows}
-        for m in methods:
-            for g in positive_groups:
-                row = row_lookup.get((m, g))
-                if row is None:
-                    y_recall[m].append(None)
-                    y_recall_ci[m].append(None)
-                    continue
-                tp = _to_int(row.get("tp"))
-                fn = _to_int(row.get("fn"))
-                denom = tp + fn
-                p, low, high = _wilson_ci(tp, denom)
-                y_recall[m].append(p)
-                if p is None or low is None or high is None:
-                    y_recall_ci[m].append(None)
-                else:
-                    y_recall_ci[m].append((p - low, high - p))
-
-        dataset_slug = _slug(dataset)
-        out_paths.extend(
-            _line_plot(
-                title=f"Safety ({dataset}) - Verified Recall vs Positive % Bucket",
-                x_values=x_vals,
-                x_labels=x_labels,
-                y_by_method=y_recall,
-                yerr_by_method=y_recall_ci,
-                method_info_by_label=method_info,
-                ylabel="Verified Recall",
-                xlabel="Positive Trace Percentage Bucket",
-                x_label_rotation=15,
-                out_base=figures_dir / f"safety_{dataset_slug}_verified_recall_by_positive_pct",
-                formats=formats,
-            )
-        )
-
-        benign_method_labels: list[str] = []
-        benign_values: list[float] = []
-        benign_lower_errs: list[float] = []
-        benign_upper_errs: list[float] = []
-        for m in methods:
-            row = row_lookup.get((m, "0%"))
-            if row is None:
-                continue
-            fp = _to_int(row.get("fp"))
-            tn = _to_int(row.get("tn"))
-            denom = fp + tn
-            p, low, high = _wilson_ci(fp, denom)
-            if p is None or low is None or high is None:
-                continue
-            benign_method_labels.append(m)
-            benign_values.append(p)
-            benign_lower_errs.append(p - low)
-            benign_upper_errs.append(high - p)
-
-        out_paths.extend(
-            _bar_plot_with_ci(
-                title=f"Safety ({dataset}) - Benign False Positive Rate (0% Positive Bucket)",
-                method_labels=benign_method_labels,
-                method_info_by_label=method_info,
-                values=benign_values,
-                lower_errs=benign_lower_errs,
-                upper_errs=benign_upper_errs,
-                ylabel="Benign FPR",
-                xlabel="Method",
-                out_base=figures_dir / f"safety_{dataset_slug}_benign_false_positive_rate",
+                out_base=figures_dir / f"safety_{dataset_slug}_ap_by_case_size",
                 formats=formats,
             )
         )
 
     return out_paths
-
-
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0].keys())
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -2831,12 +3678,6 @@ def main() -> None:
     if not figure_formats:
         figure_formats = ["png", "pdf"]
     positive_pct_bounds = _parse_positive_pct_bins(args.positive_pct_bins)
-    print("Positive-percent buckets:")
-    print("- 0%")
-    lower = 0.0
-    for upper in positive_pct_bounds:
-        print(f"- ({lower:.1f},{upper:.1f}]%")
-        lower = upper
 
     files = args.results
     if not files:
@@ -2867,27 +3708,11 @@ def main() -> None:
         all_by_case.extend(by_case)
         all_by_pct.extend(by_pct)
 
-    overall_chart_rows = list(all_overall)
-    for file in _discover_safety_result_files():
-        if file.resolve() in loaded_files:
-            continue
-        try:
-            overall, _, _ = _collect_metrics(
-                file,
-                positive_pct_bounds=positive_pct_bounds,
-            )
-        except Exception as exc:
-            print(f"Skipping overall-bar-chart load for {file}: {exc}")
-            continue
-        overall_chart_rows.extend(overall)
-
-    _print_table("Overall", all_overall, include_group=False)
-    _print_table("By Case Size", all_by_case, include_group=True)
-    _print_table("By Positive Percent", all_by_pct, include_group=True)
+    _print_paper_table(all_overall)
 
     if not args.no_figures:
         figure_paths = _generate_figures(
-            overall_rows=overall_chart_rows,
+            overall_rows=all_overall,
             case_rows=all_by_case,
             pct_rows=all_by_pct,
             figures_dir=args.figures_dir,
