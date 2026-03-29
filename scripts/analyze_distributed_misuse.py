@@ -17,7 +17,7 @@ from experiments.safety import _score_traces_parallel, _safe_slug, _trace_conten
 
 
 DM_FILE_RE = re.compile(
-    r"dm_(?P<domain>bio|cyber)_d(?P<decomp>\d+)_bg(?P<background>\d+)_(?P<variant>v2|scored)\.jsonl$"
+    r"dm_(?P<domain>bio|cyber)_d(?P<decomp>\d+)_bg(?P<background>\d+)_(?P<variant>v6|v2|scored)\.jsonl$"
 )
 
 
@@ -87,7 +87,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "inputs",
         nargs="*",
-        help="Optional dm_*_v2.jsonl or dm_*_scored.jsonl files. If omitted, auto-discovers dm_*_v2.jsonl first and falls back to dm_*_scored.jsonl.",
+        help="Optional dm_*_v6.jsonl, dm_*_v2.jsonl, or dm_*_scored.jsonl files. If omitted, auto-discovers dm_*_v6.jsonl first, then dm_*_v2.jsonl, then falls back to dm_*_scored.jsonl.",
     )
     parser.add_argument(
         "--results-dir",
@@ -766,7 +766,7 @@ def _paper_curve_runs(
     candidates: list[tuple[Path, str, str, int]] = []
     if domain == "cyber":
         for bg in (2, 20, 100):
-            path = results_dir / f"dm_cyber_d6_bg{bg}_v2.jsonl"
+            path = results_dir / f"dm_cyber_d6_bg{bg}_v6.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
         for bg in (20, 100):
@@ -1375,17 +1375,11 @@ def main() -> None:
     else:
         results_dir = Path(args.results_dir)
         preferred: dict[tuple[str, str, str], Path] = {}
-        for path in sorted(results_dir.glob("dm_*_v2.jsonl")):
-            match = DM_FILE_RE.match(path.name)
-            if match:
-                preferred[(match.group("domain"), match.group("decomp"), match.group("background"))] = path
-        for path in sorted(results_dir.glob("dm_*_scored.jsonl")):
-            match = DM_FILE_RE.match(path.name)
-            if match:
-                preferred.setdefault(
-                    (match.group("domain"), match.group("decomp"), match.group("background")),
-                    path,
-                )
+        for pattern in ("dm_*_v6.jsonl", "dm_*_v2.jsonl", "dm_*_scored.jsonl"):
+            for path in sorted(results_dir.glob(pattern)):
+                match = DM_FILE_RE.match(path.name)
+                if match:
+                    preferred.setdefault((match.group("domain"), match.group("decomp"), match.group("background")), path)
         input_paths = sorted(preferred.values())
     if not input_paths:
         raise SystemExit("No distributed-misuse result JSONL files found.")
