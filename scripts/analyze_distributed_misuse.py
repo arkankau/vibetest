@@ -1089,8 +1089,8 @@ def _plot_main_paper_pr_figure(
     if not runs:
         return []
 
-    fig = plt.figure(figsize=(10.8, 6.8))
-    grid = fig.add_gridspec(2, 6, hspace=0.38, wspace=0.35)
+    fig = plt.figure(figsize=(5.5, 3.65))
+    grid = fig.add_gridspec(2, 6, hspace=0.42, wspace=0.38)
     axes = {
         ("gpt-5.4-mini", 2): fig.add_subplot(grid[0, 0:2]),
         ("gpt-5.4-mini", 20): fig.add_subplot(grid[0, 2:4]),
@@ -1146,9 +1146,9 @@ def _plot_main_paper_pr_figure(
         case_counts = {run.method_label: run.case_count for run in panel_runs}
         unique_counts = sorted(set(case_counts.values()))
         if len(unique_counts) == 1:
-            ax.set_title(f"bg={panel_key[1]}x (n={unique_counts[0]})", fontsize=11, pad=6)
+            ax.set_title(f"bg={panel_key[1]}x (n={unique_counts[0]})", fontsize=8.5, pad=4)
         else:
-            ax.set_title(f"bg={panel_key[1]}x", fontsize=11, pad=6)
+            ax.set_title(f"bg={panel_key[1]}x", fontsize=8.5, pad=4)
             ax.text(
                 0.98,
                 0.98,
@@ -1156,7 +1156,7 @@ def _plot_main_paper_pr_figure(
                 transform=ax.transAxes,
                 ha="right",
                 va="top",
-                fontsize=8,
+                fontsize=6.2,
                 color="#444444",
                 bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.75},
             )
@@ -1171,12 +1171,11 @@ def _plot_main_paper_pr_figure(
     for bg in (2, 20, 100):
         ax = axes.get(("gpt-5.4-mini", bg))
         if ax and ax.axison and bg == 2:
-            ax.set_ylabel("gpt-5.4-mini\nPrecision")
+            ax.set_ylabel("gpt-5.4-mini\nPrecision", fontsize=8.5)
     qwen_left = axes.get(("Qwen-3.5", 20))
     if qwen_left and qwen_left.axison:
-        qwen_left.set_ylabel("Qwen-3.5\nPrecision")
+        qwen_left.set_ylabel("Qwen-3.5\nPrecision", fontsize=8.5)
 
-    fig.suptitle("Distributed Misuse (Cyber): Trace-Level Precision-Recall", fontsize=16, y=0.985)
     if method_labels:
         fig.legend(
             [method_labels[label] for label in method_order if label in method_labels],
@@ -1184,15 +1183,18 @@ def _plot_main_paper_pr_figure(
             loc="upper center",
             ncol=len(method_labels),
             frameon=False,
-            bbox_to_anchor=(0.5, 0.955),
+            bbox_to_anchor=(0.5, 0.995),
+            fontsize=8.5,
+            handlelength=2.2,
+            columnspacing=1.2,
         )
-    fig.subplots_adjust(top=0.84, left=0.08, right=0.99, bottom=0.10)
+    fig.subplots_adjust(top=0.84, left=0.13, right=0.995, bottom=0.12)
 
     output_paths: list[Path] = []
     out_base = figures_dir / "dm_cyber_paper_pr_curves"
     for fmt in figure_formats:
         out_path = out_base.with_suffix(f".{fmt}")
-        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
+        fig.savefig(out_path)
         output_paths.append(out_path)
     plt.close(fig)
     return output_paths
