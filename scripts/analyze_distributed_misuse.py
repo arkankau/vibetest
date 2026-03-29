@@ -13,7 +13,6 @@ from typing import Any
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-from experiments.safety import _score_traces_parallel, _safe_slug, _trace_content_hash
 
 
 DM_FILE_RE = re.compile(
@@ -462,6 +461,8 @@ def _recompute_stage1_scores_for_rows(
     concurrency: int,
     cache_dir: Path,
 ) -> dict[str, dict[str, float]]:
+    from experiments.safety import _score_traces_parallel, _safe_slug, _trace_content_hash
+
     model_slug = _safe_slug(model_name).lower()
     cache_path = cache_dir / f"{model_slug}.json"
     cache = _load_stage1_cache(cache_path)
@@ -702,6 +703,26 @@ def _interp_precision_at_recalls(curve: list[dict[str, float]], recall_grid: lis
     return out
 
 
+def _average_precision_from_pr_curve(curve: list[dict[str, float]] | None) -> float | None:
+    if not curve:
+        return None
+    points = sorted(
+        (
+            max(0.0, min(1.0, float(point.get("recall", 0.0)))),
+            max(0.0, min(1.0, float(point.get("precision", 0.0)))),
+        )
+        for point in curve
+    )
+    ap = 0.0
+    prev_recall = 0.0
+    for recall, precision in points:
+        if recall <= prev_recall:
+            continue
+        ap += (recall - prev_recall) * precision
+        prev_recall = recall
+    return ap
+
+
 def _bootstrap_pr_band(
     per_case_scores: list[tuple[dict[str, float], set[str]]],
     *,
@@ -710,11 +731,11 @@ def _bootstrap_pr_band(
 ) -> tuple[list[float], list[float], list[float], float | None]:
     valid_cases = [(scores, gt) for scores, gt in per_case_scores if scores and gt]
     if not valid_cases:
-        grid = [i / 100.0 for i in range(101)]
+        grid = [i / 20.0 for i in range(21)]
         zeros = [0.0 for _ in grid]
         return grid, zeros, zeros, None
     ap, curve, _, _ = _average_curves(valid_cases)
-    recall_grid = [i / 100.0 for i in range(101)]
+    recall_grid = [i / 20.0 for i in range(21)]
     rng = random.Random(seed)
     samples: list[list[float]] = []
     n = len(valid_cases)
@@ -736,6 +757,16 @@ def _bootstrap_pr_band(
         lower.append(vals[lo_idx])
         upper.append(vals[hi_idx])
     return recall_grid, lower, upper, ap
+
+
+def _collect_stage2_case_curves(path: Path) -> tuple[list[list[dict[str, float]]], int]:
+    rows = _load_rows(path)
+    curves: list[list[dict[str, float]]] = []
+    for row in rows:
+        curve = row.get("scoring", {}).get("pr_curve")
+        if curve:
+            curves.append(curve)
+    return curves, len(rows)
 
 
 def _collect_stage2_cases(path: Path) -> tuple[list[tuple[dict[str, float], set[str]]], int]:
@@ -773,6 +804,9 @@ def _paper_curve_runs(
             path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_n{20 if bg == 20 else 50}.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "Qwen-3.5", "Meerkat", bg))
+            path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl"
+            if path.is_file() and _want(path):
+                candidates.append((path, "Qwen-3.5", "Bayesian", bg))
         for path, model_label in (
             (results_dir / "dm_cyber_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
             (results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
@@ -788,6 +822,9 @@ def _paper_curve_runs(
             path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_{suffix}.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "Qwen-3.5", "Meerkat", bg))
+            path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl"
+            if path.is_file() and _want(path):
+                candidates.append((path, "Qwen-3.5", "Bayesian", bg))
         for path, model_label in (
             (results_dir / "dm_bio_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
             (results_dir / "dm_bio_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
@@ -796,17 +833,41 @@ def _paper_curve_runs(
                 candidates.append((path, model_label, "Buffer", 100))
 
     runs: list[PaperCurveRun] = []
+    recall_grid = [i / 20.0 for i in range(21)]
     for path, model_label, method_label, bg in candidates:
-        per_case_scores, case_count = _collect_stage2_cases(path)
-        if not per_case_scores:
-            continue
-        _, curve, _, _ = _average_curves(per_case_scores)
-        recall_grid, lower, upper, ap = _bootstrap_pr_band(
-            per_case_scores,
-            n_bootstrap=60,
-            seed=bg + len(runs) * 17,
-        )
-        precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
+        per_case_curves, case_count = _collect_stage2_case_curves(path)
+        if per_case_curves:
+            curve_samples = [_interp_precision_at_recalls(curve, recall_grid) for curve in per_case_curves]
+            precision_curve = [sum(sample[i] for sample in curve_samples) / len(curve_samples) for i in range(len(recall_grid))]
+            ap_values = [_average_precision_from_pr_curve(curve) for curve in per_case_curves]
+            ap_values = [float(ap) for ap in ap_values if ap is not None]
+            ap = (sum(ap_values) / len(ap_values)) if ap_values else None
+            rng = random.Random(bg + len(runs) * 17)
+            lower: list[float] = []
+            upper: list[float] = []
+            if len(curve_samples) == 1:
+                lower = precision_curve[:]
+                upper = precision_curve[:]
+            else:
+                boot_means: list[list[float]] = []
+                for _ in range(32):
+                    sampled = [curve_samples[rng.randrange(len(curve_samples))] for _ in range(len(curve_samples))]
+                    boot_means.append([sum(sample[i] for sample in sampled) / len(sampled) for i in range(len(recall_grid))])
+                for idx in range(len(recall_grid)):
+                    vals = sorted(sample[idx] for sample in boot_means)
+                    lower.append(vals[max(0, int(0.025 * len(vals)) - 1)])
+                    upper.append(vals[min(len(vals) - 1, int(0.975 * len(vals)))])
+        else:
+            per_case_scores, case_count = _collect_stage2_cases(path)
+            if not per_case_scores:
+                continue
+            _, curve, _, _ = _average_curves(per_case_scores)
+            recall_grid, lower, upper, ap = _bootstrap_pr_band(
+                per_case_scores,
+                n_bootstrap=4,
+                seed=bg + len(runs) * 17,
+            )
+            precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
         runs.append(
             PaperCurveRun(
                 path=path,
@@ -1127,13 +1188,15 @@ def _plot_main_paper_pr_figure(
             ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
             ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
         }
-        method_order = ["Meerkat", "Buffer"]
+        method_order = ["Meerkat", "Bayesian", "Buffer"]
         method_colors = {
             "Meerkat": "#D55E00",
+            "Bayesian": "#0072B2",
             "Buffer": "#009E73",
         }
         method_linestyles = {
             "Meerkat": "-",
+            "Bayesian": ":",
             "Buffer": "--",
         }
         runs_by_panel: dict[tuple[str, int], list[PaperCurveRun]] = {}
@@ -1246,13 +1309,15 @@ def _plot_bio_paper_pr_figure(
             ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
             ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
         }
-        method_order = ["Meerkat", "Buffer"]
+        method_order = ["Meerkat", "Bayesian", "Buffer"]
         method_colors = {
             "Meerkat": "#D55E00",
+            "Bayesian": "#0072B2",
             "Buffer": "#009E73",
         }
         method_linestyles = {
             "Meerkat": "-",
+            "Bayesian": ":",
             "Buffer": "--",
         }
         runs_by_panel: dict[tuple[str, int], list[PaperCurveRun]] = {}
