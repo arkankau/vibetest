@@ -752,27 +752,48 @@ def _collect_stage2_cases(path: Path) -> tuple[list[tuple[dict[str, float], set[
     return stage2_cases, len(rows)
 
 
-def _paper_curve_runs(results_dir: Path, explicit_inputs: list[Path] | None = None) -> list[PaperCurveRun]:
+def _paper_curve_runs(
+    results_dir: Path,
+    explicit_inputs: list[Path] | None = None,
+    *,
+    domain: str = "cyber",
+) -> list[PaperCurveRun]:
     explicit_set = {path.resolve() for path in explicit_inputs or []}
 
     def _want(path: Path) -> bool:
         return not explicit_set or path.resolve() in explicit_set
 
     candidates: list[tuple[Path, str, str, int]] = []
-    for bg in (2, 20, 100):
-        path = results_dir / f"dm_cyber_d6_bg{bg}_v2.jsonl"
-        if path.is_file() and _want(path):
-            candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
-    for bg in (20, 100):
-        path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_n{20 if bg == 20 else 50}.jsonl"
-        if path.is_file() and _want(path):
-            candidates.append((path, "Qwen-3.5", "Meerkat", bg))
-    for path, model_label in (
-        (results_dir / "dm_cyber_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
-        (results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
-    ):
-        if path.is_file() and _want(path):
-            candidates.append((path, model_label, "Buffer", 100))
+    if domain == "cyber":
+        for bg in (2, 20, 100):
+            path = results_dir / f"dm_cyber_d6_bg{bg}_v2.jsonl"
+            if path.is_file() and _want(path):
+                candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
+        for bg in (20, 100):
+            path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_n{20 if bg == 20 else 50}.jsonl"
+            if path.is_file() and _want(path):
+                candidates.append((path, "Qwen-3.5", "Meerkat", bg))
+        for path, model_label in (
+            (results_dir / "dm_cyber_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
+            (results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
+        ):
+            if path.is_file() and _want(path):
+                candidates.append((path, model_label, "Buffer", 100))
+    elif domain == "bio":
+        for bg in (2, 20, 100):
+            path = results_dir / f"dm_bio_d6_bg{bg}_v6.jsonl"
+            if path.is_file() and _want(path):
+                candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
+        for bg, suffix in ((20, "n20"), (100, "2pass_n50")):
+            path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_{suffix}.jsonl"
+            if path.is_file() and _want(path):
+                candidates.append((path, "Qwen-3.5", "Meerkat", bg))
+        for path, model_label in (
+            (results_dir / "dm_bio_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
+            (results_dir / "dm_bio_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
+        ):
+            if path.is_file() and _want(path):
+                candidates.append((path, model_label, "Buffer", 100))
 
     runs: list[PaperCurveRun] = []
     for path, model_label, method_label, bg in candidates:
@@ -1198,6 +1219,125 @@ def _plot_main_paper_pr_figure(
         return output_paths
 
 
+def _plot_bio_paper_pr_figure(
+    *,
+    results_dir: Path,
+    figures_dir: Path,
+    figure_formats: list[str],
+    input_paths: list[Path],
+) -> list[Path]:
+    runs = _paper_curve_runs(results_dir, input_paths, domain="bio")
+    if not runs:
+        return []
+    with mpl.rc_context(
+        {
+            "font.family": "serif",
+            "font.serif": ["Computer Modern Roman", "CMU Serif", "STIX Two Text", "DejaVu Serif"],
+            "mathtext.fontset": "cm",
+            "axes.unicode_minus": False,
+        }
+    ):
+        fig = plt.figure(figsize=(5.5, 3.65))
+        grid = fig.add_gridspec(2, 6, hspace=0.42, wspace=0.28)
+        axes = {
+            ("gpt-5.4-mini", 2): fig.add_subplot(grid[0, 0:2]),
+            ("gpt-5.4-mini", 20): fig.add_subplot(grid[0, 2:4]),
+            ("gpt-5.4-mini", 100): fig.add_subplot(grid[0, 4:6]),
+            ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
+            ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
+        }
+        method_order = ["Meerkat", "Buffer"]
+        method_colors = {
+            "Meerkat": "#D55E00",
+            "Buffer": "#009E73",
+        }
+        method_linestyles = {
+            "Meerkat": "-",
+            "Buffer": "--",
+        }
+        runs_by_panel: dict[tuple[str, int], list[PaperCurveRun]] = {}
+        for run in runs:
+            runs_by_panel.setdefault((run.model_label, run.background_multiplier), []).append(run)
+
+        for panel_key, ax in axes.items():
+            panel_runs = sorted(
+                runs_by_panel.get(panel_key, []),
+                key=lambda run: method_order.index(run.method_label) if run.method_label in method_order else 99,
+            )
+            if not panel_runs:
+                ax.axis("off")
+                continue
+            legend_handles: list[Any] = []
+            legend_labels: list[str] = []
+            for run in panel_runs:
+                color = method_colors.get(run.method_label, "#555555")
+                linestyle = method_linestyles.get(run.method_label, "-")
+                ax.fill_between(
+                    run.recall_grid,
+                    run.precision_lower,
+                    run.precision_upper,
+                    color=color,
+                    alpha=0.14,
+                    linewidth=0.0,
+                    zorder=1,
+                )
+                (line,) = ax.plot(
+                    run.recall_grid,
+                    run.precision_curve,
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=2.2,
+                    zorder=2,
+                    label=run.method_label,
+                )
+                legend_handles.append(line)
+                ap_text = "na" if run.average_precision is None else f"{run.average_precision:.2f}"
+                legend_labels.append(f"{run.method_label} (AP={ap_text})")
+            case_counts = {run.method_label: run.case_count for run in panel_runs}
+            unique_counts = sorted(set(case_counts.values()))
+            if len(unique_counts) == 1:
+                ax.set_title(f"bg={panel_key[1]}x (n={unique_counts[0]})", fontsize=8.5, pad=4)
+            else:
+                ax.set_title(f"bg={panel_key[1]}x", fontsize=8.5, pad=4)
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.02)
+            ax.grid(alpha=0.25)
+            ax.set_xticks([0.0, 0.5, 1.0])
+            ax.tick_params(labelsize=7.0)
+            if panel_key[0] == "Qwen-3.5":
+                ax.set_xlabel("Recall", fontsize=8.5)
+            ax.legend(
+                legend_handles,
+                legend_labels,
+                loc="upper right" if panel_key[1] == 100 else "lower left",
+                frameon=False,
+                fontsize=6.4,
+                handlelength=1.9,
+                borderaxespad=0.2,
+                labelspacing=0.2,
+            )
+            if panel_key != ("gpt-5.4-mini", 2) and panel_key != ("Qwen-3.5", 20):
+                ax.tick_params(labelleft=False)
+
+        top_left = axes.get(("gpt-5.4-mini", 2))
+        if top_left and top_left.axison:
+            top_left.set_ylabel("gpt-5.4-mini\nPrecision", fontsize=8.5)
+        bottom_left = axes.get(("Qwen-3.5", 20))
+        if bottom_left and bottom_left.axison:
+            bottom_left.set_ylabel("Qwen-3.5\nPrecision", fontsize=8.5)
+
+        fig.subplots_adjust(top=0.92, left=0.14, right=0.98, bottom=0.12)
+
+        output_paths: list[Path] = []
+        out_base = figures_dir / "dm_bio_paper_pr_curves"
+        for fmt in figure_formats:
+            out_path = out_base.with_suffix(f".{fmt}")
+            fig.savefig(out_path)
+            output_paths.append(out_path)
+        plt.close(fig)
+        return output_paths
+
+
 def _print_summary_table(metrics: list[SettingMetrics]) -> None:
     print("| setting | source | model | judge_ap | AT_ap | judge_cases | AT_cases |")
     print("|---|---|---|---:|---:|---:|---:|")
@@ -1212,17 +1352,18 @@ def _print_summary_table(metrics: list[SettingMetrics]) -> None:
 
 
 def _print_paper_run_summary(results_dir: Path, input_paths: list[Path]) -> None:
-    runs = _paper_curve_runs(results_dir, input_paths)
-    if not runs:
-        return
-    print("\n| model | bg | method | cases | trace_ap | file |")
-    print("|---|---:|---|---:|---:|---|")
-    for run in sorted(runs, key=lambda item: (item.model_label, item.background_multiplier, item.method_label)):
-        ap_text = "na" if run.average_precision is None else f"{run.average_precision:.3f}"
-        print(
-            f"| {run.model_label} | {run.background_multiplier} | {run.method_label} | "
-            f"{run.case_count} | {ap_text} | {run.path.name} |"
-        )
+    for domain in ("cyber", "bio"):
+        runs = _paper_curve_runs(results_dir, input_paths, domain=domain)
+        if not runs:
+            continue
+        print(f"\n| {domain} model | bg | method | cases | trace_ap | file |")
+        print("|---|---:|---|---:|---:|---|")
+        for run in sorted(runs, key=lambda item: (item.model_label, item.background_multiplier, item.method_label)):
+            ap_text = "na" if run.average_precision is None else f"{run.average_precision:.3f}"
+            print(
+                f"| {run.model_label} | {run.background_multiplier} | {run.method_label} | "
+                f"{run.case_count} | {ap_text} | {run.path.name} |"
+            )
 
 
 def main() -> None:
@@ -1282,6 +1423,14 @@ def main() -> None:
             recompute_stage1_if_missing=args.recompute_stage1_if_missing,
             stage1_concurrency=args.stage1_concurrency,
             stage1_cache_dir=stage1_cache_dir,
+        )
+    )
+    figure_paths.extend(
+        _plot_bio_paper_pr_figure(
+            results_dir=Path(args.results_dir),
+            figures_dir=figures_dir,
+            figure_formats=figure_formats,
+            input_paths=explicit_input_paths or [],
         )
     )
     print("\nWrote figures:")
