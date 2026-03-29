@@ -56,6 +56,7 @@ MODEL_COLORS = {
     "gpt-5-mini": "#0072B2",
     "gpt-5.4-mini": "#56B4E9",
     "gpt-5.4": "#009E73",
+    "GLM-5": "#7A68A6",
     "Qwen-3.5": "#CC79A7",
     "MiniMax-M2.5": "#D55E00",
 }
@@ -65,8 +66,8 @@ METHOD_HATCHES = {
     "AT-claude": "",
     "llmjudge": "////",
 }
-# ALLOWED_EVAL_MODELS = {"gpt-5-mini", "gpt-5.4-mini", "gpt-5.4", "Qwen-3.5", "MiniMax-M2.5"}
-ALLOWED_EVAL_MODELS = {"Qwen-3.5", "gpt-5.4-mini"}
+# ALLOWED_EVAL_MODELS = {"gpt-5-mini", "gpt-5.4-mini", "gpt-5.4", "GLM-5", "Qwen-3.5", "MiniMax-M2.5"}
+ALLOWED_EVAL_MODELS = {"Qwen-3.5", "gpt-5.4-mini", "GLM-5"}
 OVERALL_DATASET_LABELS = {
     # "impossiblebench_gpt-5-mini": "ImpossibleBench",
     "mle-sabotage": "MLE-Sabotage",
@@ -991,6 +992,8 @@ def _display_model_name(model: str | None) -> str | None:
     if text == "MiniMaxAI-MiniMax-M2.5":
         return "MiniMax-M2.5"
     lowered = text.lower()
+    if lowered in {"glm-5", "zai-org-glm-5"} or "glm-5" in lowered:
+        return "GLM-5"
     if lowered in {"qwen3.5", "qwen-3.5"} or "qwen3.5" in lowered or "qwen-3.5" in lowered:
         return "Qwen-3.5"
     return text
@@ -2907,7 +2910,7 @@ def _grouped_overall_metric_bar_plot(
                 str(row.get("method_variant") or "").strip() or None,
             )
 
-    preferred_model_order = ("gpt-5-mini", "gpt-5.4-mini", "gpt-5.4", "Qwen-3.5", "MiniMax-M2.5")
+    preferred_model_order = ("gpt-5-mini", "gpt-5.4-mini", "gpt-5.4", "GLM-5", "Qwen-3.5", "MiniMax-M2.5")
     model_order = [
         model_name
         for model_name in preferred_model_order
@@ -3139,7 +3142,7 @@ def _overall_ap_by_model_plot(
         "Naive Agent": 1,
         "Per-trace Monitor": 2,
     }
-    model_order = ["Qwen-3.5", "gpt-5.4-mini"]
+    model_order = ["Qwen-3.5", "gpt-5.4-mini", "GLM-5"]
     grouped: dict[str, dict[str, dict[str, Any]]] = {}
     for row in plot_rows:
         model_name = _display_model_name(str(row.get("method_model") or ""))
