@@ -490,11 +490,25 @@ def _create_synthetic_judge_results(
 
     rows = []
     for case in cases:
-        # Load existing initial scores (JSON format)
-        scores_path = case.repo_path / "initial_scores.json"
-        if not scores_path.exists():
-            scores_path = case.repo_path / "initial_scores.tsv"
-        scores = json.loads(scores_path.read_text()) if scores_path.exists() else {}
+        # Load existing initial scores (JSON or TSV format)
+        scores: dict[str, float] = {}
+        for fname in ["initial_scores.json", "initial_scores.tsv"]:
+            sp = case.repo_path / fname
+            if sp.exists():
+                raw = sp.read_text()
+                try:
+                    scores = json.loads(raw)
+                    break
+                except json.JSONDecodeError:
+                    # TSV format: "traces/trace_000.txt\t0.400000"
+                    for line in raw.strip().splitlines():
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 2:
+                            try:
+                                scores[parts[0]] = float(parts[1])
+                            except ValueError:
+                                pass
+                    break
 
         trace_scores = {}
         for tf in case.trace_files:
