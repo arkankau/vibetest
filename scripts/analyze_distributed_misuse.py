@@ -759,6 +759,18 @@ def _bootstrap_pr_band(
     return recall_grid, lower, upper, ap
 
 
+def _row_trace_scores(row: dict[str, Any]) -> dict[str, float]:
+    scores = row.get("scoring", {}).get("trace_scores") or {}
+    if scores:
+        return {_normalize_trace_path(k): float(v) for k, v in scores.items()}
+    tests = row.get("tests") or []
+    if tests:
+        meta_scores = (tests[0].get("metadata") or {}).get("trace_scores") or {}
+        if meta_scores:
+            return {_normalize_trace_path(k): float(v) for k, v in meta_scores.items()}
+    return {}
+
+
 def _collect_stage2_case_curves(path: Path) -> tuple[list[list[dict[str, float]]], int]:
     rows = _load_rows(path)
     curves: list[list[dict[str, float]]] = []
@@ -774,10 +786,7 @@ def _collect_stage2_cases(path: Path) -> tuple[list[tuple[dict[str, float], set[
     stage2_cases: list[tuple[dict[str, float], set[str]]] = []
     for row in rows:
         gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
-        scores = {
-            _normalize_trace_path(k): float(v)
-            for k, v in ((row.get("scoring", {}).get("trace_scores") or {}).items())
-        }
+        scores = _row_trace_scores(row)
         if scores and gt:
             stage2_cases.append((scores, gt))
     return stage2_cases, len(rows)
@@ -807,6 +816,13 @@ def _paper_curve_runs(
             path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "Qwen-3.5", "Bayesian", bg))
+        for path, model_label, bg in (
+            (results_dir / "safety_safety_dm_cyber_d6_bg20_qwen35_bayesian_boost_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 20),
+            (results_dir / "safety_safety_dm_cyber_d6_bg20_qwen35_bayesian_boost_llmjudge-gpt-5.4-mini.jsonl", "gpt-5.4-mini", 20),
+            (results_dir / "safety_safety_dm_cyber_d6_bg100_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 100),
+        ):
+            if path.is_file() and _want(path):
+                candidates.append((path, model_label, "Per-trace Monitor", bg))
         for path, model_label in (
             (results_dir / "dm_cyber_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
             (results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
@@ -825,6 +841,12 @@ def _paper_curve_runs(
             path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "Qwen-3.5", "Bayesian", bg))
+        for path, model_label, bg in (
+            (results_dir / "safety_safety_dm_bio_d6_bg20_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 20),
+            (results_dir / "safety_safety_dm_bio_d6_bg100_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 100),
+        ):
+            if path.is_file() and _want(path):
+                candidates.append((path, model_label, "Per-trace Monitor", bg))
         for path, model_label in (
             (results_dir / "dm_bio_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
             (results_dir / "dm_bio_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
@@ -1188,14 +1210,16 @@ def _plot_main_paper_pr_figure(
             ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
             ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
         }
-        method_order = ["Meerkat", "Bayesian", "Buffer"]
+        method_order = ["Meerkat", "Per-trace Monitor", "Bayesian", "Buffer"]
         method_colors = {
             "Meerkat": "#D55E00",
+            "Per-trace Monitor": "#CC79A7",
             "Bayesian": "#0072B2",
             "Buffer": "#009E73",
         }
         method_linestyles = {
             "Meerkat": "-",
+            "Per-trace Monitor": "-.",
             "Bayesian": ":",
             "Buffer": "--",
         }
@@ -1309,14 +1333,16 @@ def _plot_bio_paper_pr_figure(
             ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
             ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
         }
-        method_order = ["Meerkat", "Bayesian", "Buffer"]
+        method_order = ["Meerkat", "Per-trace Monitor", "Bayesian", "Buffer"]
         method_colors = {
             "Meerkat": "#D55E00",
+            "Per-trace Monitor": "#CC79A7",
             "Bayesian": "#0072B2",
             "Buffer": "#009E73",
         }
         method_linestyles = {
             "Meerkat": "-",
+            "Per-trace Monitor": "-.",
             "Bayesian": ":",
             "Buffer": "--",
         }
