@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
-from PIL import Image, ImageOps
 
 from experiments.safety import _score_traces_parallel, _safe_slug, _trace_content_hash
 
@@ -48,6 +47,20 @@ class SettingMetrics:
     stage1_available_cases: int
     stage2_available_cases: int
     total_cases: int
+
+
+@dataclass
+class PaperCurveRun:
+    path: Path
+    model_label: str
+    method_label: str
+    background_multiplier: int
+    case_count: int
+    average_precision: float | None
+    recall_grid: list[float]
+    precision_curve: list[float]
+    precision_lower: list[float]
+    precision_upper: list[float]
 
 
 def _display_model_name(model_name: str | None, *, path: Path | None = None) -> str:
@@ -724,6 +737,71 @@ def _bootstrap_pr_band(
     return recall_grid, lower, upper, ap
 
 
+def _collect_stage2_cases(path: Path) -> tuple[list[tuple[dict[str, float], set[str]]], int]:
+    rows = _load_rows(path)
+    stage2_cases: list[tuple[dict[str, float], set[str]]] = []
+    for row in rows:
+        gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
+        scores = {
+            _normalize_trace_path(k): float(v)
+            for k, v in ((row.get("scoring", {}).get("trace_scores") or {}).items())
+        }
+        if scores and gt:
+            stage2_cases.append((scores, gt))
+    return stage2_cases, len(rows)
+
+
+def _paper_curve_runs(results_dir: Path, explicit_inputs: list[Path] | None = None) -> list[PaperCurveRun]:
+    explicit_set = {path.resolve() for path in explicit_inputs or []}
+
+    def _want(path: Path) -> bool:
+        return not explicit_set or path.resolve() in explicit_set
+
+    candidates: list[tuple[Path, str, str, int]] = []
+    for bg in (2, 20, 100):
+        path = results_dir / f"dm_cyber_d6_bg{bg}_v2.jsonl"
+        if path.is_file() and _want(path):
+            candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
+    for bg in (20, 100):
+        path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_n{20 if bg == 20 else 50}.jsonl"
+        if path.is_file() and _want(path):
+            candidates.append((path, "Qwen-3.5", "Meerkat", bg))
+    for path, model_label in (
+        (results_dir / "dm_cyber_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
+        (results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
+    ):
+        if path.is_file() and _want(path):
+            candidates.append((path, model_label, "Buffer", 100))
+
+    runs: list[PaperCurveRun] = []
+    for path, model_label, method_label, bg in candidates:
+        per_case_scores, case_count = _collect_stage2_cases(path)
+        if not per_case_scores:
+            continue
+        _, curve, _, _ = _average_curves(per_case_scores)
+        recall_grid, lower, upper, ap = _bootstrap_pr_band(
+            per_case_scores,
+            n_bootstrap=60,
+            seed=bg + len(runs) * 17,
+        )
+        precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
+        runs.append(
+            PaperCurveRun(
+                path=path,
+                model_label=model_label,
+                method_label=method_label,
+                background_multiplier=bg,
+                case_count=case_count,
+                average_precision=ap,
+                recall_grid=recall_grid,
+                precision_curve=precision_curve,
+                precision_lower=lower,
+                precision_upper=upper,
+            )
+        )
+    return runs
+
+
 def _plot_ap_bars(
     metrics: list[SettingMetrics],
     *,
@@ -1002,41 +1080,119 @@ def _plot_main_paper_pr_figure(
     results_dir: Path,
     figures_dir: Path,
     figure_formats: list[str],
+    input_paths: list[Path],
     recompute_stage1_if_missing: bool,
     stage1_concurrency: int,
     stage1_cache_dir: Path,
 ) -> list[Path]:
-    gpt_source = results_dir / "dm_cyber_final_combined.png"
-    qwen_source = results_dir / "dm_cyber_qwen35_combined.png"
-    if not gpt_source.is_file() or not qwen_source.is_file():
+    runs = _paper_curve_runs(results_dir, input_paths)
+    if not runs:
         return []
-    gpt_row = Image.open(gpt_source).crop((0, 1205, 3576, 2351))
-    qwen_row = Image.open(qwen_source).crop((0, 840, 1973, 1576))
-    qwen_row = ImageOps.contain(qwen_row, (int(gpt_row.width * 0.9), int(qwen_row.height * 0.9)))
 
-    fig, axes = plt.subplots(
-        2,
-        1,
-        figsize=(11.2, 7.5),
-        gridspec_kw={"height_ratios": [1.0, 0.84]},
-    )
-    row_specs = [
-        (axes[0], gpt_row, "gpt-5.4-mini"),
-        (axes[1], qwen_row, "Qwen-3.5"),
-    ]
-    for ax, row_image, label in row_specs:
-        ax.imshow(row_image)
-        ax.set_title(label, fontsize=14, pad=8)
-        ax.axis("off")
+    fig = plt.figure(figsize=(10.8, 6.8))
+    grid = fig.add_gridspec(2, 6, hspace=0.38, wspace=0.35)
+    axes = {
+        ("gpt-5.4-mini", 2): fig.add_subplot(grid[0, 0:2]),
+        ("gpt-5.4-mini", 20): fig.add_subplot(grid[0, 2:4]),
+        ("gpt-5.4-mini", 100): fig.add_subplot(grid[0, 4:6]),
+        ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
+        ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
+    }
+    method_order = ["Meerkat", "Buffer"]
+    method_colors = {
+        "Meerkat": "#D55E00",
+        "Buffer": "#009E73",
+    }
+    method_linestyles = {
+        "Meerkat": "-",
+        "Buffer": "--",
+    }
+    method_labels: dict[str, Any] = {}
 
-    fig.suptitle("Distributed Misuse: Cyber Trace-Level Precision-Recall", fontsize=17, y=0.985)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+    runs_by_panel: dict[tuple[str, int], list[PaperCurveRun]] = {}
+    for run in runs:
+        runs_by_panel.setdefault((run.model_label, run.background_multiplier), []).append(run)
+
+    for panel_key, ax in axes.items():
+        panel_runs = sorted(
+            runs_by_panel.get(panel_key, []),
+            key=lambda run: method_order.index(run.method_label) if run.method_label in method_order else 99,
+        )
+        if not panel_runs:
+            ax.axis("off")
+            continue
+        for run in panel_runs:
+            color = method_colors.get(run.method_label, "#555555")
+            linestyle = method_linestyles.get(run.method_label, "-")
+            band = ax.fill_between(
+                run.recall_grid,
+                run.precision_lower,
+                run.precision_upper,
+                color=color,
+                alpha=0.14,
+                linewidth=0.0,
+                zorder=1,
+            )
+            (line,) = ax.plot(
+                run.recall_grid,
+                run.precision_curve,
+                color=color,
+                linestyle=linestyle,
+                linewidth=2.2,
+                zorder=2,
+                label=run.method_label,
+            )
+            method_labels.setdefault(run.method_label, line)
+        case_counts = {run.method_label: run.case_count for run in panel_runs}
+        unique_counts = sorted(set(case_counts.values()))
+        if len(unique_counts) == 1:
+            ax.set_title(f"bg={panel_key[1]}x (n={unique_counts[0]})", fontsize=11, pad=6)
+        else:
+            ax.set_title(f"bg={panel_key[1]}x", fontsize=11, pad=6)
+            ax.text(
+                0.98,
+                0.98,
+                "\n".join(f"{label} n={case_counts[label]}" for label in method_order if label in case_counts),
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                color="#444444",
+                bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.75},
+            )
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.02)
+        ax.grid(alpha=0.25)
+        if panel_key[0] == "Qwen-3.5":
+            ax.set_xlabel("Recall")
+        if panel_key[1] in (2, 20) and panel_key[0] == "gpt-5.4-mini":
+            pass
+
+    for bg in (2, 20, 100):
+        ax = axes.get(("gpt-5.4-mini", bg))
+        if ax and ax.axison and bg == 2:
+            ax.set_ylabel("gpt-5.4-mini\nPrecision")
+    qwen_left = axes.get(("Qwen-3.5", 20))
+    if qwen_left and qwen_left.axison:
+        qwen_left.set_ylabel("Qwen-3.5\nPrecision")
+
+    fig.suptitle("Distributed Misuse (Cyber): Trace-Level Precision-Recall", fontsize=16, y=0.985)
+    if method_labels:
+        fig.legend(
+            [method_labels[label] for label in method_order if label in method_labels],
+            [label for label in method_order if label in method_labels],
+            loc="upper center",
+            ncol=len(method_labels),
+            frameon=False,
+            bbox_to_anchor=(0.5, 0.955),
+        )
+    fig.subplots_adjust(top=0.84, left=0.08, right=0.99, bottom=0.10)
 
     output_paths: list[Path] = []
     out_base = figures_dir / "dm_cyber_paper_pr_curves"
     for fmt in figure_formats:
         out_path = out_base.with_suffix(f".{fmt}")
-        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
+        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
         output_paths.append(out_path)
     plt.close(fig)
     return output_paths
@@ -1055,10 +1211,26 @@ def _print_summary_table(metrics: list[SettingMetrics]) -> None:
         )
 
 
+def _print_paper_run_summary(results_dir: Path, input_paths: list[Path]) -> None:
+    runs = _paper_curve_runs(results_dir, input_paths)
+    if not runs:
+        return
+    print("\n| model | bg | method | cases | trace_ap | file |")
+    print("|---|---:|---|---:|---:|---|")
+    for run in sorted(runs, key=lambda item: (item.model_label, item.background_multiplier, item.method_label)):
+        ap_text = "na" if run.average_precision is None else f"{run.average_precision:.3f}"
+        print(
+            f"| {run.model_label} | {run.background_multiplier} | {run.method_label} | "
+            f"{run.case_count} | {ap_text} | {run.path.name} |"
+        )
+
+
 def main() -> None:
     args = _parse_args()
+    explicit_input_paths: list[Path] | None = None
     if args.inputs:
         input_paths = [Path(p) for p in args.inputs]
+        explicit_input_paths = input_paths
     else:
         results_dir = Path(args.results_dir)
         preferred: dict[tuple[str, str, str], Path] = {}
@@ -1099,12 +1271,14 @@ def main() -> None:
         raise SystemExit("No matching distributed-misuse JSONL files to analyze.")
 
     _print_summary_table(metrics)
+    _print_paper_run_summary(Path(args.results_dir), explicit_input_paths or [])
     figure_paths: list[Path] = []
     figure_paths.extend(
         _plot_main_paper_pr_figure(
             results_dir=Path(args.results_dir),
             figures_dir=figures_dir,
             figure_formats=figure_formats,
+            input_paths=explicit_input_paths or [],
             recompute_stage1_if_missing=args.recompute_stage1_if_missing,
             stage1_concurrency=args.stage1_concurrency,
             stage1_cache_dir=stage1_cache_dir,
