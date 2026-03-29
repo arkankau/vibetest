@@ -156,10 +156,15 @@ def main():
         ("optimized_embedding", "safety_dm_cyber_d6_bg100_qwen35_2pass_optimized_embedding_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
     ]
 
-    # Check for v2 optimized results
-    v2_opt_path = results_dir / "safety_dm_cyber_d6_bg100_qwen35_2pass_optimized_embedding_v2_AT-Qwen3.5-397B-A17B-FP8.jsonl"
-    if v2_opt_path.exists():
-        experiments.append(("optimized_embedding v2", v2_opt_path.name))
+    # Auto-discover additional results
+    for name, pattern in [
+        ("optimized_embedding v2", "safety_dm_cyber_d6_bg100_qwen35_2pass_optimized_embedding_v2_AT-*.jsonl"),
+        ("auditor_note", "safety_dm_cyber_d6_bg100_qwen35_2pass_auditor_note_AT-*.jsonl"),
+        ("joint_optimized", "safety_dm_cyber_d6_bg100_qwen35_2pass_joint_optimized_AT-*.jsonl"),
+    ]:
+        matches = sorted(results_dir.glob(pattern))
+        if matches:
+            experiments.append((name, matches[-1].name))
 
     all_results = []
     for name, filename in experiments:
