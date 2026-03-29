@@ -4,12 +4,14 @@ import argparse
 import asyncio
 import json
 import math
+import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from PIL import Image, ImageOps
 
 from experiments.safety import _score_traces_parallel, _safe_slug, _trace_content_hash
 
@@ -46,6 +48,22 @@ class SettingMetrics:
     stage1_available_cases: int
     stage2_available_cases: int
     total_cases: int
+
+
+def _display_model_name(model_name: str | None, *, path: Path | None = None) -> str:
+    text = str(model_name or "").strip()
+    lowered = text.lower()
+    if "qwen3.5" in lowered or "qwen-3.5" in lowered:
+        return "Qwen-3.5"
+    if "gpt-5.4-mini" in lowered:
+        return "gpt-5.4-mini"
+    if path is not None:
+        name = path.name.lower()
+        if "qwen35" in name:
+            return "Qwen-3.5"
+        if "buffer" in name and "qwen35" not in name:
+            return "gpt-5.4-mini"
+    return text or "unknown-model"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -594,6 +612,118 @@ def _collect_setting_metrics(
     )
 
 
+def _load_stage_cases(
+    path: Path,
+    *,
+    recompute_stage1_if_missing: bool,
+    stage1_concurrency: int,
+    stage1_cache_dir: Path,
+) -> tuple[list[tuple[dict[str, float], set[str]]], list[tuple[dict[str, float], set[str]]], str]:
+    rows = _load_rows(path)
+    if not rows:
+        return [], [], "unknown-model"
+
+    model_name = (
+        rows[0].get("tests", [{}])[0].get("metadata", {}).get("model")
+        or rows[0].get("summary", {}).get("model")
+        or "unknown-model"
+    )
+
+    stage2_cases: list[tuple[dict[str, float], set[str]]] = []
+    stage1_cases: list[tuple[dict[str, float], set[str]]] = []
+    rows_needing_stage1: list[dict[str, Any]] = []
+
+    for row in rows:
+        gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
+        stage2_scores = {
+            _normalize_trace_path(k): float(v)
+            for k, v in ((row.get("scoring", {}).get("trace_scores") or {}).items())
+        }
+        if stage2_scores:
+            stage2_cases.append((stage2_scores, gt))
+        stage1_scores = _load_stage1_scores_from_repo(Path(row["repo"]))
+        if stage1_scores:
+            stage1_cases.append((stage1_scores, gt))
+        elif recompute_stage1_if_missing:
+            rows_needing_stage1.append(row)
+
+    if rows_needing_stage1:
+        recomputed = _recompute_stage1_scores_for_rows(
+            rows_needing_stage1,
+            model_name=model_name,
+            concurrency=stage1_concurrency,
+            cache_dir=stage1_cache_dir,
+        )
+        for row in rows_needing_stage1:
+            gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
+            case_id = str(row.get("case_id") or row.get("repo_name") or "")
+            scores = recomputed.get(case_id) or {}
+            if scores:
+                stage1_cases.append((scores, gt))
+
+    return stage1_cases, stage2_cases, _display_model_name(model_name, path=path)
+
+
+def _interp_precision_at_recalls(curve: list[dict[str, float]], recall_grid: list[float]) -> list[float]:
+    if not curve:
+        return [0.0 for _ in recall_grid]
+    recall_to_precision: dict[float, float] = {}
+    for point in curve:
+        r = max(0.0, min(1.0, float(point["recall"])))
+        p = max(0.0, min(1.0, float(point["precision"])))
+        recall_to_precision[r] = max(recall_to_precision.get(r, 0.0), p)
+    recalls = sorted(recall_to_precision)
+    precisions = [recall_to_precision[r] for r in recalls]
+    envelope = precisions[:]
+    for idx in range(len(envelope) - 2, -1, -1):
+        envelope[idx] = max(envelope[idx], envelope[idx + 1])
+    out: list[float] = []
+    for target in recall_grid:
+        chosen = 0.0
+        for r, p in zip(recalls, envelope):
+            if r >= target:
+                chosen = p
+                break
+        out.append(chosen)
+    return out
+
+
+def _bootstrap_pr_band(
+    per_case_scores: list[tuple[dict[str, float], set[str]]],
+    *,
+    n_bootstrap: int = 200,
+    seed: int = 0,
+) -> tuple[list[float], list[float], list[float], float | None]:
+    valid_cases = [(scores, gt) for scores, gt in per_case_scores if scores and gt]
+    if not valid_cases:
+        grid = [i / 100.0 for i in range(101)]
+        zeros = [0.0 for _ in grid]
+        return grid, zeros, zeros, None
+    ap, curve, _, _ = _average_curves(valid_cases)
+    recall_grid = [i / 100.0 for i in range(101)]
+    rng = random.Random(seed)
+    samples: list[list[float]] = []
+    n = len(valid_cases)
+    for _ in range(n_bootstrap):
+        sampled = [valid_cases[rng.randrange(n)] for _ in range(n)]
+        _, sample_curve, _, _ = _average_curves(sampled)
+        if not sample_curve:
+            continue
+        samples.append(_interp_precision_at_recalls(sample_curve, recall_grid))
+    if not samples:
+        zeros = [0.0 for _ in recall_grid]
+        return recall_grid, zeros, zeros, ap
+    lower: list[float] = []
+    upper: list[float] = []
+    for idx in range(len(recall_grid)):
+        vals = sorted(sample[idx] for sample in samples)
+        lo_idx = max(0, int(0.025 * len(vals)) - 1)
+        hi_idx = min(len(vals) - 1, int(0.975 * len(vals)))
+        lower.append(vals[lo_idx])
+        upper.append(vals[hi_idx])
+    return recall_grid, lower, upper, ap
+
+
 def _plot_ap_bars(
     metrics: list[SettingMetrics],
     *,
@@ -867,6 +997,51 @@ def _plot_case_pr_grid(
     return output_paths
 
 
+def _plot_main_paper_pr_figure(
+    *,
+    results_dir: Path,
+    figures_dir: Path,
+    figure_formats: list[str],
+    recompute_stage1_if_missing: bool,
+    stage1_concurrency: int,
+    stage1_cache_dir: Path,
+) -> list[Path]:
+    gpt_source = results_dir / "dm_cyber_final_combined.png"
+    qwen_source = results_dir / "dm_cyber_qwen35_combined.png"
+    if not gpt_source.is_file() or not qwen_source.is_file():
+        return []
+    gpt_row = Image.open(gpt_source).crop((0, 1205, 3576, 2351))
+    qwen_row = Image.open(qwen_source).crop((0, 840, 1973, 1576))
+    qwen_row = ImageOps.contain(qwen_row, (int(gpt_row.width * 0.9), int(qwen_row.height * 0.9)))
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(11.2, 7.5),
+        gridspec_kw={"height_ratios": [1.0, 0.84]},
+    )
+    row_specs = [
+        (axes[0], gpt_row, "gpt-5.4-mini"),
+        (axes[1], qwen_row, "Qwen-3.5"),
+    ]
+    for ax, row_image, label in row_specs:
+        ax.imshow(row_image)
+        ax.set_title(label, fontsize=14, pad=8)
+        ax.axis("off")
+
+    fig.suptitle("Distributed Misuse: Cyber Trace-Level Precision-Recall", fontsize=17, y=0.985)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+
+    output_paths: list[Path] = []
+    out_base = figures_dir / "dm_cyber_paper_pr_curves"
+    for fmt in figure_formats:
+        out_path = out_base.with_suffix(f".{fmt}")
+        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
+        output_paths.append(out_path)
+    plt.close(fig)
+    return output_paths
+
+
 def _print_summary_table(metrics: list[SettingMetrics]) -> None:
     print("| setting | source | model | judge_ap | AT_ap | judge_cases | AT_cases |")
     print("|---|---|---|---:|---:|---:|---:|")
@@ -925,9 +1100,16 @@ def main() -> None:
 
     _print_summary_table(metrics)
     figure_paths: list[Path] = []
-    figure_paths.extend(_plot_ap_bars(metrics, figures_dir=figures_dir, figure_formats=figure_formats))
-    figure_paths.extend(_plot_pr_grid(metrics, figures_dir=figures_dir, figure_formats=figure_formats))
-    figure_paths.extend(_plot_case_pr_grid(metrics, figures_dir=figures_dir, figure_formats=figure_formats))
+    figure_paths.extend(
+        _plot_main_paper_pr_figure(
+            results_dir=Path(args.results_dir),
+            figures_dir=figures_dir,
+            figure_formats=figure_formats,
+            recompute_stage1_if_missing=args.recompute_stage1_if_missing,
+            stage1_concurrency=args.stage1_concurrency,
+            stage1_cache_dir=stage1_cache_dir,
+        )
+    )
     print("\nWrote figures:")
     for path in figure_paths:
         print(f"- {path}")
