@@ -76,8 +76,9 @@ def main() -> None:
     parser.add_argument("--num-cases", type=int, default=None,
                         help="Number of cases (default: auto based on pool size)")
     parser.add_argument("--traces-per-case", type=int, default=4)
-    parser.add_argument("--sabotage-per-case", type=int, default=1,
-                        help="Exact number of sabotage traces in each positive case")
+    parser.add_argument("--max-sabotage-per-case", type=int, default=None,
+                        help="Max sabotage traces per positive case (default: max(1, tpc//4)). "
+                             "Actual count is uniformly distributed from 1..max across positive cases.")
     parser.add_argument("--positive-rate", type=float, default=0.5,
                         help="Fraction of cases that are positive (have sabotage traces)")
     parser.add_argument("--mix-tasks", action="store_true",
@@ -171,22 +172,42 @@ def main() -> None:
         ib_link.unlink()
     ib_link.symlink_to("mle-sabotage-sets")
 
+    # Compute max sabotage per case
+    effective_max_sab = args.max_sabotage_per_case
+    if effective_max_sab is None:
+        effective_max_sab = max(1, args.traces_per_case // 4)
+    effective_max_sab = max(1, min(effective_max_sab, args.traces_per_case))
+
     case_index = 0
     for task_name, sab_pool, clean_pool, n_positive, n_negative in task_configs:
-        for ci in range(n_positive + n_negative):
+        total_task_cases = n_positive + n_negative
+
+        # Randomly assign which case indices are positive (interleaved ordering)
+        positive_indices = set(rng.sample(range(total_task_cases), n_positive)) if n_positive else set()
+
+        # Stratified sabotage counts: uniformly distribute 1..max across positive cases
+        possible_counts = list(range(1, effective_max_sab + 1))
+        repeats, rem = divmod(n_positive, len(possible_counts))
+        positive_hacked_counts = possible_counts * repeats + possible_counts[:rem]
+        rng.shuffle(positive_hacked_counts)
+        positive_cursor = 0
+
+        for ci in range(total_task_cases):
             case_id = f"case_{case_index:04d}"
             (cases_root / case_id / "traces").mkdir(parents=True, exist_ok=True)
 
-            is_positive = ci < n_positive
+            is_positive = ci in positive_indices
 
             if is_positive:
-                n_sab = min(args.sabotage_per_case, args.traces_per_case)
+                n_sab = positive_hacked_counts[positive_cursor]
+                positive_cursor += 1
                 n_clean = args.traces_per_case - n_sab
                 selected = (
                     [(t, True) for t in rng.choices(sab_pool, k=n_sab)]
                     + [(t, False) for t in rng.choices(clean_pool, k=n_clean)]
                 )
             else:
+                n_sab = 0
                 selected = [(t, False) for t in rng.choices(clean_pool, k=args.traces_per_case)]
 
             rng.shuffle(selected)
@@ -215,7 +236,7 @@ def main() -> None:
                 "hack_pool_selector": "all",
                 "task": task_name,
                 "model_filter": args.model_filter,
-                "sabotage_per_case": args.sabotage_per_case if is_positive else 0,
+                "sabotage_per_case": n_sab if is_positive else 0,
             }
             (metadata_root / f"{case_id}.json").write_text(
                 json.dumps(meta, indent=2) + "\n", encoding="utf-8",
@@ -228,7 +249,7 @@ def main() -> None:
         if json.loads((metadata_root / f"case_{i:04d}.json").read_text()).get("gt_hacked_trace_files")
     )
     print(f"\nMaterialized {total} cases at {cases_root}")
-    print(f"  traces_per_case={args.traces_per_case}, sabotage_per_case={args.sabotage_per_case}")
+    print(f"  traces_per_case={args.traces_per_case}, max_sabotage_per_case={effective_max_sab}")
     print(f"  Positive: {pos}/{total} ({pos/total:.0%})")
     print(f"\nRun with: --dataset-name {args.dataset_name} --cases {total} --traces-per-case {args.traces_per_case}")
 
