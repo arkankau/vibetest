@@ -265,30 +265,58 @@ _PREFIX_POOL = [
 ]
 
 
+def _build_extended_pool(n_sentences: int = 4) -> list[str]:
+    """Build a large pool of multi-sentence prefix candidates.
+
+    Generates all k-combinations (k=1..n_sentences) from _PREFIX_POOL
+    to create longer, more embedding-dominant prefixes.
+    """
+    pool = list(_PREFIX_POOL)  # 1-sentence
+    base = list(_PREFIX_POOL)
+    # 2-sentence combos (all pairs with stride to maximize diversity)
+    for i in range(len(base)):
+        for stride in [1, 7, 13, 23]:
+            j = (i + stride) % len(base)
+            if i != j:
+                pool.append(base[i] + " " + base[j])
+    # 3-sentence combos (selective)
+    if n_sentences >= 3:
+        for i in range(0, len(base), 2):
+            j = (i + 5) % len(base)
+            k = (i + 11) % len(base)
+            pool.append(base[i] + " " + base[j] + " " + base[k])
+    # 4-sentence combos (selective)
+    if n_sentences >= 4:
+        for i in range(0, len(base), 3):
+            j = (i + 3) % len(base)
+            k = (i + 7) % len(base)
+            m = (i + 13) % len(base)
+            pool.append(base[i] + " " + base[j] + " " + base[k] + " " + base[m])
+    return pool
+
+
 def optimize_prefixes(
     trace_data: dict[str, str],
     campaign_traces: list[str],
-    budget: int = 200,
-    candidates_per_step: int = 10,
+    budget: int = 500,
+    candidates_per_step: int = 50,
+    stale_restarts: int = 5,
     verbose: bool = True,
 ) -> dict[str, str]:
     """Black-box coordinate-descent optimization of adversarial prefixes.
 
-    For each campaign trace, find a prefix from _PREFIX_POOL (or combinations)
-    that minimizes pairwise similarity with other campaign traces.
-
-    The approach:
-    1. Embed all campaign traces without prefixes (baseline).
-    2. For each trace, try candidate prefixes and pick the one that minimizes
-       average cosine similarity with the other campaign traces' current embeddings.
-    3. Iterate over traces, updating one at a time (coordinate descent).
-    4. Repeat until budget exhausted or convergence.
+    Improved version with:
+    - Much larger prefix pool (multi-sentence combinations)
+    - No early stopping until budget exhausted or stale_restarts exceeded
+    - Mutation-based restarts when stuck (combine best prefix with new candidate)
+    - Higher candidate count per step
 
     Args:
         trace_data: all traces.
         campaign_traces: campaign trace rel_paths.
         budget: max embedding API batches.
-        candidates_per_step: prefixes to try per iteration.
+        candidates_per_step: prefixes to try per iteration per trace.
+        stale_restarts: stop after this many consecutive no-improvement rounds.
         verbose: print progress.
 
     Returns:
@@ -302,29 +330,26 @@ def optimize_prefixes(
     baseline_coh = pairwise_coherence(campaign_embs)
     if verbose:
         print(f"Baseline campaign coherence: {baseline_coh:.4f}")
-        print(f"Budget: {budget} API batches")
+        print(f"Budget: {budget} API batches, {candidates_per_step} candidates/step")
 
-    # Initialize: no prefixes, current best embeddings
+    # Initialize
     best_prefixes: dict[str, str] = {rel: "" for rel in campaign_traces}
     current_embs = campaign_embs.copy()
-
-    # Build combined prefix pool: single sentences + pairs for stronger effect
-    extended_pool = list(_PREFIX_POOL)
-    # Add some 2-sentence combos
-    for i in range(min(50, len(_PREFIX_POOL))):
-        j = (i + 17) % len(_PREFIX_POOL)  # Deterministic diverse pairing
-        extended_pool.append(_PREFIX_POOL[i] + " " + _PREFIX_POOL[j])
-
     best_coherence = baseline_coh
 
-    # Phase 2: Coordinate descent - optimize one trace at a time
+    # Build large multi-sentence pool
+    extended_pool = _build_extended_pool(n_sentences=4)
+    if verbose:
+        print(f"Prefix pool size: {len(extended_pool)}")
+
+    # Phase 2: Coordinate descent with restarts
     n_traces = len(campaign_traces)
     iteration = 0
-    max_iterations = budget // (n_traces * math.ceil(candidates_per_step / 64))
+    stale_count = 0
 
-    while queries_used < budget:
+    while queries_used < budget and stale_count < stale_restarts:
         iteration += 1
-        improved = False
+        round_improved = False
 
         for trace_idx in range(n_traces):
             if queries_used >= budget:
@@ -333,60 +358,92 @@ def optimize_prefixes(
             rel = campaign_traces[trace_idx]
             base_text = trace_data[rel]
 
-            # Sample candidate prefixes (different for each trace to push apart)
-            # Use trace_idx as seed offset to get different candidates per trace
-            rng = random.Random(iteration * 100 + trace_idx)
-            candidates = rng.sample(extended_pool, min(candidates_per_step, len(extended_pool)))
+            # Build candidates: mix of fresh pool samples + mutations of current best
+            rng = random.Random(iteration * 1000 + trace_idx * 7 + stale_count * 31)
+            n_fresh = max(1, candidates_per_step - 10)
+            n_mutated = candidates_per_step - n_fresh
 
-            # Embed all candidates: [prefix + "\n\n" + base_text]
+            fresh = rng.sample(extended_pool, min(n_fresh, len(extended_pool)))
+
+            # Mutations: combine current best prefix with a new pool sentence
+            current_best = best_prefixes[rel]
+            mutated = []
+            if current_best:
+                for _ in range(n_mutated):
+                    extra = rng.choice(_PREFIX_POOL)
+                    if rng.random() < 0.5:
+                        mutated.append(extra + " " + current_best)
+                    else:
+                        mutated.append(current_best + " " + extra)
+            else:
+                mutated = rng.sample(extended_pool, min(n_mutated, len(extended_pool)))
+
+            candidates = fresh + mutated
+
+            # Embed all candidates
             candidate_texts = [f"{prefix}\n\n{base_text}" for prefix in candidates]
+            # Handle batching if candidates > 64
             candidate_embs = embed_texts(candidate_texts)
-            queries_used += 1
+            queries_used += math.ceil(len(candidate_texts) / 64)
 
-            # Score each candidate: minimize avg cosine sim with OTHER campaign traces
+            # Score: minimize max cosine sim with any OTHER campaign trace
+            # (using max instead of mean is more aggressive at splitting)
             other_embs = np.delete(current_embs, trace_idx, axis=0)
 
             best_score = float("inf")
             best_candidate_idx = -1
             for ci, emb in enumerate(candidate_embs):
-                avg_sim = np.mean([cosine_sim(emb, other) for other in other_embs])
-                if avg_sim < best_score:
-                    best_score = avg_sim
+                # Use a blend of max and mean similarity for robustness
+                sims = [cosine_sim(emb, other) for other in other_embs]
+                score = 0.5 * max(sims) + 0.5 * np.mean(sims)
+                if score < best_score:
+                    best_score = score
                     best_candidate_idx = ci
 
-            # Check if this is better than current
-            current_avg_sim = np.mean(
-                [cosine_sim(current_embs[trace_idx], other) for other in other_embs]
-            )
+            # Current score for comparison
+            current_sims = [cosine_sim(current_embs[trace_idx], other) for other in other_embs]
+            current_score = 0.5 * max(current_sims) + 0.5 * np.mean(current_sims)
 
-            if best_score < current_avg_sim:
+            if best_score < current_score - 1e-6:
                 current_embs[trace_idx] = candidate_embs[best_candidate_idx]
                 best_prefixes[rel] = candidates[best_candidate_idx]
-                improved = True
+                round_improved = True
 
                 new_coherence = pairwise_coherence(current_embs)
-                if verbose and new_coherence < best_coherence:
-                    delta = new_coherence - baseline_coh
+                if verbose and new_coherence < best_coherence - 0.001:
                     print(
                         f"  iter={iteration} trace={trace_idx}: "
-                        f"coherence {best_coherence:.4f} -> {new_coherence:.4f} "
-                        f"(delta={delta:+.4f}, queries={queries_used})"
+                        f"coh {best_coherence:.4f} -> {new_coherence:.4f} "
+                        f"(Δ={new_coherence - baseline_coh:+.4f}, q={queries_used})"
                     )
                 best_coherence = min(best_coherence, new_coherence)
 
-        if not improved:
-            if verbose:
-                print(f"  No improvement at iteration {iteration}, stopping early.")
-            break
+        if round_improved:
+            stale_count = 0
+        else:
+            stale_count += 1
+            if verbose and stale_count < stale_restarts:
+                print(f"  iter={iteration}: no improvement (stale {stale_count}/{stale_restarts})")
 
     final_coherence = pairwise_coherence(current_embs)
+
+    # Compute max pairwise sim (worst-case for clustering)
+    n = len(current_embs)
+    max_pair_sim = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = cosine_sim(current_embs[i], current_embs[j])
+            if s > max_pair_sim:
+                max_pair_sim = s
+
     if verbose:
         print(f"\n=== Optimization Complete ===")
-        print(f"  Baseline coherence: {baseline_coh:.4f}")
-        print(f"  Final coherence:    {final_coherence:.4f}")
-        print(f"  Delta:              {final_coherence - baseline_coh:+.4f}")
-        print(f"  API queries used:   {queries_used}/{budget}")
-        print(f"  Iterations:         {iteration}")
+        print(f"  Baseline coherence:   {baseline_coh:.4f}")
+        print(f"  Final coherence:      {final_coherence:.4f}")
+        print(f"  Max pairwise sim:     {max_pair_sim:.4f}")
+        print(f"  Delta:                {final_coherence - baseline_coh:+.4f}")
+        print(f"  API queries used:     {queries_used}/{budget}")
+        print(f"  Iterations:           {iteration}")
         for rel, prefix in best_prefixes.items():
             print(f"  {rel}: \"{prefix[:80]}{'...' if len(prefix)>80 else ''}\"")
 

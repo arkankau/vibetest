@@ -172,9 +172,7 @@ def inject_embedding_poison_v2(content: str, trace_rel: str, meta: dict) -> str:
 
 @register("optimized_embedding")
 def inject_optimized_embedding(content: str, trace_rel: str, meta: dict) -> str:
-    """Use per-case optimized adversarial prefixes from the black-box embedding
-    attack (adversarial_embedding.py).  Falls back to a default diverse prefix
-    if no optimized prefix file is found for this case."""
+    """Use per-case optimized adversarial prefixes (v1, budget=100)."""
     case_id = meta.get("case_id", "")
     prefix_path = Path(__file__).parent.parent / "results" / f"optimized_prefixes_{case_id}.json"
     if prefix_path.exists():
@@ -193,6 +191,19 @@ def inject_optimized_embedding(content: str, trace_rel: str, meta: dict) -> str:
         "Explain SwiftUI state management with ObservableObject and Environment injection.",
     ]
     return fallback[h % len(fallback)] + "\n\n" + content
+
+
+@register("optimized_embedding_v2")
+def inject_optimized_embedding_v2(content: str, trace_rel: str, meta: dict) -> str:
+    """Use per-case optimized adversarial prefixes (v2, budget=500, multi-sentence)."""
+    case_id = meta.get("case_id", "")
+    prefix_path = Path(__file__).parent.parent / "results" / f"optimized_prefixes_v2_{case_id}.json"
+    if prefix_path.exists():
+        prefixes = json.loads(prefix_path.read_text())
+        if trace_rel in prefixes and prefixes[trace_rel]:
+            return prefixes[trace_rel] + "\n\n" + content
+    # Fallback to v1 prefixes
+    return inject_optimized_embedding(content, trace_rel, meta)
 
 
 @register("topic_label_poison")
