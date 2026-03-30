@@ -12,6 +12,7 @@ from typing import Any
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 
 
@@ -822,7 +823,7 @@ def _paper_curve_runs(
             (results_dir / "safety_safety_dm_cyber_d6_bg100_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 100),
         ):
             if path.is_file() and _want(path):
-                candidates.append((path, model_label, "Per-trace Monitor", bg))
+                candidates.append((path, model_label, "Monitor", bg))
         for path, model_label in (
             (results_dir / "dm_cyber_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
             (results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
@@ -846,7 +847,7 @@ def _paper_curve_runs(
             (results_dir / "safety_safety_dm_bio_d6_bg100_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 100),
         ):
             if path.is_file() and _want(path):
-                candidates.append((path, model_label, "Per-trace Monitor", bg))
+                candidates.append((path, model_label, "Monitor", bg))
         for path, model_label in (
             (results_dir / "dm_bio_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
             (results_dir / "dm_bio_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
@@ -1210,19 +1211,23 @@ def _plot_main_paper_pr_figure(
             ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
             ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
         }
-        method_order = ["Meerkat", "Per-trace Monitor", "Bayesian", "Buffer"]
+        method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
         method_colors = {
             "Meerkat": "#D55E00",
-            "Per-trace Monitor": "#CC79A7",
+            "Monitor": "#CC79A7",
             "Bayesian": "#0072B2",
             "Buffer": "#009E73",
         }
         method_linestyles = {
             "Meerkat": "-",
-            "Per-trace Monitor": "-.",
+            "Monitor": "-.",
             "Bayesian": ":",
             "Buffer": "--",
         }
+        shared_legend_handles = [
+            Line2D([0], [0], color=method_colors[method], linestyle=method_linestyles[method], linewidth=2.2)
+            for method in method_order
+        ]
         runs_by_panel: dict[tuple[str, int], list[PaperCurveRun]] = {}
         for run in runs:
             runs_by_panel.setdefault((run.model_label, run.background_multiplier), []).append(run)
@@ -1235,8 +1240,6 @@ def _plot_main_paper_pr_figure(
             if not panel_runs:
                 ax.axis("off")
                 continue
-            legend_handles: list[Any] = []
-            legend_labels: list[str] = []
             for run in panel_runs:
                 color = method_colors.get(run.method_label, "#555555")
                 linestyle = method_linestyles.get(run.method_label, "-")
@@ -1258,9 +1261,6 @@ def _plot_main_paper_pr_figure(
                     zorder=2,
                     label=run.method_label,
                 )
-                legend_handles.append(line)
-                ap_text = "na" if run.average_precision is None else f"{run.average_precision:.2f}"
-                legend_labels.append(f"{run.method_label} (AP={ap_text})")
             case_counts = {run.method_label: run.case_count for run in panel_runs}
             unique_counts = sorted(set(case_counts.values()))
             if len(unique_counts) == 1:
@@ -1274,18 +1274,21 @@ def _plot_main_paper_pr_figure(
             ax.tick_params(labelsize=7.0)
             if panel_key[0] == "Qwen-3.5":
                 ax.set_xlabel("Recall", fontsize=8.5)
-            ax.legend(
-                legend_handles,
-                legend_labels,
-                loc="upper right" if panel_key[1] == 100 else "lower left",
+            if panel_key != ("gpt-5.4-mini", 2) and panel_key != ("Qwen-3.5", 20):
+                ax.tick_params(labelleft=False)
+
+        legend_ax = axes.get(("gpt-5.4-mini", 100))
+        if legend_ax and legend_ax.axison:
+            legend_ax.legend(
+                shared_legend_handles,
+                method_order,
+                loc="upper right",
                 frameon=False,
                 fontsize=6.4,
                 handlelength=1.9,
                 borderaxespad=0.2,
                 labelspacing=0.2,
             )
-            if panel_key != ("gpt-5.4-mini", 2) and panel_key != ("Qwen-3.5", 20):
-                ax.tick_params(labelleft=False)
 
         top_left = axes.get(("gpt-5.4-mini", 2))
         if top_left and top_left.axison:
@@ -1333,19 +1336,23 @@ def _plot_bio_paper_pr_figure(
             ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
             ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
         }
-        method_order = ["Meerkat", "Per-trace Monitor", "Bayesian", "Buffer"]
+        method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
         method_colors = {
             "Meerkat": "#D55E00",
-            "Per-trace Monitor": "#CC79A7",
+            "Monitor": "#CC79A7",
             "Bayesian": "#0072B2",
             "Buffer": "#009E73",
         }
         method_linestyles = {
             "Meerkat": "-",
-            "Per-trace Monitor": "-.",
+            "Monitor": "-.",
             "Bayesian": ":",
             "Buffer": "--",
         }
+        shared_legend_handles = [
+            Line2D([0], [0], color=method_colors[method], linestyle=method_linestyles[method], linewidth=2.2)
+            for method in method_order
+        ]
         runs_by_panel: dict[tuple[str, int], list[PaperCurveRun]] = {}
         for run in runs:
             runs_by_panel.setdefault((run.model_label, run.background_multiplier), []).append(run)
@@ -1358,8 +1365,6 @@ def _plot_bio_paper_pr_figure(
             if not panel_runs:
                 ax.axis("off")
                 continue
-            legend_handles: list[Any] = []
-            legend_labels: list[str] = []
             for run in panel_runs:
                 color = method_colors.get(run.method_label, "#555555")
                 linestyle = method_linestyles.get(run.method_label, "-")
@@ -1381,9 +1386,6 @@ def _plot_bio_paper_pr_figure(
                     zorder=2,
                     label=run.method_label,
                 )
-                legend_handles.append(line)
-                ap_text = "na" if run.average_precision is None else f"{run.average_precision:.2f}"
-                legend_labels.append(f"{run.method_label} (AP={ap_text})")
             case_counts = {run.method_label: run.case_count for run in panel_runs}
             unique_counts = sorted(set(case_counts.values()))
             if len(unique_counts) == 1:
@@ -1397,18 +1399,21 @@ def _plot_bio_paper_pr_figure(
             ax.tick_params(labelsize=7.0)
             if panel_key[0] == "Qwen-3.5":
                 ax.set_xlabel("Recall", fontsize=8.5)
-            ax.legend(
-                legend_handles,
-                legend_labels,
-                loc="upper right" if panel_key[1] == 100 else "lower left",
+            if panel_key != ("gpt-5.4-mini", 2) and panel_key != ("Qwen-3.5", 20):
+                ax.tick_params(labelleft=False)
+
+        legend_ax = axes.get(("gpt-5.4-mini", 100))
+        if legend_ax and legend_ax.axison:
+            legend_ax.legend(
+                shared_legend_handles,
+                method_order,
+                loc="upper right",
                 frameon=False,
                 fontsize=6.4,
                 handlelength=1.9,
                 borderaxespad=0.2,
                 labelspacing=0.2,
             )
-            if panel_key != ("gpt-5.4-mini", 2) and panel_key != ("Qwen-3.5", 20):
-                ax.tick_params(labelleft=False)
 
         top_left = axes.get(("gpt-5.4-mini", 2))
         if top_left and top_left.axison:
@@ -1440,6 +1445,69 @@ def _print_summary_table(metrics: list[SettingMetrics]) -> None:
             f"| {setting} | {m.variant} | {m.model_name} | {judge_ap} | {at_ap} | "
             f"{m.stage1_available_cases}/{m.total_cases} | {m.stage2_available_cases}/{m.total_cases} |"
         )
+
+
+def _write_paper_ap_tables(results_dir: Path, input_paths: list[Path], output_dir: Path) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths: list[Path] = []
+    md_lines = ["# Distributed-Misuse Trace AP Table", ""]
+    tex_lines = ["% Auto-generated by scripts/analyze_distributed_misuse.py"]
+    method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
+    for domain in ("cyber", "bio"):
+        runs = _paper_curve_runs(results_dir, input_paths, domain=domain)
+        if not runs:
+            continue
+        rows: dict[tuple[str, int], dict[str, str]] = {}
+        for run in runs:
+            ap_text = "na" if run.average_precision is None else f"{run.average_precision:.3f}"
+            rows.setdefault((run.model_label, run.background_multiplier), {})[run.method_label] = ap_text
+
+        md_lines.append(f"## {domain.title()}")
+        md_lines.append("| Model | BG | Meerkat | Monitor | Bayesian | Buffer |")
+        md_lines.append("|---|---:|---:|---:|---:|---:|")
+
+        tex_lines.append(f"% {domain.title()}")
+        tex_lines.append(r"\begin{tabular}{llrrrr}")
+        tex_lines.append(r"\toprule")
+        tex_lines.append("Model & BG & Meerkat & Monitor & Bayesian & Buffer \\\\")
+        tex_lines.append(r"\midrule")
+        for (model_label, bg), values in sorted(rows.items(), key=lambda item: (item[0][0], item[0][1])):
+            numeric_values = {
+                method: float(ap_text)
+                for method, ap_text in values.items()
+                if ap_text != "na"
+            }
+            max_ap = max(numeric_values.values()) if numeric_values else None
+
+            def _fmt_md(method: str) -> str:
+                value = values.get(method, "na")
+                if value == "na" or max_ap is None:
+                    return value
+                return f"**{value}**" if float(value) == max_ap else value
+
+            def _fmt_tex(method: str) -> str:
+                value = values.get(method, "na")
+                if value == "na" or max_ap is None:
+                    return value
+                return rf"\textbf{{{value}}}" if float(value) == max_ap else value
+
+            md_lines.append(
+                f"| {model_label} | {bg}x | {_fmt_md('Meerkat')} | {_fmt_md('Monitor')} | {_fmt_md('Bayesian')} | {_fmt_md('Buffer')} |"
+            )
+            tex_lines.append(
+                f"{model_label} & {bg}x & {_fmt_tex('Meerkat')} & {_fmt_tex('Monitor')} & {_fmt_tex('Bayesian')} & {_fmt_tex('Buffer')} \\\\"
+            )
+        md_lines.append("")
+        tex_lines.append(r"\bottomrule")
+        tex_lines.append(r"\end{tabular}")
+        tex_lines.append("")
+
+    md_path = output_dir / "dm_paper_trace_ap_table.md"
+    tex_path = output_dir / "dm_paper_trace_ap_table.tex"
+    md_path.write_text("\n".join(md_lines).rstrip() + "\n")
+    tex_path.write_text("\n".join(tex_lines).rstrip() + "\n")
+    output_paths.extend([md_path, tex_path])
+    return output_paths
 
 
 def _print_paper_run_summary(results_dir: Path, input_paths: list[Path]) -> None:
@@ -1518,8 +1586,10 @@ def main() -> None:
             input_paths=explicit_input_paths or [],
         )
     )
-    print("\nWrote figures:")
-    for path in figure_paths:
+    table_paths = _write_paper_ap_tables(Path(args.results_dir), explicit_input_paths or [], figures_dir)
+
+    print("\nWrote outputs:")
+    for path in figure_paths + table_paths:
         print(f"- {path}")
 
 
