@@ -806,7 +806,7 @@ def _paper_curve_runs(
 
     candidates: list[tuple[Path, str, str, int]] = []
     if domain == "cyber":
-        for bg in (2, 20, 100):
+        for bg in (20, 100):
             path = results_dir / f"dm_cyber_d6_bg{bg}_v6.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
@@ -831,7 +831,7 @@ def _paper_curve_runs(
             if path.is_file() and _want(path):
                 candidates.append((path, model_label, "Buffer", 100))
     elif domain == "bio":
-        for bg in (2, 20, 100):
+        for bg in (20, 100):
             path = results_dir / f"dm_bio_d6_bg{bg}_v6.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
@@ -1202,14 +1202,13 @@ def _plot_main_paper_pr_figure(
             "axes.unicode_minus": False,
         }
     ):
-        fig = plt.figure(figsize=(5.5, 3.65))
-        grid = fig.add_gridspec(2, 6, hspace=0.42, wspace=0.28)
+        fig = plt.figure(figsize=(4.2, 3.65))
+        grid = fig.add_gridspec(2, 2, hspace=0.42, wspace=0.28)
         axes = {
-            ("gpt-5.4-mini", 2): fig.add_subplot(grid[0, 0:2]),
-            ("gpt-5.4-mini", 20): fig.add_subplot(grid[0, 2:4]),
-            ("gpt-5.4-mini", 100): fig.add_subplot(grid[0, 4:6]),
-            ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
-            ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
+            ("gpt-5.4-mini", 20): fig.add_subplot(grid[0, 0]),
+            ("gpt-5.4-mini", 100): fig.add_subplot(grid[0, 1]),
+            ("Qwen-3.5", 20): fig.add_subplot(grid[1, 0]),
+            ("Qwen-3.5", 100): fig.add_subplot(grid[1, 1]),
         }
         method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
         method_colors = {
@@ -1274,7 +1273,7 @@ def _plot_main_paper_pr_figure(
             ax.tick_params(labelsize=7.0)
             if panel_key[0] == "Qwen-3.5":
                 ax.set_xlabel("Recall", fontsize=8.5)
-            if panel_key != ("gpt-5.4-mini", 2) and panel_key != ("Qwen-3.5", 20):
+            if panel_key != ("gpt-5.4-mini", 20) and panel_key != ("Qwen-3.5", 20):
                 ax.tick_params(labelleft=False)
 
         legend_ax = axes.get(("gpt-5.4-mini", 100))
@@ -1290,14 +1289,14 @@ def _plot_main_paper_pr_figure(
                 labelspacing=0.2,
             )
 
-        top_left = axes.get(("gpt-5.4-mini", 2))
+        top_left = axes.get(("gpt-5.4-mini", 20))
         if top_left and top_left.axison:
             top_left.set_ylabel("gpt-5.4-mini\nPrecision", fontsize=8.5)
         bottom_left = axes.get(("Qwen-3.5", 20))
         if bottom_left and bottom_left.axison:
             bottom_left.set_ylabel("Qwen-3.5\nPrecision", fontsize=8.5)
 
-        fig.subplots_adjust(top=0.92, left=0.14, right=0.98, bottom=0.12)
+        fig.subplots_adjust(top=0.92, left=0.17, right=0.98, bottom=0.12)
 
         output_paths: list[Path] = []
         out_base = figures_dir / "dm_cyber_paper_pr_curves"
@@ -1327,14 +1326,13 @@ def _plot_bio_paper_pr_figure(
             "axes.unicode_minus": False,
         }
     ):
-        fig = plt.figure(figsize=(5.5, 3.65))
-        grid = fig.add_gridspec(2, 6, hspace=0.42, wspace=0.28)
+        fig = plt.figure(figsize=(4.2, 3.65))
+        grid = fig.add_gridspec(2, 2, hspace=0.42, wspace=0.28)
         axes = {
-            ("gpt-5.4-mini", 2): fig.add_subplot(grid[0, 0:2]),
-            ("gpt-5.4-mini", 20): fig.add_subplot(grid[0, 2:4]),
-            ("gpt-5.4-mini", 100): fig.add_subplot(grid[0, 4:6]),
-            ("Qwen-3.5", 20): fig.add_subplot(grid[1, 1:3]),
-            ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3:5]),
+            ("gpt-5.4-mini", 20): fig.add_subplot(grid[0, 0]),
+            ("gpt-5.4-mini", 100): fig.add_subplot(grid[0, 1]),
+            ("Qwen-3.5", 20): fig.add_subplot(grid[1, 0]),
+            ("Qwen-3.5", 100): fig.add_subplot(grid[1, 1]),
         }
         method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
         method_colors = {
@@ -1399,7 +1397,7 @@ def _plot_bio_paper_pr_figure(
             ax.tick_params(labelsize=7.0)
             if panel_key[0] == "Qwen-3.5":
                 ax.set_xlabel("Recall", fontsize=8.5)
-            if panel_key != ("gpt-5.4-mini", 2) and panel_key != ("Qwen-3.5", 20):
+            if panel_key != ("gpt-5.4-mini", 20) and panel_key != ("Qwen-3.5", 20):
                 ax.tick_params(labelleft=False)
 
         legend_ax = axes.get(("gpt-5.4-mini", 100))
@@ -1415,14 +1413,14 @@ def _plot_bio_paper_pr_figure(
                 labelspacing=0.2,
             )
 
-        top_left = axes.get(("gpt-5.4-mini", 2))
+        top_left = axes.get(("gpt-5.4-mini", 20))
         if top_left and top_left.axison:
             top_left.set_ylabel("gpt-5.4-mini\nPrecision", fontsize=8.5)
         bottom_left = axes.get(("Qwen-3.5", 20))
         if bottom_left and bottom_left.axison:
             bottom_left.set_ylabel("Qwen-3.5\nPrecision", fontsize=8.5)
 
-        fig.subplots_adjust(top=0.92, left=0.14, right=0.98, bottom=0.12)
+        fig.subplots_adjust(top=0.92, left=0.17, right=0.98, bottom=0.12)
 
         output_paths: list[Path] = []
         out_base = figures_dir / "dm_bio_paper_pr_curves"
