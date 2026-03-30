@@ -58,6 +58,7 @@ class PaperCurveRun:
     background_multiplier: int
     case_count: int
     average_precision: float | None
+    average_precision_bootstrap_se: float | None
     recall_grid: list[float]
     precision_curve: list[float]
     precision_lower: list[float]
@@ -724,6 +725,35 @@ def _average_precision_from_pr_curve(curve: list[dict[str, float]] | None) -> fl
     return ap
 
 
+def _stddev(values: list[float]) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(max(0.0, variance))
+
+
+def _bootstrap_mean_se(
+    values: list[float],
+    *,
+    n_bootstrap: int = 200,
+    seed: int = 0,
+) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return 0.0
+    rng = random.Random(seed)
+    n = len(values)
+    means: list[float] = []
+    for _ in range(n_bootstrap):
+        sample = [values[rng.randrange(n)] for _ in range(n)]
+        means.append(sum(sample) / n)
+    return _stddev(means)
+
+
 def _bootstrap_pr_band(
     per_case_scores: list[tuple[dict[str, float], set[str]]],
     *,
@@ -865,6 +895,7 @@ def _paper_curve_runs(
             ap_values = [_average_precision_from_pr_curve(curve) for curve in per_case_curves]
             ap_values = [float(ap) for ap in ap_values if ap is not None]
             ap = (sum(ap_values) / len(ap_values)) if ap_values else None
+            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=200, seed=bg + len(runs) * 31)
             rng = random.Random(bg + len(runs) * 17)
             lower: list[float] = []
             upper: list[float] = []
@@ -873,7 +904,7 @@ def _paper_curve_runs(
                 upper = precision_curve[:]
             else:
                 boot_means: list[list[float]] = []
-                for _ in range(32):
+                for _ in range(200):
                     sampled = [curve_samples[rng.randrange(len(curve_samples))] for _ in range(len(curve_samples))]
                     boot_means.append([sum(sample[i] for sample in sampled) / len(sampled) for i in range(len(recall_grid))])
                 for idx in range(len(recall_grid)):
@@ -884,12 +915,15 @@ def _paper_curve_runs(
             per_case_scores, case_count = _collect_stage2_cases(path)
             if not per_case_scores:
                 continue
+            ap_values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
+            ap_values = [float(ap) for ap in ap_values if ap is not None]
             _, curve, _, _ = _average_curves(per_case_scores)
             recall_grid, lower, upper, ap = _bootstrap_pr_band(
                 per_case_scores,
-                n_bootstrap=4,
+                n_bootstrap=200,
                 seed=bg + len(runs) * 17,
             )
+            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=200, seed=bg + len(runs) * 31)
             precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
         runs.append(
             PaperCurveRun(
@@ -899,6 +933,7 @@ def _paper_curve_runs(
                 background_multiplier=bg,
                 case_count=case_count,
                 average_precision=ap,
+                average_precision_bootstrap_se=ap_bootstrap_se,
                 recall_grid=recall_grid,
                 precision_curve=precision_curve,
                 precision_lower=lower,
@@ -1455,10 +1490,12 @@ def _write_paper_ap_tables(results_dir: Path, input_paths: list[Path], output_di
         runs = _paper_curve_runs(results_dir, input_paths, domain=domain)
         if not runs:
             continue
-        rows: dict[tuple[str, int], dict[str, str]] = {}
+        rows: dict[tuple[str, int], dict[str, tuple[float | None, float | None]]] = {}
         for run in runs:
-            ap_text = "na" if run.average_precision is None else f"{run.average_precision:.3f}"
-            rows.setdefault((run.model_label, run.background_multiplier), {})[run.method_label] = ap_text
+            rows.setdefault((run.model_label, run.background_multiplier), {})[run.method_label] = (
+                run.average_precision,
+                run.average_precision_bootstrap_se,
+            )
 
         md_lines.append(f"## {domain.title()}")
         md_lines.append("| Model | BG | Meerkat | Monitor | Bayesian | Buffer |")
@@ -1470,24 +1507,34 @@ def _write_paper_ap_tables(results_dir: Path, input_paths: list[Path], output_di
         tex_lines.append("Model & BG & Meerkat & Monitor & Bayesian & Buffer \\\\")
         tex_lines.append(r"\midrule")
         for (model_label, bg), values in sorted(rows.items(), key=lambda item: (item[0][0], item[0][1])):
-            numeric_values = {
-                method: float(ap_text)
-                for method, ap_text in values.items()
-                if ap_text != "na"
-            }
+            numeric_values = {method: mean for method, (mean, _) in values.items() if mean is not None}
             max_ap = max(numeric_values.values()) if numeric_values else None
 
             def _fmt_md(method: str) -> str:
-                value = values.get(method, "na")
-                if value == "na" or max_ap is None:
-                    return value
-                return f"**{value}**" if float(value) == max_ap else value
+                pair = values.get(method)
+                if pair is None:
+                    return "na"
+                mean, se = pair
+                if mean is None:
+                    return "na"
+                if se is None:
+                    value = f"{mean:.3f}"
+                else:
+                    value = f"{mean:.3f} +/- {se:.3f}"
+                return f"**{value}**" if max_ap is not None and mean == max_ap else value
 
             def _fmt_tex(method: str) -> str:
-                value = values.get(method, "na")
-                if value == "na" or max_ap is None:
-                    return value
-                return rf"\textbf{{{value}}}" if float(value) == max_ap else value
+                pair = values.get(method)
+                if pair is None:
+                    return "na"
+                mean, se = pair
+                if mean is None:
+                    return "na"
+                if se is None:
+                    value = f"{mean:.3f}"
+                else:
+                    value = f"{mean:.3f} $\\\\pm$ {se:.3f}"
+                return rf"\textbf{{{value}}}" if max_ap is not None and mean == max_ap else value
 
             md_lines.append(
                 f"| {model_label} | {bg}x | {_fmt_md('Meerkat')} | {_fmt_md('Monitor')} | {_fmt_md('Bayesian')} | {_fmt_md('Buffer')} |"
