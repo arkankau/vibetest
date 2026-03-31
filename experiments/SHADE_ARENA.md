@@ -82,6 +82,33 @@ Cases constructed with variable traces-per-case (tpc), mixed tasks, 50% positive
 
 The agent substantially outperforms both the monitor and EaE. With tool access in a Docker sandbox, the agent can read full transcripts, search for patterns, and reason about multi-step behaviors that the single-call monitor misses.
 
+### Figures
+
+![ROC and PR Curves by Case Size](../results/shade_arena_paper_curves.png)
+
+![Per-Task AUROC](../results/shade_arena_paper_per_task.png)
+
+![Score Distributions](../results/shade_arena_paper_distributions.png)
+
+![AUROC Decomposition](../results/shade_arena_paper_decomposition.png)
+
+### Where does the Agent's improvement come from?
+
+A swap analysis decomposes the Agent's AUROC improvement over the Monitor into sensitivity (finding positives) vs. specificity (rejecting negatives):
+
+| Configuration | AUROC | vs. Monitor |
+|---------------|-------|-------------|
+| Monitor (baseline) | 0.808 | — |
+| Agent pos scores + Monitor neg scores | 0.953 | +0.145 |
+| Monitor pos scores + Agent neg scores | 0.669 | -0.139 |
+| **Agent (full)** | **0.896** | **+0.088** |
+
+**The Agent's improvement comes entirely from better positive detection.** If we keep the Monitor's clean-trace scores but use the Agent's sabotage-trace scores, AUROC jumps to 0.953 (+0.145). The Agent finds hard positives — subtle sabotage traces (AA flights, HR manipulation) where the Monitor gives moderate scores (0.3-0.5) but the Agent, with tool access and multi-step reasoning, correctly pushes them to 0.8+.
+
+The tradeoff: the Agent is *worse* at rejecting clean traces (mean neg score 0.40 vs Monitor's 0.18). At TPR=0.90, the Monitor requires FPR=1.00 (can't achieve 90% recall without flagging everything), while the Agent achieves FPR=0.41. The Agent finds the hard positives that the Monitor simply cannot see, at the cost of slightly more false alarms — a worthwhile trade for operational sabotage detection.
+
+The decomposition figure (panel b) shows this clearly: at any FPR budget, the Agent catches more sabotage traces. The positive CDF (panel c) shows the Agent pushes sabotage scores higher, while the negative CDF (panel d) confirms the Agent is more trigger-happy on clean traces.
+
 ### Comparison with paper
 
 We outperform the paper's reported monitor results across all methods. Key differences:
