@@ -121,6 +121,12 @@ def _parse_args() -> argparse.Namespace:
         default="results/dm_stage1_score_cache",
         help="Cache directory for recomputed stage-1 scores.",
     )
+    parser.add_argument(
+        "--bootstrap-samples",
+        type=int,
+        default=100,
+        help="Number of bootstrap resamples for PR bands and AP standard errors.",
+    )
     return parser.parse_args()
 
 
@@ -823,11 +829,44 @@ def _collect_stage2_cases(path: Path) -> tuple[list[tuple[dict[str, float], set[
     return stage2_cases, len(rows)
 
 
+def _row_case_id(row: dict[str, Any], fallback_index: int) -> str:
+    return str(row.get("case_id") or row.get("repo_name") or fallback_index)
+
+
+def _collect_case_rows(path: Path) -> tuple[list[tuple[str, dict[str, float], set[str]]], int]:
+    rows = _load_rows(path)
+    cases: list[tuple[str, dict[str, float], set[str]]] = []
+    for idx, row in enumerate(rows):
+        gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
+        scores = _row_trace_scores(row)
+        if scores and gt:
+            cases.append((_row_case_id(row, idx), scores, gt))
+    return cases, len(rows)
+
+
+def _merged_cases_with_monitor(agent_path: Path, monitor_path: Path | None) -> tuple[list[tuple[dict[str, float], set[str]]], int]:
+    agent_cases, case_count = _collect_case_rows(agent_path)
+    if monitor_path is None or not monitor_path.is_file():
+        return [(scores, gt) for _, scores, gt in agent_cases], case_count
+
+    monitor_cases, _ = _collect_case_rows(monitor_path)
+    monitor_by_case = {case_id: scores for case_id, scores, _ in monitor_cases}
+    merged_cases: list[tuple[dict[str, float], set[str]]] = []
+    for case_id, agent_scores, gt in agent_cases:
+        merged = dict(agent_scores)
+        monitor_scores = monitor_by_case.get(case_id) or {}
+        for trace_key, score in monitor_scores.items():
+            merged[trace_key] = max(float(merged.get(trace_key, 0.0)), float(score))
+        merged_cases.append((merged, gt))
+    return merged_cases, case_count
+
+
 def _paper_curve_runs(
     results_dir: Path,
     explicit_inputs: list[Path] | None = None,
     *,
     domain: str = "cyber",
+    bootstrap_samples: int = 100,
 ) -> list[PaperCurveRun]:
     explicit_set = {path.resolve() for path in explicit_inputs or []}
 
@@ -836,8 +875,8 @@ def _paper_curve_runs(
 
     candidates: list[tuple[Path, str, str, int]] = []
     if domain == "cyber":
-        for bg in (20, 100):
-            path = results_dir / f"dm_cyber_d6_bg{bg}_v6.jsonl"
+        for bg, filename in ((20, "dm_cyber_d6_bg20_v6.jsonl"), (100, "dm_cyber_d6_bg100_n15.jsonl")):
+            path = results_dir / filename
             if path.is_file() and _want(path):
                 candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
         for bg in (20, 100):
@@ -865,7 +904,7 @@ def _paper_curve_runs(
             path = results_dir / f"dm_bio_d6_bg{bg}_v6.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
-        for bg, suffix in ((20, "n20"), (100, "2pass_n50")):
+        for bg, suffix in ((20, "n20"), (100, "v4_n50")):
             path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_{suffix}.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "Qwen-3.5", "Meerkat", bg))
@@ -885,34 +924,16 @@ def _paper_curve_runs(
             if path.is_file() and _want(path):
                 candidates.append((path, model_label, "Buffer", 100))
 
+    monitor_paths: dict[tuple[str, int], Path] = {}
+    for candidate_path, model_label, method_label, bg in candidates:
+        if method_label == "Monitor":
+            monitor_paths[(model_label, bg)] = candidate_path
+
     runs: list[PaperCurveRun] = []
     recall_grid = [i / 20.0 for i in range(21)]
     for path, model_label, method_label, bg in candidates:
-        per_case_curves, case_count = _collect_stage2_case_curves(path)
-        if per_case_curves:
-            curve_samples = [_interp_precision_at_recalls(curve, recall_grid) for curve in per_case_curves]
-            precision_curve = [sum(sample[i] for sample in curve_samples) / len(curve_samples) for i in range(len(recall_grid))]
-            ap_values = [_average_precision_from_pr_curve(curve) for curve in per_case_curves]
-            ap_values = [float(ap) for ap in ap_values if ap is not None]
-            ap = (sum(ap_values) / len(ap_values)) if ap_values else None
-            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=100, seed=bg + len(runs) * 31)
-            rng = random.Random(bg + len(runs) * 17)
-            lower: list[float] = []
-            upper: list[float] = []
-            if len(curve_samples) == 1:
-                lower = precision_curve[:]
-                upper = precision_curve[:]
-            else:
-                boot_means: list[list[float]] = []
-                for _ in range(100):
-                    sampled = [curve_samples[rng.randrange(len(curve_samples))] for _ in range(len(curve_samples))]
-                    boot_means.append([sum(sample[i] for sample in sampled) / len(sampled) for i in range(len(recall_grid))])
-                for idx in range(len(recall_grid)):
-                    vals = sorted(sample[idx] for sample in boot_means)
-                    lower.append(vals[max(0, int(0.025 * len(vals)) - 1)])
-                    upper.append(vals[min(len(vals) - 1, int(0.975 * len(vals)))])
-        else:
-            per_case_scores, case_count = _collect_stage2_cases(path)
+        if method_label == "Meerkat":
+            per_case_scores, case_count = _merged_cases_with_monitor(path, monitor_paths.get((model_label, bg)))
             if not per_case_scores:
                 continue
             ap_values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
@@ -920,11 +941,49 @@ def _paper_curve_runs(
             _, curve, _, _ = _average_curves(per_case_scores)
             recall_grid, lower, upper, ap = _bootstrap_pr_band(
                 per_case_scores,
-                n_bootstrap=100,
+                n_bootstrap=bootstrap_samples,
                 seed=bg + len(runs) * 17,
             )
-            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=100, seed=bg + len(runs) * 31)
+            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
             precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
+        else:
+            per_case_curves, case_count = _collect_stage2_case_curves(path)
+            if per_case_curves:
+                curve_samples = [_interp_precision_at_recalls(curve, recall_grid) for curve in per_case_curves]
+                precision_curve = [sum(sample[i] for sample in curve_samples) / len(curve_samples) for i in range(len(recall_grid))]
+                ap_values = [_average_precision_from_pr_curve(curve) for curve in per_case_curves]
+                ap_values = [float(ap) for ap in ap_values if ap is not None]
+                ap = (sum(ap_values) / len(ap_values)) if ap_values else None
+                ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
+                rng = random.Random(bg + len(runs) * 17)
+                lower = []
+                upper = []
+                if len(curve_samples) == 1:
+                    lower = precision_curve[:]
+                    upper = precision_curve[:]
+                else:
+                    boot_means: list[list[float]] = []
+                    for _ in range(bootstrap_samples):
+                        sampled = [curve_samples[rng.randrange(len(curve_samples))] for _ in range(len(curve_samples))]
+                        boot_means.append([sum(sample[i] for sample in sampled) / len(sampled) for i in range(len(recall_grid))])
+                    for idx in range(len(recall_grid)):
+                        vals = sorted(sample[idx] for sample in boot_means)
+                        lower.append(vals[max(0, int(0.025 * len(vals)) - 1)])
+                        upper.append(vals[min(len(vals) - 1, int(0.975 * len(vals)))])
+            else:
+                per_case_scores, case_count = _collect_stage2_cases(path)
+                if not per_case_scores:
+                    continue
+                ap_values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
+                ap_values = [float(ap) for ap in ap_values if ap is not None]
+                _, curve, _, _ = _average_curves(per_case_scores)
+                recall_grid, lower, upper, ap = _bootstrap_pr_band(
+                    per_case_scores,
+                    n_bootstrap=bootstrap_samples,
+                    seed=bg + len(runs) * 17,
+                )
+                ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
+                precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
         runs.append(
             PaperCurveRun(
                 path=path,
@@ -1225,8 +1284,9 @@ def _plot_main_paper_pr_figure(
     recompute_stage1_if_missing: bool,
     stage1_concurrency: int,
     stage1_cache_dir: Path,
+    bootstrap_samples: int,
 ) -> list[Path]:
-    runs = _paper_curve_runs(results_dir, input_paths)
+    runs = _paper_curve_runs(results_dir, input_paths, bootstrap_samples=bootstrap_samples)
     if not runs:
         return []
     with mpl.rc_context(
@@ -1349,8 +1409,9 @@ def _plot_bio_paper_pr_figure(
     figures_dir: Path,
     figure_formats: list[str],
     input_paths: list[Path],
+    bootstrap_samples: int,
 ) -> list[Path]:
-    runs = _paper_curve_runs(results_dir, input_paths, domain="bio")
+    runs = _paper_curve_runs(results_dir, input_paths, domain="bio", bootstrap_samples=bootstrap_samples)
     if not runs:
         return []
     with mpl.rc_context(
@@ -1473,9 +1534,10 @@ def _plot_combined_paper_pr_figure(
     figures_dir: Path,
     figure_formats: list[str],
     input_paths: list[Path],
+    bootstrap_samples: int,
 ) -> list[Path]:
-    cyber_runs = _paper_curve_runs(results_dir, input_paths, domain="cyber")
-    bio_runs = _paper_curve_runs(results_dir, input_paths, domain="bio")
+    cyber_runs = _paper_curve_runs(results_dir, input_paths, domain="cyber", bootstrap_samples=bootstrap_samples)
+    bio_runs = _paper_curve_runs(results_dir, input_paths, domain="bio", bootstrap_samples=bootstrap_samples)
     runs = cyber_runs + bio_runs
     if not runs:
         return []
@@ -1551,8 +1613,8 @@ def _plot_combined_paper_pr_figure(
                     zorder=2,
                 )
             _, domain, bg = panel_key
-            domain_prefix = "C" if domain == "cyber" else "B"
-            ax.set_title(f"{domain_prefix}{bg}x", fontsize=7.5, pad=3)
+            domain_label = "Cyber" if domain == "cyber" else "Bio"
+            ax.set_title(f"{domain_label} (bg={bg}x)", fontsize=7.5, pad=3)
             ax.set_xlim(0.0, 1.0)
             ax.set_ylim(0.0, 1.02)
             ax.grid(alpha=0.22)
@@ -1608,13 +1670,19 @@ def _print_summary_table(metrics: list[SettingMetrics]) -> None:
         )
 
 
-def _write_paper_ap_tables(results_dir: Path, input_paths: list[Path], output_dir: Path) -> list[Path]:
+def _write_paper_ap_tables(
+    results_dir: Path,
+    input_paths: list[Path],
+    output_dir: Path,
+    *,
+    bootstrap_samples: int,
+) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_paths: list[Path] = []
     md_lines = ["# Distributed-Misuse Trace AP Table", "", "| Domain | Model | BG | Meerkat | Monitor | Bayesian | Buffer |", "|---|---|---:|---:|---:|---:|---:|"]
     tex_lines = ["% Auto-generated by scripts/analyze_distributed_misuse.py", r"\begin{tabular}{lllrrrr}", r"\toprule", "Domain & Model & BG & Meerkat & Monitor & Bayesian & Buffer \\\\", r"\midrule"]
     for domain in ("cyber", "bio"):
-        runs = _paper_curve_runs(results_dir, input_paths, domain=domain)
+        runs = _paper_curve_runs(results_dir, input_paths, domain=domain, bootstrap_samples=bootstrap_samples)
         if not runs:
             continue
         rows: dict[tuple[str, int], dict[str, tuple[float | None, float | None]]] = {}
@@ -1722,6 +1790,7 @@ def main() -> None:
             recompute_stage1_if_missing=args.recompute_stage1_if_missing,
             stage1_concurrency=args.stage1_concurrency,
             stage1_cache_dir=stage1_cache_dir,
+            bootstrap_samples=args.bootstrap_samples,
         )
     )
     figure_paths.extend(
@@ -1730,6 +1799,7 @@ def main() -> None:
             figures_dir=figures_dir,
             figure_formats=figure_formats,
             input_paths=explicit_input_paths or [],
+            bootstrap_samples=args.bootstrap_samples,
         )
     )
     figure_paths.extend(
@@ -1738,9 +1808,15 @@ def main() -> None:
             figures_dir=figures_dir,
             figure_formats=figure_formats,
             input_paths=explicit_input_paths or [],
+            bootstrap_samples=args.bootstrap_samples,
         )
     )
-    table_paths = _write_paper_ap_tables(Path(args.results_dir), explicit_input_paths or [], figures_dir)
+    table_paths = _write_paper_ap_tables(
+        Path(args.results_dir),
+        explicit_input_paths or [],
+        figures_dir,
+        bootstrap_samples=args.bootstrap_samples,
+    )
 
     print("\nWrote outputs:")
     for path in figure_paths + table_paths:

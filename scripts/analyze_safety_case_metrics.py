@@ -69,11 +69,12 @@ METHOD_HATCHES = {
 # ALLOWED_EVAL_MODELS = {"gpt-5-mini", "gpt-5.4-mini", "gpt-5.4", "GLM-5", "Qwen-3.5", "MiniMax-M2.5"}
 ALLOWED_EVAL_MODELS = {"Qwen-3.5", "gpt-5.4-mini", "GLM-5"}
 OVERALL_DATASET_LABELS = {
-    # "impossiblebench_gpt-5-mini": "ImpossibleBench",
+    "impossiblebench_claude-opus-4.6": "ImpossibleBench",
     "mle-sabotage": "MLE-Sabotage",
     "trace-dataset": "TRACE",
 }
 TRACE_SCORE_DATASET_LABELS = {
+    "impossiblebench_claude-opus-4.6": "ImpossibleBench",
     "mle-sabotage": "MLE-Sabotage",
     "trace-dataset": "TRACE",
 }
@@ -1093,13 +1094,21 @@ def _positive_pct_bucket_label(pct: float, bounds: list[float]) -> str:
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    source_path = str(path)
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            rows.append(json.loads(line))
+            row = json.loads(line)
+            if isinstance(row, dict):
+                row.setdefault("__source_path", source_path)
+            rows.append(row)
     return rows
+
+
+def _row_case_id(row: dict[str, Any]) -> str:
+    return str(row.get("case_id") or row.get("repo_name") or "").strip()
 
 
 @lru_cache(maxsize=4096)
@@ -1130,6 +1139,57 @@ def _load_initial_trace_scores_from_repo(repo_path: str) -> dict[str, float]:
     return scores
 
 
+def _judge_results_path_for_source(row: dict[str, Any]) -> Path | None:
+    source_path = Path(str(row.get("__source_path") or "")).expanduser()
+    if not source_path.is_file():
+        return None
+    dataset_name, method = _infer_dataset_and_method_from_file(str(source_path))
+    stripped_method, _ = _strip_method_variant(method)
+    method_base, method_model = _split_method_parts(stripped_method)
+    if method_base != "AT":
+        return None
+    if not method_model:
+        tests = row.get("tests") or []
+        metadata = (tests[0] or {}).get("metadata") if tests else {}
+        if isinstance(metadata, dict):
+            method_model = str(metadata.get("model") or "").strip() or None
+    if not method_model:
+        return None
+    base_dataset, _ = _split_dataset_variant(dataset_name)
+    prefix = "safety_" if source_path.name.startswith("safety_") else ""
+    candidate = source_path.parent / f"{prefix}{base_dataset}_llmjudge-{method_model}.jsonl"
+    return candidate if candidate.is_file() else None
+
+
+@lru_cache(maxsize=512)
+def _load_judge_trace_scores_by_case(judge_path: str) -> dict[str, dict[str, float]]:
+    path = Path(str(judge_path or "")).expanduser()
+    if not path.is_file():
+        return {}
+    by_case: dict[str, dict[str, float]] = {}
+    for row in _load_rows(path):
+        case_id = _row_case_id(row)
+        if not case_id:
+            continue
+        scores = _row_trace_scores(row, max_merge=False)
+        if scores:
+            by_case[case_id] = scores
+    return by_case
+
+
+def _initial_scores_for_row(row: dict[str, Any]) -> dict[str, float]:
+    initial_scores = _load_initial_trace_scores_from_repo(str(row.get("repo") or ""))
+    if initial_scores:
+        return initial_scores
+    judge_path = _judge_results_path_for_source(row)
+    if judge_path is None:
+        return {}
+    case_id = _row_case_id(row)
+    if not case_id:
+        return {}
+    return dict(_load_judge_trace_scores_by_case(str(judge_path)).get(case_id) or {})
+
+
 def _row_trace_scores(row: dict[str, Any], *, max_merge: bool = False) -> dict[str, float]:
     tests = row.get("tests") or []
     metadata = (tests[0] or {}).get("metadata") if tests else {}
@@ -1150,7 +1210,7 @@ def _row_trace_scores(row: dict[str, Any], *, max_merge: bool = False) -> dict[s
         scores[trace_key] = max(0.0, min(1.0, score))
     if not max_merge:
         return scores
-    initial_scores = _load_initial_trace_scores_from_repo(str(row.get("repo") or ""))
+    initial_scores = _initial_scores_for_row(row)
     if not initial_scores:
         return scores
     merged = dict(initial_scores)
@@ -1486,15 +1546,33 @@ def _collect_metrics(
     _, dataset_variant = _split_dataset_variant(dataset_name)
     stripped_method, stripped_method_variant = _strip_method_variant(method)
     method_base, method_model = _split_method_parts(stripped_method)
+    effective_variant = str(stripped_method_variant or dataset_variant or "").strip()
     eval_model = _display_model_name(method_model or fallback_model)
     if not _should_include_eval_model(eval_model):
         return [], [], []
 
-    overall = _init_metric_row(label, path, "overall")
+    use_default_max_merge = (
+        method_base == "AT"
+        and effective_variant == ""
+        and dataset_name in {"trace-dataset", "impossiblebench_claude-opus-4.6"}
+    )
+    default_score_mode = "max-merge" if use_default_max_merge else "original"
+
+    overall = _init_metric_row(
+        label,
+        path,
+        "overall",
+        score_mode=default_score_mode,
+        method_base_override=method_base,
+        method_variant_override=effective_variant or None,
+    )
     by_case_size: dict[str, dict[str, Any]] = {}
     by_positive_pct: dict[str, dict[str, Any]] = {}
-    effective_variant = str(stripped_method_variant or dataset_variant or "").strip()
-    include_max_merge = method_base == "AT" and effective_variant in {"", "no-tools"}
+    include_max_merge = (
+        method_base == "AT"
+        and effective_variant in {"", "no-tools"}
+        and not use_default_max_merge
+    )
     max_variant_override: str | None = None
     if include_max_merge:
         if effective_variant == "no-tools":
@@ -1524,7 +1602,14 @@ def _collect_metrics(
         case_size = _to_int(row.get("traces_per_case"))
         case_key = str(case_size) if case_size > 0 else "unknown"
         if case_key not in by_case_size:
-            by_case_size[case_key] = _init_metric_row(label, path, case_key)
+            by_case_size[case_key] = _init_metric_row(
+                label,
+                path,
+                case_key,
+                score_mode=default_score_mode,
+                method_base_override=method_base,
+                method_variant_override=effective_variant or None,
+            )
         _update_metric_row(by_case_size[case_key], row, fallback_model=fallback_model)
         if overall_max is not None:
             if case_key not in by_case_size_max:
@@ -1545,7 +1630,14 @@ def _collect_metrics(
         else:
             pct_key = "unknown"
         if pct_key not in by_positive_pct:
-            by_positive_pct[pct_key] = _init_metric_row(label, path, pct_key)
+            by_positive_pct[pct_key] = _init_metric_row(
+                label,
+                path,
+                pct_key,
+                score_mode=default_score_mode,
+                method_base_override=method_base,
+                method_variant_override=effective_variant or None,
+            )
         _update_metric_row(by_positive_pct[pct_key], row, fallback_model=fallback_model)
         if overall_max is not None:
             if pct_key not in by_positive_pct_max:
@@ -1669,7 +1761,7 @@ def _print_table(title: str, rows: list[dict[str, Any]], *, include_group: bool)
 
 def _include_in_paper_outputs(row: dict[str, Any]) -> bool:
     dataset = str(row.get("dataset") or "").strip()
-    if dataset != "trace-dataset":
+    if dataset not in {"trace-dataset", "impossiblebench_claude-opus-4.6"}:
         return False
     method_base = str(row.get("method_base") or "").strip()
     method_variant = str(row.get("method_variant") or "").strip()
@@ -1702,7 +1794,7 @@ def _print_paper_table(rows: list[dict[str, Any]]) -> None:
     ]
     paper_rows = [row for row in grouped_rows if _include_in_paper_outputs(row)]
     if not paper_rows:
-        print("\n## TRACE Paper Table\n(no rows)")
+        print("\n## Safety Paper Table\n(no rows)")
         return
 
     paper_rows = sorted(
@@ -1713,17 +1805,19 @@ def _print_paper_table(rows: list[dict[str, Any]]) -> None:
         ),
     )
     cols = [
+        ("dataset", "dataset"),
         ("model", "model"),
         ("method", "method"),
         ("verified_macro_f1", "verified_macro_f1"),
         ("case_average_precision", "case_ap"),
         ("trace_average_precision", "trace_ap"),
     ]
-    print("\n## TRACE Paper Table")
+    print("\n## Safety Paper Table")
     print(" | ".join(label for _, label in cols))
     print(" | ".join("---" for _ in cols))
     for row in paper_rows:
         values = {
+            "dataset": OVERALL_DATASET_LABELS.get(str(row.get("dataset") or ""), str(row.get("dataset") or "")),
             "model": _display_model_name(str(row.get("method_model") or "")) or "",
             "method": _presentation_method_label(
                 method_base=str(row.get("method_base") or ""),
@@ -1740,6 +1834,15 @@ def _print_paper_table(rows: list[dict[str, Any]]) -> None:
 def _slug(text: str) -> str:
     value = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(text).strip().lower())
     return value.strip("-") or "unknown"
+
+
+def _dataset_output_slug(dataset: str) -> str:
+    dataset = str(dataset or "").strip()
+    if dataset == "impossiblebench_claude-opus-4.6":
+        return "impossiblebench"
+    if dataset == "trace-dataset":
+        return "trace"
+    return _slug(dataset)
 
 
 def _infer_dataset_and_method_from_file(file_path: str) -> tuple[str, str]:
@@ -3119,6 +3222,7 @@ def _grouped_overall_metric_bar_plot(
 def _overall_ap_by_model_plot(
     *,
     rows: list[dict[str, Any]],
+    dataset: str,
     out_base: Path,
     formats: list[str],
 ) -> list[Path]:
@@ -3132,7 +3236,7 @@ def _overall_ap_by_model_plot(
     plot_rows = [
         row
         for row in rows
-        if str(row.get("dataset") or "") == "trace-dataset"
+        if str(row.get("dataset") or "") == dataset
         and _include_in_paper_outputs(row)
         and str(row.get("method_variant") or "").strip() not in {"max-merge", "no-tools-max-merge"}
     ]
@@ -3266,6 +3370,176 @@ def _overall_ap_by_model_plot(
     return out_paths
 
 
+def _macro_f1_by_dataset_plot(
+    *,
+    rows: list[dict[str, Any]],
+    out_base: Path,
+    formats: list[str],
+) -> list[Path]:
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+    except ImportError:
+        print("Skipping figure generation: matplotlib is not installed.")
+        return []
+
+    grouped_rows = [
+        row
+        for dataset_rows in _group_plot_rows_by_dataset(rows).values()
+        for row in dataset_rows
+    ]
+    plot_rows = [
+        row
+        for row in grouped_rows
+        if str(row.get("dataset") or "") in TRACE_SCORE_DATASET_LABELS
+        and _include_in_paper_outputs(row)
+        and str(row.get("method_variant") or "").strip() not in {"max-merge", "no-tools-max-merge"}
+    ]
+    if not plot_rows:
+        return []
+
+    method_rank = {
+        "Meerkat": 0,
+        "Naive Agent": 1,
+        "Per-trace Monitor": 2,
+    }
+    model_order = ["Qwen-3.5", "gpt-5.4-mini", "GLM-5"]
+    method_sequence = ["Meerkat", "Naive Agent", "Per-trace Monitor"]
+    datasets = [
+        dataset
+        for dataset in ("impossiblebench_claude-opus-4.6", "trace-dataset")
+        if dataset in {str(row.get("dataset") or "") for row in plot_rows}
+    ]
+    if not datasets:
+        return []
+
+    grouped: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in plot_rows:
+        dataset = str(row.get("dataset") or "")
+        model_name = _display_model_name(str(row.get("method_model") or ""))
+        method_label = _presentation_method_label(
+            method_base=str(row.get("method_base") or ""),
+            method_variant=str(row.get("method_variant") or ""),
+            dataset_variant=str(row.get("dataset_variant") or ""),
+        )
+        if dataset not in datasets or not model_name or method_label not in method_rank:
+            continue
+        grouped.setdefault(dataset, {}).setdefault(model_name, {})[method_label] = row
+
+    _apply_publication_style(plt)
+    fig, axes = plt.subplots(
+        1,
+        len(datasets),
+        figsize=(FIGURE_WIDTH_IN * max(1.15, 1.12 * len(datasets)), BAR_FIGURE_HEIGHT_IN * 1.35),
+        constrained_layout=False,
+    )
+    if not isinstance(axes, (list, tuple)):
+        try:
+            axes = list(axes.ravel())
+        except Exception:
+            axes = [axes]
+    fig.subplots_adjust(left=0.10, right=0.99, bottom=0.18, top=0.74, wspace=0.25)
+
+    method_handles = [
+        Patch(facecolor="#777777", edgecolor=SPINE_COLOR, label="Meerkat"),
+        Patch(facecolor="#BBBBBB", edgecolor=SPINE_COLOR, hatch="..", label="Naive Agent"),
+        Patch(facecolor="#DDDDDD", edgecolor=SPINE_COLOR, hatch="////", label="Per-trace Monitor"),
+    ]
+    fig.legend(
+        handles=method_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.98),
+        ncol=3,
+        title="Method",
+        title_fontsize=LEGEND_FONTSIZE,
+        frameon=False,
+        borderaxespad=0.0,
+        handlelength=1.1,
+        columnspacing=1.0,
+        handletextpad=0.4,
+    )
+
+    for ax, dataset in zip(axes, datasets):
+        model_map = grouped.get(dataset, {})
+        model_names = [m for m in model_order if m in model_map] + [m for m in model_map if m not in model_order]
+        if not model_names:
+            ax.axis("off")
+            continue
+
+        bar_width = 0.22
+        model_gap = 0.30
+        group_centers: list[float] = []
+        cursor = 0.0
+        positions: dict[tuple[str, str], float] = {}
+        for model_name in model_names:
+            start = cursor
+            for method_label in method_sequence:
+                positions[(model_name, method_label)] = cursor
+                cursor += bar_width
+            group_centers.append(start + bar_width)
+            cursor += model_gap
+
+        for model_name in model_names:
+            for method_label in method_sequence:
+                row = model_map.get(model_name, {}).get(method_label)
+                if row is None:
+                    continue
+                x = positions[(model_name, method_label)]
+                value = _to_float(row.get("macro_f1"))
+                if value is None:
+                    continue
+                low = _to_float(row.get("macro_f1_ci_low"))
+                high = _to_float(row.get("macro_f1_ci_high"))
+                lower_err = max(0.0, value - low) if low is not None else 0.0
+                upper_err = max(0.0, high - value) if high is not None else 0.0
+                face = _method_fill_color(
+                    method_model=model_name,
+                    method_base=str(row.get("method_base") or ""),
+                    method_variant=str(row.get("method_variant") or ""),
+                    fallback_index=0,
+                    palette=[],
+                )
+                hatch = ""
+                if method_label == "Per-trace Monitor":
+                    hatch = "////"
+                elif method_label == "Naive Agent":
+                    hatch = ".."
+                ax.bar(
+                    x,
+                    value,
+                    width=bar_width * 0.88,
+                    color=face,
+                    edgecolor=SPINE_COLOR,
+                    linewidth=0.6,
+                    hatch=hatch,
+                    yerr=[[lower_err], [upper_err]],
+                    capsize=2.0,
+                    ecolor="black",
+                    zorder=3,
+                )
+
+        ax.set_title(TRACE_SCORE_DATASET_LABELS.get(dataset, dataset), fontsize=11.0, pad=8)
+        ax.set_ylabel("Macro F1", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.0)
+        ax.set_xticks(group_centers)
+        ax.set_xticklabels(model_names)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, which="major", axis="y", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color(SPINE_COLOR)
+        ax.spines["bottom"].set_color(SPINE_COLOR)
+
+    out_paths: list[Path] = []
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in formats:
+        out_path = out_base.with_suffix(f".{ext}")
+        fig.savefig(out_path, dpi=300)
+        out_paths.append(out_path)
+    plt.close(fig)
+    return out_paths
+
+
 def _judge_vs_at_ap_scatter_plot(
     *,
     rows: list[dict[str, Any]],
@@ -3325,8 +3599,9 @@ def _judge_vs_at_ap_scatter_plot(
                     continue
                 if not _ground_truth_positive_trace_files(judge_case):
                     continue
+                use_max_merge = str(row.get("score_mode") or "") == "max-merge"
                 judge_ap = _average_precision_from_pairs(_row_trace_score_pairs(judge_case))
-                at_ap = _average_precision_from_pairs(_row_trace_score_pairs(at_case))
+                at_ap = _average_precision_from_pairs(_row_trace_score_pairs(at_case, max_merge=use_max_merge))
                 if judge_ap is None or at_ap is None:
                     continue
                 points_by_dataset.setdefault(dataset, []).append(
@@ -3456,9 +3731,10 @@ def _build_calibration_groups(
         source_rows = _load_rows(file_path)
         trace_pairs: list[tuple[int, float]] = []
         case_pairs: list[tuple[int, float]] = []
+        use_max_merge = str(row.get("score_mode") or "") == "max-merge"
         for source_row in source_rows:
-            trace_pairs.extend(_row_trace_score_pairs(source_row))
-            case_pair = _row_case_score_pair(source_row)
+            trace_pairs.extend(_row_trace_score_pairs(source_row, max_merge=use_max_merge))
+            case_pair = _row_case_score_pair(source_row, max_merge=use_max_merge)
             if case_pair is not None:
                 case_pairs.append(case_pair)
         if not trace_pairs and not case_pairs:
@@ -3526,7 +3802,7 @@ def _discover_safety_result_files() -> list[Path]:
             continue
         dataset, method = _infer_dataset_and_method_from_file(str(path))
         dataset_base, _ = _split_dataset_variant(dataset)
-        if dataset_base != "trace-dataset":
+        if dataset_base not in {"trace-dataset", "impossiblebench_claude-opus-4.6"}:
             continue
         method, _ = _strip_method_variant(method)
         _, method_model = _split_method_parts(method)
@@ -3552,25 +3828,38 @@ def _generate_figures(
         for row in dataset_rows
         if str(row.get("dataset") or "") in TRACE_SCORE_DATASET_LABELS and _include_in_paper_outputs(row)
     ]
-    out_paths.extend(
-        _judge_vs_at_ap_scatter_plot(
-            rows=trace_ap_rows,
-            dataset_labels=TRACE_SCORE_DATASET_LABELS,
-            out_base=figures_dir / "safety_trace_judge_vs_meerkat_trace_ap",
-            formats=formats,
-        )
+    datasets_for_paper = sorted(
+        {
+            str(row.get("dataset") or "")
+            for row in trace_ap_rows
+            if str(row.get("dataset") or "") in TRACE_SCORE_DATASET_LABELS
+        }
     )
-    out_paths.extend(
-        _overall_ap_by_model_plot(
-            rows=trace_ap_rows,
-            out_base=figures_dir / "safety_trace_overall_ap_by_model",
-            formats=formats,
+    for dataset in datasets_for_paper:
+        dataset_rows = [row for row in trace_ap_rows if str(row.get("dataset") or "") == dataset]
+        if not dataset_rows:
+            continue
+        dataset_slug = _dataset_output_slug(dataset)
+        out_paths.extend(
+            _judge_vs_at_ap_scatter_plot(
+                rows=dataset_rows,
+                dataset_labels={dataset: TRACE_SCORE_DATASET_LABELS.get(dataset, dataset)},
+                out_base=figures_dir / f"safety_{dataset_slug}_judge_vs_meerkat_trace_ap",
+                formats=formats,
+            )
         )
-    )
+        out_paths.extend(
+            _overall_ap_by_model_plot(
+                rows=dataset_rows,
+                dataset=dataset,
+                out_base=figures_dir / f"safety_{dataset_slug}_overall_ap_by_model",
+                formats=formats,
+            )
+        )
 
     by_dataset_case = _group_plot_rows_by_dataset(case_rows)
     for dataset, rows in sorted(by_dataset_case.items(), key=lambda kv: kv[0]):
-        if dataset != "trace-dataset":
+        if dataset not in TRACE_SCORE_DATASET_LABELS:
             continue
         rows = [row for row in rows if _include_in_paper_outputs(row)]
         method_info = _method_info_by_label(rows)
@@ -3619,7 +3908,7 @@ def _generate_figures(
                 else:
                     y_trace_ap_ci[m].append((max(0.0, trace_ap - trace_ap_low), max(0.0, trace_ap_high - trace_ap)))
 
-        dataset_slug = _slug(dataset)
+        dataset_slug = _dataset_output_slug(dataset)
         out_paths.extend(
             _ap_by_case_size_plot(
                 dataset=dataset,
@@ -3634,6 +3923,14 @@ def _generate_figures(
                 formats=formats,
             )
         )
+
+    out_paths.extend(
+        _macro_f1_by_dataset_plot(
+            rows=overall_rows,
+            out_base=figures_dir / "safety_macro_f1_by_dataset",
+            formats=formats,
+        )
+    )
 
     return out_paths
 
