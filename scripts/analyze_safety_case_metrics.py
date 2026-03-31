@@ -4349,15 +4349,6 @@ def _generate_figures(
                 formats=formats,
             )
         )
-        out_paths.extend(
-            _pr_curve_grid_by_case_size_plot(
-                dataset=dataset,
-                rows=rows,
-                out_base=figures_dir / f"safety_{dataset_slug}_pr_curves_by_case_size",
-                formats=formats,
-                n_bootstrap=50,
-            )
-        )
 
     out_paths.extend(
         _macro_f1_by_dataset_plot(
