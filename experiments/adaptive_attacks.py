@@ -211,6 +211,29 @@ def inject_varied_refusal(content: str, trace_rel: str, meta: dict) -> str:
     return result
 
 
+@register("gradient_optimized")
+def inject_gradient_optimized(content: str, trace_rel: str, meta: dict) -> str:
+    """Use per-case gradient-optimized adversarial prefixes from GCG attack.
+
+    Reads prefix files produced by gradient_prefix_attack.py on GPU.
+    Falls back to the black-box optimized prefixes if gradient prefixes
+    are not available.
+    """
+    case_id = meta.get("case_id", "")
+    # Check multiple possible locations for gradient prefixes
+    for prefix_dir in [
+        Path(__file__).parent.parent / "results" / "gradient_prefixes",
+        Path(__file__).parent.parent / "results",
+    ]:
+        prefix_path = prefix_dir / f"gradient_prefixes_{case_id}.json"
+        if prefix_path.exists():
+            prefixes = json.loads(prefix_path.read_text())
+            if trace_rel in prefixes and prefixes[trace_rel]:
+                return prefixes[trace_rel] + "\n\n" + content
+    # Fallback to v2 black-box prefixes
+    return inject_optimized_embedding_v2(content, trace_rel, meta)
+
+
 @register("persona_reframe")
 def inject_persona_reframe(content: str, trace_rel: str, meta: dict) -> str:
     """Reframe each campaign trace as a DIFFERENT type of interaction.
