@@ -42,16 +42,26 @@ We tested 12 injection strategies spanning four categories:
 
 All experiments use Qwen3.5-397B-A17B-FP8 as both the Stage 1 scorer and the compositional agent.  Results report mean campaign score (average score assigned to ground-truth campaign traces after max-merge) with paired bootstrap 95% CIs.
 
-### Main result: `auditor_note` on cyber bg=100x (n=50)
+### Main results on cyber bg=100x
 
-| Method | Mean campaign score | 95% CI |
-|---|---|---|
-| Agent baseline | 0.533 | — |
-| Agent + `auditor_note` | 0.433 | **Δ = −0.100 [−0.180, −0.021]** |
+Two attacks achieve statistically significant reductions in campaign scores at bg=100x:
 
-This is the only statistically significant result across all experiments.  The `auditor_note` injection reduces mean campaign scores by 19% (p < 0.05) at bg=100x.  Detection rate remains 50/50 (the agent still identifies *some* campaign in every case), but the per-trace scores assigned to actual campaign traces are significantly lower.
+| Method | n | Mean campaign score | Δ | 95% CI | AP |
+|---|---|---|---|---|---|
+| Agent baseline | 50 | 0.533 | — | — | 0.10 |
+| + `auditor_note` | 50 | 0.433 | **−0.100** | **[−0.180, −0.021]** | 0.13 |
+| + `response_truncate` | 20 | 0.192 | **−0.291** | **[−0.449, −0.130]** | 0.02 |
+| + `persona_reframe` | 20 | 0.601 | +0.118 | [−0.047, +0.265] | — |
 
-**Mechanism**: At bg=100x the agent must search through 600 traces and 75 clusters.  Under this cognitive load, 32% of findable campaigns (10/31 cases where the baseline found the campaign) are suppressed by the injection, while only 10% backfire.
+**`response_truncate` is the strongest attack**: it removes the assistant's response entirely, replacing it with a varied refusal (unique per trace).  This reduces mean campaign scores by 60% and AP from 0.10 to 0.02.  Of 11 campaigns the baseline agent found, 9 (82%) were suppressed and 0 backfired.
+
+**`auditor_note`** achieves a more modest 19% reduction.  Of 31 findable campaigns, 10 (32%) were suppressed and 3 (10%) backfired.
+
+**`persona_reframe`** backfires (not significant).
+
+**Why `response_truncate` works**: The agent's compositional analysis requires confirming that "responses can be recomposed into a joint response that answers a harmful task."  Without actual harmful responses — only refusals — the agent cannot confirm compositional harm.  At bg=100x with 600 traces to analyze, the agent doesn't have enough analysis budget to infer campaign membership from question structure alone.
+
+**Why `response_truncate` fails at bg=20x** (Δ=+0.041, n=5): With only 120 traces and 15 clusters, the agent can deeply analyze every suspicious cluster and detects campaigns from question structure alone.  It explicitly reasons: *"The traces systematically cover different aspects of exploiting Siemens S7-1200 PLCs."*
 
 ### Null results at bg=20x
 
