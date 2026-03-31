@@ -84,13 +84,9 @@ The agent substantially outperforms both the monitor and EaE. With tool access i
 
 ### Figures
 
-![ROC and PR Curves by Case Size](../results/shade_arena_paper_curves.png)
+![PR Curves by Case Size](../figures/shade_arena_paper_pr_curves.png)
 
-![Per-Task AUROC](../results/shade_arena_paper_per_task.png)
-
-![Score Distributions](../results/shade_arena_paper_distributions.png)
-
-![AUROC Decomposition](../results/shade_arena_paper_decomposition.png)
+![AUROC Decomposition](../figures/shade_arena_paper_decomposition.png)
 
 ### Where does the Agent's improvement come from?
 
