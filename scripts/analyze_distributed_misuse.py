@@ -738,7 +738,7 @@ def _stddev(values: list[float]) -> float | None:
 def _bootstrap_mean_se(
     values: list[float],
     *,
-    n_bootstrap: int = 200,
+    n_bootstrap: int = 100,
     seed: int = 0,
 ) -> float | None:
     if not values:
@@ -757,7 +757,7 @@ def _bootstrap_mean_se(
 def _bootstrap_pr_band(
     per_case_scores: list[tuple[dict[str, float], set[str]]],
     *,
-    n_bootstrap: int = 200,
+    n_bootstrap: int = 100,
     seed: int = 0,
 ) -> tuple[list[float], list[float], list[float], float | None]:
     valid_cases = [(scores, gt) for scores, gt in per_case_scores if scores and gt]
@@ -895,7 +895,7 @@ def _paper_curve_runs(
             ap_values = [_average_precision_from_pr_curve(curve) for curve in per_case_curves]
             ap_values = [float(ap) for ap in ap_values if ap is not None]
             ap = (sum(ap_values) / len(ap_values)) if ap_values else None
-            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=200, seed=bg + len(runs) * 31)
+            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=100, seed=bg + len(runs) * 31)
             rng = random.Random(bg + len(runs) * 17)
             lower: list[float] = []
             upper: list[float] = []
@@ -904,7 +904,7 @@ def _paper_curve_runs(
                 upper = precision_curve[:]
             else:
                 boot_means: list[list[float]] = []
-                for _ in range(200):
+                for _ in range(100):
                     sampled = [curve_samples[rng.randrange(len(curve_samples))] for _ in range(len(curve_samples))]
                     boot_means.append([sum(sample[i] for sample in sampled) / len(sampled) for i in range(len(recall_grid))])
                 for idx in range(len(recall_grid)):
@@ -920,10 +920,10 @@ def _paper_curve_runs(
             _, curve, _, _ = _average_curves(per_case_scores)
             recall_grid, lower, upper, ap = _bootstrap_pr_band(
                 per_case_scores,
-                n_bootstrap=200,
+                n_bootstrap=100,
                 seed=bg + len(runs) * 17,
             )
-            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=200, seed=bg + len(runs) * 31)
+            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=100, seed=bg + len(runs) * 31)
             precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
         runs.append(
             PaperCurveRun(
@@ -1467,6 +1467,134 @@ def _plot_bio_paper_pr_figure(
         return output_paths
 
 
+def _plot_combined_paper_pr_figure(
+    *,
+    results_dir: Path,
+    figures_dir: Path,
+    figure_formats: list[str],
+    input_paths: list[Path],
+) -> list[Path]:
+    cyber_runs = _paper_curve_runs(results_dir, input_paths, domain="cyber")
+    bio_runs = _paper_curve_runs(results_dir, input_paths, domain="bio")
+    runs = cyber_runs + bio_runs
+    if not runs:
+        return []
+    with mpl.rc_context(
+        {
+            "font.family": "serif",
+            "font.serif": ["Computer Modern Roman", "CMU Serif", "STIX Two Text", "DejaVu Serif"],
+            "mathtext.fontset": "cm",
+            "axes.unicode_minus": False,
+        }
+    ):
+        fig = plt.figure(figsize=(5.5, 2.85))
+        grid = fig.add_gridspec(2, 4, hspace=0.34, wspace=0.22)
+        axes = {
+            ("gpt-5.4-mini", "cyber", 20): fig.add_subplot(grid[0, 0]),
+            ("gpt-5.4-mini", "cyber", 100): fig.add_subplot(grid[0, 1]),
+            ("gpt-5.4-mini", "bio", 20): fig.add_subplot(grid[0, 2]),
+            ("gpt-5.4-mini", "bio", 100): fig.add_subplot(grid[0, 3]),
+            ("Qwen-3.5", "cyber", 20): fig.add_subplot(grid[1, 0]),
+            ("Qwen-3.5", "cyber", 100): fig.add_subplot(grid[1, 1]),
+            ("Qwen-3.5", "bio", 20): fig.add_subplot(grid[1, 2]),
+            ("Qwen-3.5", "bio", 100): fig.add_subplot(grid[1, 3]),
+        }
+        method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
+        method_colors = {
+            "Meerkat": "#D55E00",
+            "Monitor": "#CC79A7",
+            "Bayesian": "#0072B2",
+            "Buffer": "#009E73",
+        }
+        method_linestyles = {
+            "Meerkat": "-",
+            "Monitor": "-.",
+            "Bayesian": ":",
+            "Buffer": "--",
+        }
+        shared_legend_handles = [
+            Line2D([0], [0], color=method_colors[method], linestyle=method_linestyles[method], linewidth=1.8)
+            for method in method_order
+        ]
+        runs_by_panel: dict[tuple[str, str, int], list[PaperCurveRun]] = {}
+        for run in cyber_runs:
+            runs_by_panel.setdefault((run.model_label, "cyber", run.background_multiplier), []).append(run)
+        for run in bio_runs:
+            runs_by_panel.setdefault((run.model_label, "bio", run.background_multiplier), []).append(run)
+
+        for panel_key, ax in axes.items():
+            panel_runs = sorted(
+                runs_by_panel.get(panel_key, []),
+                key=lambda run: method_order.index(run.method_label) if run.method_label in method_order else 99,
+            )
+            if not panel_runs:
+                ax.axis("off")
+                continue
+            for run in panel_runs:
+                color = method_colors.get(run.method_label, "#555555")
+                linestyle = method_linestyles.get(run.method_label, "-")
+                ax.fill_between(
+                    run.recall_grid,
+                    run.precision_lower,
+                    run.precision_upper,
+                    color=color,
+                    alpha=0.12,
+                    linewidth=0.0,
+                    zorder=1,
+                )
+                ax.plot(
+                    run.recall_grid,
+                    run.precision_curve,
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=1.8,
+                    zorder=2,
+                )
+            _, domain, bg = panel_key
+            domain_prefix = "C" if domain == "cyber" else "B"
+            ax.set_title(f"{domain_prefix}{bg}x", fontsize=7.5, pad=3)
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.02)
+            ax.grid(alpha=0.22)
+            ax.set_xticks([0.0, 0.5, 1.0])
+            ax.tick_params(labelsize=6.2)
+            if panel_key[0] == "Qwen-3.5":
+                ax.set_xlabel("Recall", fontsize=7.5)
+            if panel_key not in (("gpt-5.4-mini", "cyber", 20), ("Qwen-3.5", "cyber", 20)):
+                ax.tick_params(labelleft=False)
+
+        legend_ax = axes.get(("gpt-5.4-mini", "bio", 100))
+        if legend_ax and legend_ax.axison:
+            legend_ax.legend(
+                shared_legend_handles,
+                method_order,
+                loc="upper right",
+                frameon=False,
+                fontsize=5.8,
+                handlelength=1.7,
+                borderaxespad=0.15,
+                labelspacing=0.18,
+            )
+
+        left_top = axes.get(("gpt-5.4-mini", "cyber", 20))
+        if left_top and left_top.axison:
+            left_top.set_ylabel("gpt-5.4-mini\nPrecision", fontsize=7.5)
+        left_bottom = axes.get(("Qwen-3.5", "cyber", 20))
+        if left_bottom and left_bottom.axison:
+            left_bottom.set_ylabel("Qwen-3.5\nPrecision", fontsize=7.5)
+
+        fig.subplots_adjust(top=0.92, left=0.12, right=0.985, bottom=0.16)
+
+        output_paths: list[Path] = []
+        out_base = figures_dir / "dm_combined_paper_pr_curves"
+        for fmt in figure_formats:
+            out_path = out_base.with_suffix(f".{fmt}")
+            fig.savefig(out_path)
+            output_paths.append(out_path)
+        plt.close(fig)
+        return output_paths
+
+
 def _print_summary_table(metrics: list[SettingMetrics]) -> None:
     print("| setting | source | model | judge_ap | AT_ap | judge_cases | AT_cases |")
     print("|---|---|---|---:|---:|---:|---:|")
@@ -1483,29 +1611,15 @@ def _print_summary_table(metrics: list[SettingMetrics]) -> None:
 def _write_paper_ap_tables(results_dir: Path, input_paths: list[Path], output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_paths: list[Path] = []
-    md_lines = ["# Distributed-Misuse Trace AP Table", ""]
-    tex_lines = ["% Auto-generated by scripts/analyze_distributed_misuse.py"]
-    method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
+    md_lines = ["# Distributed-Misuse Trace AP Table", "", "| Domain | Model | BG | Meerkat | Monitor | Bayesian | Buffer |", "|---|---|---:|---:|---:|---:|---:|"]
+    tex_lines = ["% Auto-generated by scripts/analyze_distributed_misuse.py", r"\begin{tabular}{lllrrrr}", r"\toprule", "Domain & Model & BG & Meerkat & Monitor & Bayesian & Buffer \\\\", r"\midrule"]
     for domain in ("cyber", "bio"):
         runs = _paper_curve_runs(results_dir, input_paths, domain=domain)
         if not runs:
             continue
         rows: dict[tuple[str, int], dict[str, tuple[float | None, float | None]]] = {}
         for run in runs:
-            rows.setdefault((run.model_label, run.background_multiplier), {})[run.method_label] = (
-                run.average_precision,
-                run.average_precision_bootstrap_se,
-            )
-
-        md_lines.append(f"## {domain.title()}")
-        md_lines.append("| Model | BG | Meerkat | Monitor | Bayesian | Buffer |")
-        md_lines.append("|---|---:|---:|---:|---:|---:|")
-
-        tex_lines.append(f"% {domain.title()}")
-        tex_lines.append(r"\begin{tabular}{llrrrr}")
-        tex_lines.append(r"\toprule")
-        tex_lines.append("Model & BG & Meerkat & Monitor & Bayesian & Buffer \\\\")
-        tex_lines.append(r"\midrule")
+            rows.setdefault((run.model_label, run.background_multiplier), {})[run.method_label] = (run.average_precision, run.average_precision_bootstrap_se)
         for (model_label, bg), values in sorted(rows.items(), key=lambda item: (item[0][0], item[0][1])):
             numeric_values = {method: mean for method, (mean, _) in values.items() if mean is not None}
             max_ap = max(numeric_values.values()) if numeric_values else None
@@ -1517,10 +1631,7 @@ def _write_paper_ap_tables(results_dir: Path, input_paths: list[Path], output_di
                 mean, se = pair
                 if mean is None:
                     return "na"
-                if se is None:
-                    value = f"{mean:.3f}"
-                else:
-                    value = f"{mean:.3f} +/- {se:.3f}"
+                value = f"{mean:.3f} +/- {se:.3f}" if se is not None else f"{mean:.3f}"
                 return f"**{value}**" if max_ap is not None and mean == max_ap else value
 
             def _fmt_tex(method: str) -> str:
@@ -1530,23 +1641,13 @@ def _write_paper_ap_tables(results_dir: Path, input_paths: list[Path], output_di
                 mean, se = pair
                 if mean is None:
                     return "na"
-                if se is None:
-                    value = f"{mean:.3f}"
-                else:
-                    value = f"{mean:.3f} $\\\\pm$ {se:.3f}"
+                value = f"{mean:.3f} $\\pm$ {se:.3f}" if se is not None else f"{mean:.3f}"
                 return rf"\textbf{{{value}}}" if max_ap is not None and mean == max_ap else value
 
-            md_lines.append(
-                f"| {model_label} | {bg}x | {_fmt_md('Meerkat')} | {_fmt_md('Monitor')} | {_fmt_md('Bayesian')} | {_fmt_md('Buffer')} |"
-            )
-            tex_lines.append(
-                f"{model_label} & {bg}x & {_fmt_tex('Meerkat')} & {_fmt_tex('Monitor')} & {_fmt_tex('Bayesian')} & {_fmt_tex('Buffer')} \\\\"
-            )
-        md_lines.append("")
-        tex_lines.append(r"\bottomrule")
-        tex_lines.append(r"\end{tabular}")
-        tex_lines.append("")
-
+            domain_label = "Cyber" if domain == "cyber" else "Bio"
+            md_lines.append(f"| {domain_label} | {model_label} | {bg}x | {_fmt_md('Meerkat')} | {_fmt_md('Monitor')} | {_fmt_md('Bayesian')} | {_fmt_md('Buffer')} |")
+            tex_lines.append(f"{domain_label} & {model_label} & {bg}x & {_fmt_tex('Meerkat')} & {_fmt_tex('Monitor')} & {_fmt_tex('Bayesian')} & {_fmt_tex('Buffer')} \\\\")
+    tex_lines.extend([r"\bottomrule", r"\end{tabular}"])
     md_path = output_dir / "dm_paper_trace_ap_table.md"
     tex_path = output_dir / "dm_paper_trace_ap_table.tex"
     md_path.write_text("\n".join(md_lines).rstrip() + "\n")
@@ -1625,6 +1726,14 @@ def main() -> None:
     )
     figure_paths.extend(
         _plot_bio_paper_pr_figure(
+            results_dir=Path(args.results_dir),
+            figures_dir=figures_dir,
+            figure_formats=figure_formats,
+            input_paths=explicit_input_paths or [],
+        )
+    )
+    figure_paths.extend(
+        _plot_combined_paper_pr_figure(
             results_dir=Path(args.results_dir),
             figures_dir=figures_dir,
             figure_formats=figure_formats,

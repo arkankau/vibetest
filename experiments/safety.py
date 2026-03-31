@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import random
 import re
 import shutil
@@ -636,6 +637,26 @@ def _parse_int_csv(text: str | None) -> list[int]:
             raise SystemExit("--traces-per-case-list values must be >= 1")
         out.append(value)
     return out
+
+
+def _resolve_max_positive_count_for_case_size(
+    *,
+    traces_per_case: int,
+    max_positive_per_case: int | None,
+    max_positive_percent_per_case: float | None,
+) -> int:
+    if traces_per_case <= 0:
+        raise ValueError("traces_per_case must be positive")
+    if max_positive_per_case is not None and max_positive_percent_per_case is not None:
+        raise ValueError("max count and max percent caps are mutually exclusive")
+    if max_positive_percent_per_case is not None:
+        if max_positive_percent_per_case <= 0:
+            return 0
+        derived = int(math.floor((max_positive_percent_per_case / 100.0) * traces_per_case))
+        return max(1, min(derived, traces_per_case))
+    if max_positive_per_case is None:
+        return 0
+    return int(max_positive_per_case)
 
 
 def _exp_trace_counts(min_value: int, max_value: int, base: int) -> list[int]:
@@ -4230,6 +4251,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-positive-traces-percent-per-case",
+        type=float,
+        default=None,
+        help=(
+            "Maximum number of positive-class traces per positive case as a percent of traces-per-case. "
+            "Uses floor(percent * traces-per-case / 100) with a minimum of 1 when percent > 0."
+        ),
+    )
+    parser.add_argument(
         "--impossiblebench-seed",
         type=int,
         default=None,
@@ -4610,6 +4640,19 @@ def main() -> None:
             legacy_flag="--impossiblebench-max-hacked-per-case",
         )
     )
+    max_positive_traces_percent_per_case = (
+        None
+        if args.max_positive_traces_percent_per_case is None
+        else float(args.max_positive_traces_percent_per_case)
+    )
+    if max_positive_traces_percent_per_case is not None and (
+        args.max_positive_traces_per_case is not None
+        or args.impossiblebench_max_hacked_per_case is not None
+    ):
+        raise SystemExit(
+            "Use only one of --max-positive-traces-per-case and "
+            "--max-positive-traces-percent-per-case."
+        )
     case_seed = int(
         _resolve_scalar(
             new_value=args.seed,
@@ -4684,10 +4727,28 @@ def main() -> None:
         materialize_dataset_name = (
             base_dataset_name if not sweep_mode else f"{base_dataset_name}_tpc{traces_per_case}"
         )
+        resolved_max_positive_traces_per_case = _resolve_max_positive_count_for_case_size(
+            traces_per_case=traces_per_case,
+            max_positive_per_case=(
+                None if args.max_positive_traces_per_case is None else max_positive_traces_per_case
+            ),
+            max_positive_percent_per_case=max_positive_traces_percent_per_case,
+        )
         print("-" * 80)
         print(f"Dataset name: {base_dataset_name}")
         print(f"Materialization dataset: {materialize_dataset_name}")
         print(f"Traces per case: {traces_per_case}")
+        if max_positive_traces_percent_per_case is not None:
+            print(
+                "Resolved max positive traces per positive case: "
+                f"{resolved_max_positive_traces_per_case} "
+                f"({max_positive_traces_percent_per_case:g}% of traces-per-case)"
+            )
+        else:
+            print(
+                "Resolved max positive traces per positive case: "
+                f"{resolved_max_positive_traces_per_case}"
+            )
 
         if args.safety_mode == "impossiblebench":
             cases = _materialize_impossiblebench_cases(
@@ -4698,7 +4759,7 @@ def main() -> None:
                 num_cases=cases_count,
                 traces_per_case=traces_per_case,
                 positive_rate=positive_rate,
-                max_hacked_per_case=max_positive_traces_per_case,
+                max_hacked_per_case=resolved_max_positive_traces_per_case,
                 seed=case_seed,
                 reuse_if_exists=not rematerialize_cases,
                 hard_positives_from_judge=bool(args.impossiblebench_hard_positives_from_judge),
@@ -4717,7 +4778,7 @@ def main() -> None:
                 num_cases=cases_count,
                 traces_per_case=traces_per_case,
                 positive_rate=positive_rate,
-                max_aware_per_case=max_positive_traces_per_case,
+                max_aware_per_case=resolved_max_positive_traces_per_case,
                 seed=case_seed,
                 reuse_if_exists=not rematerialize_cases,
                 hard_split_from_judge=bool(args.mle_sabotage_hard_split_from_judge),
@@ -4735,7 +4796,7 @@ def main() -> None:
                 num_cases=cases_count,
                 traces_per_case=traces_per_case,
                 positive_rate=positive_rate,
-                max_positive_per_case=max_positive_traces_per_case,
+                max_positive_per_case=resolved_max_positive_traces_per_case,
                 seed=case_seed,
                 reuse_if_exists=not rematerialize_cases,
             )
