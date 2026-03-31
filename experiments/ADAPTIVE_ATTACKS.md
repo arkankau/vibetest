@@ -40,22 +40,22 @@ We tested 12 injection strategies spanning four categories:
 
 ## Results
 
-All experiments use Qwen3.5-397B-A17B-FP8 as both the Stage 1 scorer and the compositional agent.  Results report mean campaign score (average score assigned to ground-truth campaign traces after max-merge) with paired bootstrap 95% CIs.
+All experiments use Qwen3.5-397B-A17B-FP8 as both the Stage 1 scorer and the compositional agent.  Results report mean campaign score (average score assigned to ground-truth campaign traces after max-merge) with paired bootstrap 95% CIs.  AP is micro-averaged (pooled across all traces in all cases).
 
 ### Main results on cyber bg=100x
 
 Two attacks achieve statistically significant reductions in campaign scores at bg=100x:
 
-| Method | n | Mean campaign score | Δ | 95% CI | AP |
+| Method | n | Mean campaign score | Δ | 95% CI | AP (micro) |
 |---|---|---|---|---|---|
-| Agent baseline | 50 | 0.533 | — | — | 0.10 |
-| + `auditor_note` | 50 | 0.433 | **−0.100** | **[−0.180, −0.021]** | 0.13 |
-| + `response_truncate` | 20 | 0.192 | **−0.291** | **[−0.449, −0.130]** | 0.02 |
+| Agent baseline | 50 | 0.533 | — | — | 0.025 |
+| + `auditor_note` | 50 | 0.433 | **−0.100** | **[−0.180, −0.021]** | 0.036 |
+| + `response_truncate` | 20 | 0.192 | **−0.291** | **[−0.449, −0.130]** | 0.014 |
 | + `persona_reframe` | 20 | 0.601 | +0.118 | [−0.047, +0.265] | — |
 
-**`response_truncate` is the strongest attack**: it removes the assistant's response entirely, replacing it with a varied refusal (unique per trace).  This reduces mean campaign scores by 60% and AP from 0.10 to 0.02.  Of 11 campaigns the baseline agent found, 9 (82%) were suppressed and 0 backfired.
+**`response_truncate` is the strongest attack**: it removes the assistant's response entirely, replacing it with a varied refusal (unique per trace).  This reduces mean campaign scores by 60% and micro AP from 0.025 to 0.014.  Of 11 campaigns the baseline agent found, 10 (91%) were suppressed and 0 backfired.
 
-**`auditor_note`** achieves a more modest 19% reduction.  Of 31 findable campaigns, 10 (32%) were suppressed and 3 (10%) backfired.
+**`auditor_note`** achieves a more modest 19% reduction.  Of 31 findable campaigns, 11 (35%) were suppressed and 2 (6%) backfired.
 
 **`persona_reframe`** backfires (not significant).
 

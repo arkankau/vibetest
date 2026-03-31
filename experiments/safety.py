@@ -383,6 +383,9 @@ def _normalize_trace_path(path: str) -> str:
     return normalized
 
 
+_VALID_TRACE_PATH_RE = re.compile(r"^traces/trace_\d{2,4}\.txt$")
+
+
 def _extract_trace_scores_from_text(text: str) -> dict[str, float]:
     match = _TRACE_SCORES_RE.search(text or "")
     if not match:
@@ -398,6 +401,8 @@ def _extract_trace_scores_from_text(text: str) -> dict[str, float]:
         if len(parts) < 2:
             continue
         trace_path = _normalize_trace_path(parts[0].strip())
+        if not _VALID_TRACE_PATH_RE.match(trace_path):
+            continue  # skip corrupted/truncated paths
         try:
             score = float(parts[-1].strip())
         except ValueError:
@@ -3577,6 +3582,7 @@ def _extract_trace_scores_from_text(text: str) -> dict[str, float]:
         return {}
     block = m.group(1)
     scores: dict[str, float] = {}
+    _valid_re = re.compile(r"^traces/trace_\d{2,4}\.txt$")
     for line in block.strip().split("\n"):
         line = line.strip()
         if not line:
@@ -3597,6 +3603,8 @@ def _extract_trace_scores_from_text(text: str) -> dict[str, float]:
             if path_raw.startswith(prefix):
                 path_raw = path_raw[len(prefix):]
                 break
+        if not _valid_re.match(path_raw):
+            continue  # skip corrupted/truncated paths
         scores[path_raw] = max(0.0, min(1.0, score))
     return scores
 

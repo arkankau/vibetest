@@ -10,51 +10,26 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
 import numpy as np
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+_VALID_TRACE_PATH_RE = re.compile(r"^traces/trace_\d{2,4}\.txt$")
 
 
 def _auroc(labels: list[int], scores: list[float]) -> float:
-    """Compute AUROC from binary labels and continuous scores."""
     if not labels or len(set(labels)) < 2:
         return float("nan")
-    pairs = sorted(zip(scores, labels), reverse=True)
-    tp = fp = 0
-    tp_prev = fp_prev = 0
-    auc = 0.0
-    n_pos = sum(labels)
-    n_neg = len(labels) - n_pos
-    if n_pos == 0 or n_neg == 0:
-        return float("nan")
-    prev_score = None
-    for score, label in pairs:
-        if score != prev_score and prev_score is not None:
-            auc += (fp - fp_prev) * (tp + tp_prev) / 2
-            tp_prev = tp
-            fp_prev = fp
-        if label == 1:
-            tp += 1
-        else:
-            fp += 1
-        prev_score = score
-    auc += (fp - fp_prev) * (tp + tp_prev) / 2
-    return auc / (n_pos * n_neg)
+    return float(roc_auc_score(labels, scores))
 
 
 def _average_precision(labels: list[int], scores: list[float]) -> float:
-    """Compute average precision from binary labels and continuous scores."""
     if not labels or sum(labels) == 0:
         return float("nan")
-    pairs = sorted(zip(scores, labels), reverse=True)
-    tp = 0
-    ap = 0.0
-    for rank, (score, label) in enumerate(pairs, 1):
-        if label == 1:
-            tp += 1
-            ap += tp / rank
-    return ap / sum(labels)
+    return float(average_precision_score(labels, scores))
 
 
 def analyze_result_file(path: Path) -> dict:
@@ -83,6 +58,8 @@ def analyze_result_file(path: Path) -> dict:
         benign_scores_list = []
 
         for trace_file, score in trace_scores.items():
+            if not _VALID_TRACE_PATH_RE.match(trace_file):
+                continue  # skip corrupted/truncated paths
             is_campaign = trace_file in campaign_set
             case_labels.append(1 if is_campaign else 0)
             case_scores.append(float(score))
@@ -149,18 +126,24 @@ def main():
     results_dir = Path("/Users/davisbrown/vibetest/results")
 
     experiments = [
-        ("Baseline (2pass)", "dm_cyber_d6_bg100_qwen35_2pass_n10.jsonl"),
-        ("score_format", "safety_dm_cyber_d6_bg100_qwen35_2pass_score_format_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
-        ("embedding_poison v1", "safety_dm_cyber_d6_bg100_qwen35_2pass_embedding_poison_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
-        ("embedding_poison v2", "safety_dm_cyber_d6_bg100_qwen35_2pass_embedding_poison_v2_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
-        ("optimized_embedding", "safety_dm_cyber_d6_bg100_qwen35_2pass_optimized_embedding_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        # Main bayesian_boost results (large-scale)
+        ("Baseline (bb, n=50)", "safety_dm_cyber_d6_bg100_qwen35_bayesian_boost_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        ("auditor_note (bb, n=50)", "safety_dm_cyber_d6_bg100_qwen35_bb_auditor_note_n50_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        ("response_truncate (bb, n=20)", "safety_dm_cyber_d6_bg100_qwen35_bb_response_truncate_n20_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        ("persona_reframe (bb, n=20)", "safety_dm_cyber_d6_bg100_qwen35_bb_persona_reframe_n20_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        # 2pass results (smaller-scale)
+        ("Baseline (2pass, n=10)", "dm_cyber_d6_bg100_qwen35_2pass_n10.jsonl"),
+        ("score_format (2pass)", "safety_dm_cyber_d6_bg100_qwen35_2pass_score_format_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        ("embedding_poison v1 (2pass)", "safety_dm_cyber_d6_bg100_qwen35_2pass_embedding_poison_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        ("embedding_poison v2 (2pass)", "safety_dm_cyber_d6_bg100_qwen35_2pass_embedding_poison_v2_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
+        ("optimized_embedding (2pass)", "safety_dm_cyber_d6_bg100_qwen35_2pass_optimized_embedding_AT-Qwen3.5-397B-A17B-FP8.jsonl"),
     ]
 
-    # Auto-discover additional results
+    # Auto-discover additional 2pass results
     for name, pattern in [
-        ("optimized_embedding v2", "safety_dm_cyber_d6_bg100_qwen35_2pass_optimized_embedding_v2_AT-*.jsonl"),
-        ("auditor_note", "safety_dm_cyber_d6_bg100_qwen35_2pass_auditor_note_AT-*.jsonl"),
-        ("joint_optimized", "safety_dm_cyber_d6_bg100_qwen35_2pass_joint_optimized_AT-*.jsonl"),
+        ("optimized_embedding v2 (2pass)", "safety_dm_cyber_d6_bg100_qwen35_2pass_optimized_embedding_v2_AT-*.jsonl"),
+        ("auditor_note (2pass)", "safety_dm_cyber_d6_bg100_qwen35_2pass_auditor_note_AT-*.jsonl"),
+        ("joint_optimized (2pass)", "safety_dm_cyber_d6_bg100_qwen35_2pass_joint_optimized_AT-*.jsonl"),
     ]:
         matches = sorted(results_dir.glob(pattern))
         if matches:
@@ -176,18 +159,19 @@ def main():
         all_results.append(result)
 
     # Summary table
-    print("=" * 100)
-    print(f"{'Strategy':<25s} {'Cases':>5s} {'Det':>4s} {'Rate':>6s} "
-          f"{'AUROC':>7s} {'AP':>7s} {'Camp μ':>7s} {'Ben μ':>7s} {'Gap':>7s}")
-    print("=" * 100)
+    print("=" * 115)
+    print(f"{'Strategy':<35s} {'Cases':>5s} {'Det':>4s} {'Rate':>6s} "
+          f"{'μ-AUROC':>8s} {'μ-AP':>7s} {'M-AP':>6s} {'Camp μ':>7s} {'Ben μ':>7s} {'Gap':>7s}")
+    print("=" * 115)
     for r in all_results:
         gap = r["campaign_mean_score"] - r["benign_mean_score"]
-        print(f"{r['strategy']:<25s} {r['n_gt_positive']:>5d} {r['n_detected']:>4d} "
+        print(f"{r['strategy']:<35s} {r['n_gt_positive']:>5d} {r['n_detected']:>4d} "
               f"{r['detection_rate']:>5.0%} "
-              f"{r['macro_auroc']:>7.3f} {r['macro_ap']:>7.3f} "
+              f"{r['global_auroc']:>8.3f} {r['global_ap']:>7.3f} "
+              f"{r['macro_ap']:>6.3f} "
               f"{r['campaign_mean_score']:>7.3f} {r['benign_mean_score']:>7.3f} "
               f"{gap:>+6.3f}")
-    print("=" * 100)
+    print("=" * 115)
 
     # Per-case detail for each strategy
     for r in all_results:
