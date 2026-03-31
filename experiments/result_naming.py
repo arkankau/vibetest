@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 
 
-METHODS_WITH_MODEL = {"AT", "AT-codex", "codex", "llmjudge"}
+METHODS_WITH_MODEL = {"AT", "AT-codex", "codex", "llmjudge", "buffer", "bayesian"}
 
 
 def normalize_model_name(model_name: str | None) -> str:

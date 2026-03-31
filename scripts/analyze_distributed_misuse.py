@@ -143,6 +143,13 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.open(encoding="utf-8") if line.strip()]
 
 
+def _first_existing(paths: list[Path], want) -> Path | None:
+    for path in paths:
+        if path.is_file() and want(path):
+            return path
+    return None
+
+
 def _average_precision_for_case(scores: dict[str, float], gt: set[str]) -> float | None:
     if not scores or not gt:
         return None
@@ -883,9 +890,18 @@ def _paper_curve_runs(
             path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_n{20 if bg == 20 else 50}.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "Qwen-3.5", "Meerkat", bg))
-            path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl"
-            if path.is_file() and _want(path):
-                candidates.append((path, "Qwen-3.5", "Bayesian", bg))
+        for bg, model_label, suffixes in (
+            (20, "gpt-5.4-mini", ["gpt-5.4-mini"]),
+            (100, "gpt-5.4-mini", ["gpt-5.4-mini"]),
+            (20, "Qwen-3.5", ["qwen35"]),
+            (100, "Qwen-3.5", ["qwen35"]),
+        ):
+            bayesian_candidates = [results_dir / f"dm_cyber_d6_bg{bg}_{suffix}_bayesian.jsonl" for suffix in suffixes]
+            if model_label == "Qwen-3.5":
+                bayesian_candidates.append(results_dir / f"dm_cyber_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl")
+            path = _first_existing(bayesian_candidates, _want)
+            if path is not None:
+                candidates.append((path, model_label, "Bayesian", bg))
         for path, model_label, bg in (
             (results_dir / "safety_safety_dm_cyber_d6_bg20_qwen35_bayesian_boost_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 20),
             (results_dir / "safety_safety_dm_cyber_d6_bg20_qwen35_bayesian_boost_llmjudge-gpt-5.4-mini.jsonl", "gpt-5.4-mini", 20),
@@ -893,12 +909,15 @@ def _paper_curve_runs(
         ):
             if path.is_file() and _want(path):
                 candidates.append((path, model_label, "Monitor", bg))
-        for path, model_label in (
-            (results_dir / "dm_cyber_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
-            (results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
+        for bg, model_label, paths in (
+            (20, "gpt-5.4-mini", [results_dir / "dm_cyber_d6_bg20_gpt-5.4-mini_buffer.jsonl"]),
+            (100, "gpt-5.4-mini", [results_dir / "dm_cyber_d6_bg100_gpt-5.4-mini_buffer.jsonl", results_dir / "dm_cyber_d6_bg100_buffer.jsonl"]),
+            (20, "Qwen-3.5", [results_dir / "dm_cyber_d6_bg20_qwen35_buffer.jsonl"]),
+            (100, "Qwen-3.5", [results_dir / "dm_cyber_d6_bg100_qwen35_buffer.jsonl", results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl"]),
         ):
-            if path.is_file() and _want(path):
-                candidates.append((path, model_label, "Buffer", 100))
+            path = _first_existing(paths, _want)
+            if path is not None:
+                candidates.append((path, model_label, "Buffer", bg))
     elif domain == "bio":
         for bg in (20, 100):
             path = results_dir / f"dm_bio_d6_bg{bg}_v6.jsonl"
@@ -908,21 +927,33 @@ def _paper_curve_runs(
             path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_{suffix}.jsonl"
             if path.is_file() and _want(path):
                 candidates.append((path, "Qwen-3.5", "Meerkat", bg))
-            path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl"
-            if path.is_file() and _want(path):
-                candidates.append((path, "Qwen-3.5", "Bayesian", bg))
+        for bg, model_label, suffixes in (
+            (20, "gpt-5.4-mini", ["gpt-5.4-mini"]),
+            (100, "gpt-5.4-mini", ["gpt-5.4-mini"]),
+            (20, "Qwen-3.5", ["qwen35"]),
+            (100, "Qwen-3.5", ["qwen35"]),
+        ):
+            bayesian_candidates = [results_dir / f"dm_bio_d6_bg{bg}_{suffix}_bayesian.jsonl" for suffix in suffixes]
+            if model_label == "Qwen-3.5":
+                bayesian_candidates.append(results_dir / f"dm_bio_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl")
+            path = _first_existing(bayesian_candidates, _want)
+            if path is not None:
+                candidates.append((path, model_label, "Bayesian", bg))
         for path, model_label, bg in (
             (results_dir / "safety_safety_dm_bio_d6_bg20_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 20),
             (results_dir / "safety_safety_dm_bio_d6_bg100_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 100),
         ):
             if path.is_file() and _want(path):
                 candidates.append((path, model_label, "Monitor", bg))
-        for path, model_label in (
-            (results_dir / "dm_bio_d6_bg100_buffer.jsonl", "gpt-5.4-mini"),
-            (results_dir / "dm_bio_d6_bg100_buffer_qwen35.jsonl", "Qwen-3.5"),
+        for bg, model_label, paths in (
+            (20, "gpt-5.4-mini", [results_dir / "dm_bio_d6_bg20_gpt-5.4-mini_buffer.jsonl"]),
+            (100, "gpt-5.4-mini", [results_dir / "dm_bio_d6_bg100_gpt-5.4-mini_buffer.jsonl", results_dir / "dm_bio_d6_bg100_buffer.jsonl"]),
+            (20, "Qwen-3.5", [results_dir / "dm_bio_d6_bg20_qwen35_buffer.jsonl"]),
+            (100, "Qwen-3.5", [results_dir / "dm_bio_d6_bg100_qwen35_buffer.jsonl", results_dir / "dm_bio_d6_bg100_buffer_qwen35.jsonl"]),
         ):
-            if path.is_file() and _want(path):
-                candidates.append((path, model_label, "Buffer", 100))
+            path = _first_existing(paths, _want)
+            if path is not None:
+                candidates.append((path, model_label, "Buffer", bg))
 
     monitor_paths: dict[tuple[str, int], Path] = {}
     for candidate_path, model_label, method_label, bg in candidates:
