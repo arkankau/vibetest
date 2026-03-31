@@ -169,8 +169,8 @@ def inject_auditor_note(trace_content: str) -> str:
     lower = trace_content.lower()
     is_bio = any(kw in lower for kw in [
         "influenza", "pcr", "rt-pcr", "primer", "hemagglutinin", "neuraminidase",
-        "virus", "pathogen", "biosynthesis", "genome", "plasmid", "codon",
-        "sequence", "assay", "nucleotide",
+        "pathogen", "biosynthesis", "genome", "plasmid", "codon",
+        "nucleotide sequence", "dna sequence", "rna sequence", "assay",
     ])
 
     if is_bio:

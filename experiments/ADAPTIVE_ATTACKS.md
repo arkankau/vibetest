@@ -43,7 +43,7 @@ All experiments use Qwen3.5-397B-A17B as both the Stage 1 scorer and the composi
 | **Cyber 100x** | Stage 1 classifier | 0.541 | 0.012 | 0.088 |
 | | + Bayesian monitor | 0.703 | 0.021 | 0.448 |
 | | + Agent (baseline) | 0.712 | 0.019 | 0.483 |
-| | + Agent (**auditor_note**) | 0.601 | 0.074 | 0.279 (**-42%**) |
+| | + Agent (**auditor_note**) | 0.558 | 0.033 | 0.144 (**-70%**) |
 | **Bio 100x** | Stage 1 classifier | 0.576 | 0.014 | 0.103 |
 | | + Bayesian monitor | 0.657 | 0.055 | 0.362 |
 | | + Agent (baseline) | 0.673 | 0.050 | 0.472 |
@@ -55,10 +55,10 @@ All experiments use Qwen3.5-397B-A17B as both the Stage 1 scorer and the composi
 |---|---|---|---|
 | Cyber 20x | 0.595 | 0.008 | 99% |
 | Bio 20x | 0.544 | 0.093 | 83% |
-| Cyber 100x | 0.483 | 0.279 | 42% |
+| Cyber 100x | 0.483 | 0.144 | 70% |
 | Bio 100x | 0.472 | 0.047 | 90% |
 
-The attack generalizes across both domains and background multipliers.  It is most effective at bg=20x (83--99% reduction) and still highly effective at bg=100x for bio (90%).  Cyber bg=100x shows the smallest reduction (42%), likely because the larger corpus gives the agent more context to cross-check.
+The attack generalizes across both domains and background multipliers.  It is most effective at bg=20x (83--99% reduction) and still highly effective at bg=100x (70--90%).  Cyber bg=100x shows the smallest reduction (70%) — on 3/20 cases the agent sees through the injection, likely because the larger corpus (600 traces, 75 clusters) gives it more context to cross-check the "false positive" claim.
 
 ### Why it works
 
