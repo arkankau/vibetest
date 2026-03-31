@@ -15,7 +15,7 @@ Usage (on GPU machine):
         --trace-repo results/safety/trace_repos/safety_dm_cyber_d6_bg100_qwen35_bayesian_boost \
         --cases 50 \
         --output-dir results/gradient_prefixes \
-        --model Alibaba-NLP/gte-base-en-v1.5 \
+        --model BAAI/bge-base-en-v1.5 \
         --steps 500 --prefix-len 20 --topk 64
 """
 from __future__ import annotations
@@ -297,7 +297,7 @@ def main():
                    help="Source trace repo (e.g. safety_dm_cyber_d6_bg100_qwen35_bayesian_boost)")
     p.add_argument("--cases", type=int, default=50, help="Number of cases to process")
     p.add_argument("--output-dir", type=Path, default=Path("results/gradient_prefixes"))
-    p.add_argument("--model", type=str, default="Alibaba-NLP/gte-base-en-v1.5")
+    p.add_argument("--model", type=str, default="BAAI/bge-base-en-v1.5")
     p.add_argument("--steps", type=int, default=500, help="Optimization steps per case")
     p.add_argument("--prefix-len", type=int, default=20, help="Prefix length in tokens")
     p.add_argument("--topk", type=int, default=64, help="Top-k candidates per GCG step")

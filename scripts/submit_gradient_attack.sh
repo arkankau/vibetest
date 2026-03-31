@@ -51,7 +51,7 @@ sbatch \
             --trace-repo ${TRACE_REPO} \
             --cases ${CASES} \
             --output-dir ${REMOTE_ARTIFACT_ROOT}/gradient_prefixes \
-            --model Alibaba-NLP/gte-base-en-v1.5 \
+            --model BAAI/bge-base-en-v1.5 \
             --steps ${STEPS} \
             --prefix-len ${PREFIX_LEN} \
             --topk 64 \
