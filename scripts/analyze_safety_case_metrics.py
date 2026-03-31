@@ -168,6 +168,29 @@ def _bootstrap_mean_ci(
     return mean, means[low_idx], means[high_idx]
 
 
+def _bootstrap_mean_se(
+    values: list[float],
+    *,
+    n_resamples: int = 1000,
+    seed: int = 0,
+) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return 0.0
+    rng = random.Random(seed)
+    means: list[float] = []
+    n = len(values)
+    for _ in range(n_resamples):
+        sample = [values[rng.randrange(n)] for _ in range(n)]
+        means.append(sum(sample) / n)
+    if not means:
+        return None
+    mean_of_means = sum(means) / len(means)
+    variance = sum((value - mean_of_means) ** 2 for value in means) / max(1, len(means) - 1)
+    return math.sqrt(max(0.0, variance))
+
+
 def _average_precision_from_pairs(pairs: list[tuple[int, float]]) -> float | None:
     if not pairs:
         return None
@@ -423,6 +446,98 @@ def _precision_recall_curve_from_flat_pairs(pairs: list[tuple[int, float]]) -> l
         recall = tp / positives if positives > 0 else 0.0
         curve.append({"threshold": threshold, "precision": precision, "recall": recall})
     return curve
+
+
+def _interp_precision_at_recalls(
+    curve: list[dict[str, float]],
+    recall_grid: list[float],
+) -> list[float]:
+    if not curve:
+        return [0.0 for _ in recall_grid]
+    points = sorted(
+        (
+            max(0.0, min(1.0, float(point.get("recall", 0.0)))),
+            max(0.0, min(1.0, float(point.get("precision", 0.0)))),
+        )
+        for point in curve
+    )
+    out: list[float] = []
+    idx = 0
+    last_precision = points[0][1]
+    for target in recall_grid:
+        while idx < len(points) and points[idx][0] <= target:
+            last_precision = points[idx][1]
+            idx += 1
+        out.append(last_precision)
+    return out
+
+
+def _bootstrap_pr_curve_band(
+    case_pairs: list[list[tuple[int, float]]],
+    *,
+    n_resamples: int = 200,
+    seed: int = 0,
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    valid_case_pairs = [list(case) for case in case_pairs if _average_precision_from_pairs(list(case)) is not None]
+    recall_grid = [i / 20.0 for i in range(21)]
+    if not valid_case_pairs:
+        zeros = [0.0 for _ in recall_grid]
+        return recall_grid, zeros, zeros, zeros
+    mean_curve = _precision_recall_curve_from_cases(valid_case_pairs)
+    mean_precision = _interp_precision_at_recalls(mean_curve, recall_grid)
+    if len(valid_case_pairs) == 1:
+        return recall_grid, mean_precision, mean_precision[:], mean_precision[:]
+    rng = random.Random(seed)
+    samples: list[list[float]] = []
+    n = len(valid_case_pairs)
+    for _ in range(n_resamples):
+        sampled = [valid_case_pairs[rng.randrange(n)] for _ in range(n)]
+        sample_curve = _precision_recall_curve_from_cases(sampled)
+        samples.append(_interp_precision_at_recalls(sample_curve, recall_grid))
+    lower: list[float] = []
+    upper: list[float] = []
+    for idx in range(len(recall_grid)):
+        vals = sorted(sample[idx] for sample in samples)
+        lo_idx = max(0, min(len(vals) - 1, int(0.025 * len(vals))))
+        hi_idx = max(0, min(len(vals) - 1, int(0.975 * len(vals)) - 1))
+        lower.append(vals[lo_idx])
+        upper.append(vals[hi_idx])
+    return recall_grid, mean_precision, lower, upper
+
+
+def _bootstrap_pooled_pr_curve_band(
+    case_pairs: list[list[tuple[int, float]]],
+    *,
+    n_resamples: int = 200,
+    seed: int = 0,
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    valid_case_pairs = [list(case) for case in case_pairs if _average_precision_from_pairs(list(case)) is not None]
+    recall_grid = [i / 20.0 for i in range(21)]
+    if not valid_case_pairs:
+        zeros = [0.0 for _ in recall_grid]
+        return recall_grid, zeros, zeros, zeros
+    flat_pairs = [pair for case in valid_case_pairs for pair in case]
+    mean_curve = _precision_recall_curve_from_flat_pairs(flat_pairs)
+    mean_precision = _interp_precision_at_recalls(mean_curve, recall_grid)
+    if len(valid_case_pairs) == 1:
+        return recall_grid, mean_precision, mean_precision[:], mean_precision[:]
+    rng = random.Random(seed)
+    samples: list[list[float]] = []
+    n = len(valid_case_pairs)
+    for _ in range(n_resamples):
+        sampled_cases = [valid_case_pairs[rng.randrange(n)] for _ in range(n)]
+        sampled_pairs = [pair for case in sampled_cases for pair in case]
+        sample_curve = _precision_recall_curve_from_flat_pairs(sampled_pairs)
+        samples.append(_interp_precision_at_recalls(sample_curve, recall_grid))
+    lower: list[float] = []
+    upper: list[float] = []
+    for idx in range(len(recall_grid)):
+        vals = sorted(sample[idx] for sample in samples)
+        lo_idx = max(0, min(len(vals) - 1, int(0.025 * len(vals))))
+        hi_idx = max(0, min(len(vals) - 1, int(0.975 * len(vals)) - 1))
+        lower.append(vals[lo_idx])
+        upper.append(vals[hi_idx])
+    return recall_grid, mean_precision, lower, upper
 
 
 def _roc_at_threshold(pairs: list[tuple[int, float]], threshold: float) -> tuple[float, float] | None:
@@ -1491,9 +1606,12 @@ def _finalize_metric_row(metric: dict[str, Any]) -> dict[str, Any]:
     out["verified_macro_f1_ci_high"] = verified_macro_f1_high
     trace_score_cases = [list(case) for case in metric.get("_trace_score_cases") or []]
     trace_average_precision, trace_ap_low, trace_ap_high = _bootstrap_average_precision_ci(trace_score_cases)
+    trace_ap_values = [_average_precision_from_pairs(case) for case in trace_score_cases]
+    trace_ap_values = [float(value) for value in trace_ap_values if value is not None]
     out["trace_average_precision"] = trace_average_precision
     out["trace_average_precision_ci_low"] = trace_ap_low
     out["trace_average_precision_ci_high"] = trace_ap_high
+    out["trace_average_precision_bootstrap_se"] = _bootstrap_mean_se(trace_ap_values)
     trace_roc_auc, trace_roc_low, trace_roc_high = _bootstrap_roc_auc_ci(trace_score_cases)
     out["trace_roc_auc"] = trace_roc_auc
     out["trace_roc_auc_ci_low"] = trace_roc_low
@@ -1829,6 +1947,175 @@ def _print_paper_table(rows: list[dict[str, Any]]) -> None:
             "trace_average_precision": _fmt(row.get("trace_average_precision"), digits=4),
         }
         print(" | ".join(str(values[key]) for key, _ in cols))
+
+
+def _paper_short_model_label(model_name: str) -> str:
+    if model_name == "Qwen-3.5":
+        return "Qwen3.5"
+    if model_name == "gpt-5.4-mini":
+        return "GPT-5.4m"
+    return model_name
+
+
+def _paper_latex_result_cell(value: float | None, se: float | None, *, best: bool) -> str:
+    if value is None:
+        return r"\na"
+    se_value = 0.0 if se is None else se
+    macro = r"\bestres" if best else r"\res"
+    return f"{macro}{{{value:.3f}}}{{{se_value:.3f}}}"
+
+
+def _paper_latex_delta(meerkat: float | None, baselines: list[float | None]) -> str:
+    valid = [value for value in baselines if value is not None]
+    if meerkat is None or not valid:
+        return r"\na"
+    delta = meerkat - max(valid)
+    return f"{delta:+.3f}"
+
+
+def _write_safety_trace_ap_tables(case_rows: list[dict[str, Any]], output_dir: Path) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for row in case_rows:
+        if not str(row.get("group", "")).isdigit():
+            continue
+        file_path = str(row.get("file") or "")
+        dataset_name, method_name = _infer_dataset_and_method_from_file(file_path)
+        dataset_base, dataset_variant = _split_dataset_variant(dataset_name)
+        method_name, stripped_method_variant = _strip_method_variant(method_name)
+        method_base, method_model = _split_method_parts(method_name)
+        effective_variant = str(stripped_method_variant or dataset_variant or "").strip()
+        synthesized = dict(row)
+        synthesized["dataset"] = dataset_base
+        synthesized["dataset_variant"] = dataset_variant
+        synthesized["method_base"] = method_base
+        synthesized["method_variant"] = effective_variant
+        synthesized["method_model"] = _display_model_name(method_model or "")
+        if _include_in_paper_outputs(synthesized):
+            rows.append(synthesized)
+    if not rows:
+        return []
+
+    grouped: dict[tuple[str, int, str], dict[str, tuple[float | None, float | None]]] = {}
+    for row in rows:
+        dataset = str(row.get("dataset") or "")
+        tpc = int(str(row.get("group") or "0"))
+        model = _display_model_name(str(row.get("method_model") or "")) or ""
+        method_label = _presentation_method_label(
+            method_base=str(row.get("method_base") or ""),
+            dataset_variant=str(row.get("dataset_variant") or ""),
+            method_variant=str(row.get("method_variant") or ""),
+        )
+        grouped.setdefault((dataset, tpc, model), {})[method_label] = (
+            _to_float(row.get("trace_average_precision")),
+            _to_float(row.get("trace_average_precision_bootstrap_se")),
+        )
+
+    dataset_order = ["trace-dataset", "impossiblebench_claude-opus-4.6"]
+    model_order = ["Qwen-3.5", "gpt-5.4-mini", "GLM-5"]
+    tpc_order = [10, 25, 50, 100]
+    method_order = ["Meerkat", "Per-trace Monitor", "Naive Agent"]
+
+    md_lines = [
+        "# Safety Trace AP Table",
+        "",
+        "| Domain | TPC | Model | Meerkat | Monitor | Naive Agent | Delta |",
+        "|---|---:|---|---:|---:|---:|---:|",
+    ]
+
+    tex_lines = [
+        "% Auto-generated by scripts/analyze_safety_case_metrics.py",
+        r"\begin{table*}[t]",
+        r"  \centering",
+        r"  \small",
+        r"  % \setlength{\tabcolsep}{3.5pt}",
+        r"  % \renewcommand{\arraystretch}{0.95}",
+        r"  \caption{Trace-level average precision across safety corpora by traces per case. Higher is better. $\Delta$ is Meerkat minus the strongest baseline.}",
+        r"  \label{tab:safety-trace-ap}",
+        r"  \begin{tabular}{@{}lllrrrr@{}}",
+        r"    \toprule",
+        r"    \multirow{2}{*}{Domain} & \multirow{2}{*}{TPC} & \multirow{2}{*}{Model}",
+        r"      & \multicolumn{3}{c}{Method} & \multirow{2}{*}{$\Delta$} \\",
+        r"    \cmidrule(lr){4-6}",
+        r"      & & & Meerkat & Monitor & Naive Agent & \\",
+        r"    \midrule",
+    ]
+
+    tex_domain_chunks: list[str] = []
+    for dataset in dataset_order:
+        dataset_rows: list[str] = []
+        present_tpcs = [tpc for tpc in tpc_order if any((dataset, tpc, model) in grouped for model in model_order)]
+        if not present_tpcs:
+            continue
+        domain_label = TRACE_SCORE_DATASET_LABELS.get(dataset, dataset)
+        domain_row_count = sum(1 for tpc in present_tpcs for model in model_order if (dataset, tpc, model) in grouped)
+        domain_printed = False
+        for tpc_idx, tpc in enumerate(present_tpcs):
+            present_models = [model for model in model_order if (dataset, tpc, model) in grouped]
+            if not present_models:
+                continue
+            for model_idx, model in enumerate(present_models):
+                values = grouped[(dataset, tpc, model)]
+                model_cells = {name: values.get(name, (None, None)) for name in method_order}
+                numeric_values = {name: pair[0] for name, pair in model_cells.items() if pair[0] is not None}
+                max_value = max(numeric_values.values()) if numeric_values else None
+                monitor_value = model_cells["Per-trace Monitor"][0]
+                naive_value = model_cells["Naive Agent"][0]
+                meerkat_value = model_cells["Meerkat"][0]
+                delta_text = _paper_latex_delta(meerkat_value, [monitor_value, naive_value])
+                if not domain_printed:
+                    prefix = rf"    \multirow{{{domain_row_count}}}{{*}}{{{domain_label}}}"
+                    domain_printed = True
+                else:
+                    prefix = "    "
+                if model_idx == 0:
+                    tpc_prefix = rf" & \multirow{{{len(present_models)}}}{{*}}{{{tpc}}}"
+                else:
+                    tpc_prefix = " &"
+                model_label = _paper_short_model_label(model)
+                cells = [
+                    _paper_latex_result_cell(*model_cells["Meerkat"], best=(max_value is not None and model_cells["Meerkat"][0] == max_value)),
+                    _paper_latex_result_cell(*model_cells["Per-trace Monitor"], best=(max_value is not None and model_cells["Per-trace Monitor"][0] == max_value)),
+                    _paper_latex_result_cell(*model_cells["Naive Agent"], best=(max_value is not None and model_cells["Naive Agent"][0] == max_value)),
+                ]
+                dataset_rows.append(f"{prefix}{tpc_prefix} & {model_label} & {cells[0]} & {cells[1]} & {cells[2]} & {delta_text} \\\\")
+                md_delta = "na" if delta_text == r"\na" else delta_text
+                def _fmt_md(pair: tuple[float | None, float | None], best: bool) -> str:
+                    value, se = pair
+                    if value is None:
+                        return "na"
+                    text = f"{value:.3f} +/- {(0.0 if se is None else se):.3f}"
+                    return f"**{text}**" if best else text
+                md_lines.append(
+                    "| "
+                    + " | ".join(
+                        [
+                            domain_label,
+                            str(tpc),
+                            model_label,
+                            _fmt_md(model_cells["Meerkat"], max_value is not None and model_cells["Meerkat"][0] == max_value),
+                            _fmt_md(model_cells["Per-trace Monitor"], max_value is not None and model_cells["Per-trace Monitor"][0] == max_value),
+                            _fmt_md(model_cells["Naive Agent"], max_value is not None and model_cells["Naive Agent"][0] == max_value),
+                            md_delta,
+                        ]
+                    )
+                    + " |"
+                )
+            if tpc_idx != len(present_tpcs) - 1:
+                dataset_rows.append(r"    \cmidrule(lr){2-7}")
+        tex_domain_chunks.extend(dataset_rows)
+        tex_domain_chunks.append(r"    \midrule")
+
+    if tex_domain_chunks and tex_domain_chunks[-1] == r"    \midrule":
+        tex_domain_chunks.pop()
+    tex_lines.extend(tex_domain_chunks)
+    tex_lines.extend([r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"])
+
+    md_path = output_dir / "safety_paper_trace_ap_table.md"
+    tex_path = output_dir / "safety_paper_trace_ap_table.tex"
+    md_path.write_text("\n".join(md_lines).rstrip() + "\n")
+    tex_path.write_text("\n".join(tex_lines).rstrip() + "\n")
+    return [md_path, tex_path]
 
 
 def _slug(text: str) -> str:
@@ -3540,6 +3827,175 @@ def _macro_f1_by_dataset_plot(
     return out_paths
 
 
+def _pr_curve_grid_by_case_size_plot(
+    *,
+    dataset: str,
+    rows: list[dict[str, Any]],
+    out_base: Path,
+    formats: list[str],
+    n_bootstrap: int = 100,
+) -> list[Path]:
+    rows = [row for row in rows if _include_in_paper_outputs(row)]
+    if not rows:
+        return []
+
+    method_info = _method_info_by_label(rows)
+    numeric_groups = sorted({int(r["group"]) for r in rows if str(r.get("group", "")).isdigit()})
+    if not numeric_groups:
+        return []
+
+    model_order = [m for m in ("Qwen-3.5", "gpt-5.4-mini", "GLM-5") if any((_display_model_name(str(r.get("method_model") or "")) == m) for r in rows)]
+    if not model_order:
+        return []
+
+    row_lookup = {
+        (
+            str(r.get("method_label") or ""),
+            _display_model_name(str(r.get("method_model") or "")) or "",
+            int(str(r.get("group") or "0")),
+        ): r
+        for r in rows
+        if str(r.get("group", "")).isdigit()
+    }
+
+    method_labels = sorted({str(r.get("method_label") or "") for r in rows}, key=lambda m: _paper_method_rank(next(r for r in rows if str(r.get("method_label") or "") == m)))
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ImportError:
+        print("Skipping figure generation: matplotlib is not installed.")
+        return []
+
+    _apply_publication_style(plt)
+    fig, axes = plt.subplots(
+        len(model_order),
+        len(numeric_groups),
+        figsize=(5.5, 1.35 * max(1, len(model_order))),
+        sharex=True,
+        sharey=True,
+        constrained_layout=False,
+    )
+    if len(model_order) == 1 and len(numeric_groups) == 1:
+        axes = [[axes]]
+    elif len(model_order) == 1:
+        axes = [list(axes)]
+    elif len(numeric_groups) == 1:
+        axes = [[ax] for ax in axes]
+
+    palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
+
+    for row_idx, model_name in enumerate(model_order):
+        for col_idx, case_size in enumerate(numeric_groups):
+            ax = axes[row_idx][col_idx]
+            plotted = False
+            for method_label in method_labels:
+                row = row_lookup.get((method_label, model_name, case_size))
+                if row is None:
+                    continue
+                file_path = Path(str(row.get("file") or "")).expanduser()
+                if not file_path.is_file():
+                    continue
+                score_mode = str(row.get("score_mode") or "")
+                source_rows = [
+                    source_row
+                    for source_row in _load_rows(file_path)
+                    if _to_int(source_row.get("traces_per_case")) == case_size
+                ]
+                case_pairs = [
+                    _row_trace_score_pairs(source_row, max_merge=(score_mode == "max-merge"))
+                    for source_row in source_rows
+                ]
+                case_pairs = [pairs for pairs in case_pairs if _average_precision_from_pairs(pairs) is not None]
+                if not case_pairs:
+                    continue
+                recall_grid, mean_precision, lower, upper = _bootstrap_pooled_pr_curve_band(
+                    case_pairs,
+                    n_resamples=n_bootstrap,
+                    seed=case_size * 100 + row_idx * 10 + col_idx,
+                )
+                method_model, method_base, method_variant = method_info.get(method_label, (None, None, None))
+                color = _method_fill_color(method_model, method_base, method_variant, col_idx, palette)
+                linestyle = _method_variant_linestyle(method_base, method_variant)
+                ax.fill_between(recall_grid, lower, upper, color=color, alpha=0.12, linewidth=0.0, zorder=1)
+                ax.plot(recall_grid, mean_precision, color=color, linestyle=linestyle, linewidth=1.8, zorder=2)
+                plotted = True
+
+            if not plotted:
+                ax.axis("off")
+                continue
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_color(SPINE_COLOR)
+            ax.spines["bottom"].set_color(SPINE_COLOR)
+            ax.set_xticks([0.0, 0.5, 1.0])
+            ax.tick_params(labelsize=TICK_LABEL_FONTSIZE)
+            if row_idx == 0:
+                ax.set_title(f"tpc={case_size}", fontsize=AXIS_LABEL_FONTSIZE, pad=4)
+            if row_idx == len(model_order) - 1:
+                ax.set_xlabel("Recall", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+            if col_idx == 0:
+                ax.set_ylabel(f"{model_name}\nPrecision", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+            else:
+                ax.tick_params(labelleft=False)
+
+    legend_handles: list[Line2D] = []
+    seen_styles: set[tuple[str, str, str]] = set()
+    for method_label in method_labels:
+        method_model, method_base, method_variant = method_info.get(method_label, (None, None, None))
+        pretty_label = _presentation_method_label(
+            method_base=method_base,
+            method_variant=method_variant,
+            dataset_variant=None,
+        )
+        style_key = (pretty_label, _method_variant_linestyle(method_base, method_variant), _method_variant_marker(method_base, method_variant))
+        if style_key in seen_styles:
+            continue
+        seen_styles.add(style_key)
+        color = _method_fill_color(method_model, method_base, method_variant, 0, palette)
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=color,
+                linewidth=1.8,
+                linestyle=_method_variant_linestyle(method_base, method_variant),
+                label=pretty_label,
+            )
+        )
+
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.01),
+            ncol=max(1, min(4, len(legend_handles))),
+            frameon=False,
+            title="Method",
+            title_fontsize=LEGEND_FONTSIZE,
+            fontsize=LEGEND_FONTSIZE,
+            borderaxespad=0.0,
+            handlelength=1.6,
+            columnspacing=0.8,
+            handletextpad=0.5,
+        )
+
+    fig.subplots_adjust(left=0.10, right=0.99, bottom=0.18, top=0.78, wspace=0.18, hspace=0.28)
+
+    out_paths: list[Path] = []
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in formats:
+        out_path = out_base.with_suffix(f".{ext}")
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
+        out_paths.append(out_path)
+    plt.close(fig)
+    return out_paths
+
+
 def _judge_vs_at_ap_scatter_plot(
     *,
     rows: list[dict[str, Any]],
@@ -3619,92 +4075,62 @@ def _judge_vs_at_ap_scatter_plot(
         return []
 
     _apply_publication_style(plt)
-    fig, axes = plt.subplots(
-        1,
-        len(datasets),
-        figsize=(FIGURE_WIDTH_IN * max(1.0, 1.02 * len(datasets)), LINE_FIGURE_HEIGHT_IN * 0.98),
-        constrained_layout=False,
-    )
-    if not isinstance(axes, (list, tuple)):
-        try:
-            axes = list(axes.ravel())
-        except Exception:
-            axes = [axes]
-    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.18, top=0.87, wspace=0.24)
-    palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
-    for ax, dataset in zip(axes, datasets):
-        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, color="#999999", alpha=0.8, zorder=1)
-        for point in points_by_dataset.get(dataset, []):
-            color = _model_color(str(point["model"]), 0, palette)
-            ax.scatter(
-                [float(point["judge_ap"])],
-                [float(point["at_ap"])],
-                s=18,
-                marker="o",
-                facecolors=color,
-                edgecolors="#333333",
-                linewidths=0.45,
-                alpha=0.72,
-                zorder=3,
-            )
-        ax.set_xlabel("Per-trace Monitor AP", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
-        ax.set_ylabel("Meerkat AP", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
-        ax.set_xlim(0.0, 1.0)
-        ax.set_ylim(0.0, 1.0)
-        ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
-        ax.set_axisbelow(True)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_color(SPINE_COLOR)
-        ax.spines["bottom"].set_color(SPINE_COLOR)
-
-    model_handles: list[Line2D] = []
-    seen_models: set[str] = set()
-    for dataset in datasets:
-        for point in points_by_dataset.get(dataset, []):
-            model = str(point["model"])
-            if model in seen_models:
-                continue
-            seen_models.add(model)
-            model_handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    marker="o",
-                    linestyle="None",
-                    markerfacecolor=_model_color(model, 0, palette),
-                    markeredgecolor=_model_color(model, 0, palette),
-                    markersize=5.2,
-                    label=model,
-                )
-            )
-
-    legend_kwargs = dict(
-        frameon=False,
-        borderaxespad=0.0,
-        handlelength=1.2,
-        columnspacing=0.8,
-        handletextpad=0.4,
-    )
-    if model_handles:
-        model_legend = fig.legend(
-            handles=model_handles,
-            loc="upper center",
-            bbox_to_anchor=(0.34, 0.99),
-            ncol=max(1, min(3, len(model_handles))),
-            title="Model",
-            title_fontsize=LEGEND_FONTSIZE,
-            **legend_kwargs,
-        )
-        fig.add_artist(model_legend)
-
     out_paths: list[Path] = []
     out_base.parent.mkdir(parents=True, exist_ok=True)
-    for ext in formats:
-        out_path = out_base.with_suffix(f".{ext}")
-        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
-        out_paths.append(out_path)
-    plt.close(fig)
+    palette = plt.rcParams.get("axes.prop_cycle").by_key().get("color", [])
+    for dataset in datasets:
+        dataset_points = points_by_dataset.get(dataset, [])
+        model_order = [model for model in ALLOWED_EVAL_MODELS if any(str(point["model"]) == model for point in dataset_points)]
+        if not model_order:
+            model_order = sorted({str(point["model"]) for point in dataset_points})
+        fig, axes = plt.subplots(
+            1,
+            len(model_order),
+            figsize=(FIGURE_WIDTH_IN * max(1.0, 0.98 * len(model_order)), LINE_FIGURE_HEIGHT_IN * 0.98),
+            constrained_layout=False,
+        )
+        if not isinstance(axes, (list, tuple)):
+            try:
+                axes = list(axes.ravel())
+            except Exception:
+                axes = [axes]
+        fig.subplots_adjust(left=0.12, right=0.98, bottom=0.18, top=0.82, wspace=0.18)
+        for ax, model in zip(axes, model_order):
+            ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, color="#999999", alpha=0.8, zorder=1)
+            model_color = _model_color(model, 0, palette)
+            for point in dataset_points:
+                if str(point["model"]) != model:
+                    continue
+                ax.scatter(
+                    [float(point["judge_ap"])],
+                    [float(point["at_ap"])],
+                    s=18,
+                    marker="o",
+                    facecolors=model_color,
+                    edgecolors="#333333",
+                    linewidths=0.45,
+                    alpha=0.72,
+                    zorder=3,
+                )
+            ax.set_title(model, fontsize=AXIS_LABEL_FONTSIZE, pad=4)
+            ax.set_xlabel("Per-trace Monitor AP", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+            if ax is axes[0]:
+                ax.set_ylabel("Meerkat AP", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.5)
+            else:
+                ax.tick_params(labelleft=False)
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_color(SPINE_COLOR)
+            ax.spines["bottom"].set_color(SPINE_COLOR)
+        for ext in formats:
+            out_path = out_base.with_suffix(f".{ext}")
+            fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
+            out_paths.append(out_path)
+        plt.close(fig)
     return out_paths
 
 
@@ -3923,6 +4349,15 @@ def _generate_figures(
                 formats=formats,
             )
         )
+        out_paths.extend(
+            _pr_curve_grid_by_case_size_plot(
+                dataset=dataset,
+                rows=rows,
+                out_base=figures_dir / f"safety_{dataset_slug}_pr_curves_by_case_size",
+                formats=formats,
+                n_bootstrap=50,
+            )
+        )
 
     out_paths.extend(
         _macro_f1_by_dataset_plot(
@@ -4011,6 +4446,11 @@ def main() -> None:
         all_by_pct.extend(by_pct)
 
     _print_paper_table(all_overall)
+    table_paths = _write_safety_trace_ap_tables(all_by_case, args.figures_dir)
+    if table_paths:
+        print("\nGenerated tables:")
+        for p in table_paths:
+            print(f"- {p}")
 
     if not args.no_figures:
         figure_paths = _generate_figures(
