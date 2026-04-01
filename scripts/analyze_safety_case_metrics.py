@@ -454,21 +454,23 @@ def _interp_precision_at_recalls(
 ) -> list[float]:
     if not curve:
         return [0.0 for _ in recall_grid]
-    points = sorted(
-        (
-            max(0.0, min(1.0, float(point.get("recall", 0.0)))),
-            max(0.0, min(1.0, float(point.get("precision", 0.0)))),
-        )
-        for point in curve
-    )
+    recall_to_precision: dict[float, float] = {}
+    for point in curve:
+        recall = max(0.0, min(1.0, float(point.get("recall", 0.0))))
+        precision = max(0.0, min(1.0, float(point.get("precision", 0.0))))
+        recall_to_precision[recall] = max(recall_to_precision.get(recall, 0.0), precision)
+    points = sorted(recall_to_precision.items())
+    envelope = [precision for _, precision in points]
+    for idx in range(len(envelope) - 2, -1, -1):
+        envelope[idx] = max(envelope[idx], envelope[idx + 1])
     out: list[float] = []
-    idx = 0
-    last_precision = points[0][1]
     for target in recall_grid:
-        while idx < len(points) and points[idx][0] <= target:
-            last_precision = points[idx][1]
-            idx += 1
-        out.append(last_precision)
+        precision_for_target = 0.0
+        for (recall, _), precision in zip(points, envelope):
+            if recall >= target:
+                precision_for_target = precision
+                break
+        out.append(precision_for_target)
     return out
 
 
@@ -4010,65 +4012,7 @@ def _judge_vs_at_ap_scatter_plot(
         print("Skipping figure generation: matplotlib is not installed.")
         return []
 
-    grouped = _group_plot_rows_by_dataset(rows)
-    points_by_dataset: dict[str, list[dict[str, Any]]] = {}
-    for dataset, dataset_rows in grouped.items():
-        if dataset not in dataset_labels:
-            continue
-        judge_by_model: dict[str, dict[str, Any]] = {}
-        for row in dataset_rows:
-            if str(row.get("method_base") or "") != "llmjudge":
-                continue
-            display_model = _display_model_name(str(row.get("method_model") or ""))
-            if not display_model:
-                continue
-            judge_by_model[display_model] = row
-        for row in dataset_rows:
-            if str(row.get("method_base") or "") != "AT":
-                continue
-            method_variant = str(row.get("method_variant") or "").strip()
-            if method_variant != "":
-                continue
-            display_model = _display_model_name(str(row.get("method_model") or ""))
-            if not display_model:
-                continue
-            judge_row = judge_by_model.get(display_model)
-            if judge_row is None:
-                continue
-            judge_file = Path(str(judge_row.get("file") or "")).expanduser()
-            at_file = Path(str(row.get("file") or "")).expanduser()
-            if not judge_file.is_file() or not at_file.is_file():
-                continue
-            judge_cases = {
-                str(case_row.get("case_id") or ""): case_row
-                for case_row in _load_rows(judge_file)
-                if case_row.get("case_id")
-            }
-            at_cases = {
-                str(case_row.get("case_id") or ""): case_row
-                for case_row in _load_rows(at_file)
-                if case_row.get("case_id")
-            }
-            for case_id, judge_case in judge_cases.items():
-                at_case = at_cases.get(case_id)
-                if at_case is None:
-                    continue
-                if not _ground_truth_positive_trace_files(judge_case):
-                    continue
-                use_max_merge = str(row.get("score_mode") or "") == "max-merge"
-                judge_ap = _average_precision_from_pairs(_row_trace_score_pairs(judge_case))
-                at_ap = _average_precision_from_pairs(_row_trace_score_pairs(at_case, max_merge=use_max_merge))
-                if judge_ap is None or at_ap is None:
-                    continue
-                points_by_dataset.setdefault(dataset, []).append(
-                    {
-                        "dataset": dataset,
-                        "model": display_model,
-                        "case_id": case_id,
-                        "judge_ap": float(judge_ap),
-                        "at_ap": float(at_ap),
-                    }
-                )
+    points_by_dataset = _judge_vs_at_ap_points(rows, dataset_labels)
 
     datasets = [dataset for dataset in sorted(dataset_labels) if points_by_dataset.get(dataset)]
     if not datasets:
@@ -4132,6 +4076,71 @@ def _judge_vs_at_ap_scatter_plot(
             out_paths.append(out_path)
         plt.close(fig)
     return out_paths
+
+
+def _judge_vs_at_ap_points(
+    rows: list[dict[str, Any]],
+    dataset_labels: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    grouped = _group_plot_rows_by_dataset(rows)
+    points_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for dataset, dataset_rows in grouped.items():
+        if dataset not in dataset_labels:
+            continue
+        judge_file_by_model: dict[str, Path] = {}
+        at_file_by_model: dict[str, Path] = {}
+        at_score_mode_by_model: dict[str, str] = {}
+        for row in dataset_rows:
+            display_model = _display_model_name(str(row.get("method_model") or ""))
+            if not display_model:
+                continue
+            file_path = Path(str(row.get("file") or "")).expanduser()
+            if not file_path.is_file():
+                continue
+            method_base = str(row.get("method_base") or "")
+            method_variant = str(row.get("method_variant") or "").strip()
+            if method_base == "llmjudge":
+                judge_file_by_model.setdefault(display_model, file_path)
+            elif method_base == "AT" and method_variant == "":
+                at_file_by_model.setdefault(display_model, file_path)
+                at_score_mode_by_model.setdefault(display_model, str(row.get("score_mode") or ""))
+        for display_model, judge_file in judge_file_by_model.items():
+            at_file = at_file_by_model.get(display_model)
+            if at_file is None:
+                continue
+            if not judge_file.is_file() or not at_file.is_file():
+                continue
+            use_max_merge = at_score_mode_by_model.get(display_model) == "max-merge"
+            judge_cases = {
+                str(case_row.get("case_id") or ""): case_row
+                for case_row in _load_rows(judge_file)
+                if case_row.get("case_id")
+            }
+            at_cases = {
+                str(case_row.get("case_id") or ""): case_row
+                for case_row in _load_rows(at_file)
+                if case_row.get("case_id")
+            }
+            for case_id, judge_case in judge_cases.items():
+                at_case = at_cases.get(case_id)
+                if at_case is None:
+                    continue
+                if not _ground_truth_positive_trace_files(judge_case):
+                    continue
+                judge_ap = _average_precision_from_pairs(_row_trace_score_pairs(judge_case))
+                at_ap = _average_precision_from_pairs(_row_trace_score_pairs(at_case, max_merge=use_max_merge))
+                if judge_ap is None or at_ap is None:
+                    continue
+                points_by_dataset.setdefault(dataset, []).append(
+                    {
+                        "dataset": dataset,
+                        "model": display_model,
+                        "case_id": case_id,
+                        "judge_ap": float(judge_ap),
+                        "at_ap": float(at_ap),
+                    }
+                )
+    return points_by_dataset
 
 
 def _build_calibration_groups(
