@@ -4347,6 +4347,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional max traces to run (0 = all).")
     parser.add_argument("--offset", type=int, default=0, help="Optional number of traces to skip first.")
+    parser.add_argument(
+        "--case-ids",
+        type=str,
+        default="",
+        help="Comma-separated list of case indices to run (e.g. '1,5,15,36,46'). "
+             "Requires materializing enough cases first (via --cases).",
+    )
     parser.add_argument("--sandbox", type=str, default="docker", help="Inspect sandbox backend.")
 
     parser.add_argument(
@@ -5152,8 +5159,12 @@ def main() -> None:
             start = max(args.offset, 0)
             end = None if args.limit <= 0 else start + args.limit
             cases = cases[start:end]
+        if args.case_ids:
+            wanted = set(f"case_{int(x.strip()):04d}" for x in args.case_ids.split(","))
+            cases = [c for c in cases if c.case_id in wanted]
+            print(f"Filtered to {len(cases)} cases by --case-ids: {sorted(wanted)}")
         if not cases:
-            raise SystemExit("No safety cases selected after applying limit/offset.")
+            raise SystemExit("No safety cases selected after applying limit/offset/case-ids.")
         print(f"Materialized safety cases: {len(cases)}")
 
         for case in cases:
