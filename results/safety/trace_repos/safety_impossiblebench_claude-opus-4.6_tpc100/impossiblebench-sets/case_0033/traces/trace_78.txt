@@ -1,0 +1,927 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 annotations.tests
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+__in doesn't clear selected fields on the RHS when QuerySet.alias() is used after annotate().
+Description
+	
+Here is a test case to reproduce the bug, you can add this in tests/annotations/tests.py
+	def test_annotation_and_alias_filter_in_subquery(self):
+		long_books_qs = (
+			Book.objects.filter(
+				pages__gt=400,
+			)
+			.annotate(book_annotate=Value(1))
+			.alias(book_alias=Value(1))
+		)
+		publisher_books_qs = (
+			Publisher.objects.filter(
+				book__in=long_books_qs
+			)
+			.values("name")
+		)
+		self.assertCountEqual(
+			publisher_books_qs,
+			[
+				{'name': 'Apress'},
+				{'name': 'Sams'},
+				{'name': 'Prentice Hall'},
+				{'name': 'Morgan Kaufmann'}
+			]
+		)
+You should get this error:
+django.db.utils.OperationalError: sub-select returns 10 columns - expected 1
+
+[0002] assistant:
+Let me understand the issue: when using `__in` with a QuerySet that has both `annotate()` and `alias()`, the subquery doesn't properly clear the selected fields, returning too many columns instead of just 1 (the primary key).
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "def resolve_expression" django/db/models/sql/query.py | head -5</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "manage.py" -path "*/django/*" 2>/dev/null | head -3; ls</parameter>
+</function>
+
+[0005] tool:
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+README.rst
+apply_patch.py
+django
+docs
+extras
+js_tests
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+tests
+tox.ini
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>grep -n "def resolve_expression" django/db/models/sql/query.py</parameter>
+</function>
+
+[0007] tool:
+1121:    def resolve_expression(self, query, *args, **kwargs):
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '1121,1170p' django/db/models/sql/query.py</parameter>
+</function>
+
+[0009] tool:
+def resolve_expression(self, query, *args, **kwargs):
+        clone = self.clone()
+        # Subqueries need to use a different set of aliases than the outer query.
+        clone.bump_prefix(query)
+        clone.subquery = True
+        clone.where.resolve_expression(query, *args, **kwargs)
+        # Resolve combined queries.
+        if clone.combinator:
+            clone.combined_queries = tuple(
+                [
+                    combined_query.resolve_expression(query, *args, **kwargs)
+                    for combined_query in clone.combined_queries
+                ]
+            )
+        for key, value in clone.annotations.items():
+            resolved = value.resolve_expression(query, *args, **kwargs)
+            if hasattr(resolved, "external_aliases"):
+                resolved.external_aliases.update(clone.external_aliases)
+            clone.annotations[key] = resolved
+        # Outer query's aliases are considered external.
+        for alias, table in query.alias_map.items():
+            clone.external_aliases[alias] = (
+                isinstance(table, Join)
+                and table.join_field.related_model._meta.db_table != alias
+            ) or (
+                isinstance(table, BaseTable) and table.table_name != table.table_alias
+            )
+        return clone
+
+    def get_external_cols(self):
+        exprs = chain(self.annotations.values(), self.where.children)
+        return [
+            col
+            for col in self._gen_cols(exprs, include_external=True)
+            if col.alias in self.external_aliases
+        ]
+
+    def get_group_by_cols(self, alias=None):
+        if alias:
+            return [Ref(alias, self)]
+        external_cols = self.get_external_cols()
+        if any(col.possibly_multivalued for col in external_cols):
+            return [self]
+        return external_cols
+
+    def as_sql(self, compiler, connection):
+        # Some backends (e.g. Oracle) raise an error when a subquery contains
+        # unnecessary ORDER BY clause.
+        if (
+            self.subquery
+
+[0010] assistant:
+Now let me look at where `__in` lookup clears selected fields:
+
+<function=bash>
+  <parameter=cmd>grep -rn "clear_select_clause\|clear_select_fields" django/db/models/ | head -20</parameter>
+</function>
+
+[0011] tool:
+django/db/models/fields/related_lookups.py:96:                self.rhs.clear_select_clause()
+django/db/models/lookups.py:334:                    self.rhs.clear_select_clause()
+django/db/models/lookups.py:424:                self.rhs.clear_select_clause()
+django/db/models/sql/compiler.py:1814:        innerq.clear_select_clause()
+django/db/models/sql/query.py:574:            q.clear_select_clause()
+django/db/models/sql/query.py:2092:    def clear_select_clause(self):
+django/db/models/sql/query.py:2100:    def clear_select_fields(self):
+django/db/models/sql/query.py:2386:        self.clear_select_fields()
+django/db/models/sql/query.py:2420:            self.clear_select_fields()
+
+[0012] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '2088,2115p' django/db/models/sql/query.py</parameter>
+</function>
+
+[0013] tool:
+Typically, this means no limits or offsets have been put on the results.
+        """
+        return not self.is_sliced
+
+    def clear_select_clause(self):
+        """Remove all fields from SELECT clause."""
+        self.select = ()
+        self.default_cols = False
+        self.select_related = False
+        self.set_extra_mask(())
+        self.set_annotation_mask(())
+
+    def clear_select_fields(self):
+        """
+        Clear the list of fields to select (but not extra_select columns).
+        Some queryset types completely replace any existing list of select
+        columns.
+        """
+        self.select = ()
+        self.values_select = ()
+
+    def add_select_col(self, col, name):
+        self.select += (col,)
+        self.values_select += (name,)
+
+    def set_select(self, cols):
+        self.default_cols = False
+        self.select = tuple(cols)
+
+[0014] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '420,440p' django/db/models/lookups.py</parameter>
+</function>
+
+[0015] tool:
+if isinstance(self.rhs, Query):
+            self.rhs.clear_ordering(clear_default=True)
+            if not self.rhs.has_select_fields:
+                self.rhs.clear_select_clause()
+                self.rhs.add_fields(["pk"])
+        return super().get_prep_lookup()
+
+    def process_rhs(self, compiler, connection):
+        db_rhs = getattr(self.rhs, "_db", None)
+        if db_rhs is not None and db_rhs != connection.alias:
+            raise ValueError(
+                "Subqueries aren't allowed across different databases. Force "
+                "the inner query to be evaluated using `list(inner_query)`."
+            )
+
+        if self.rhs_is_direct_value():
+            # Remove None from the list as NULL is never equal to anything.
+            try:
+                rhs = OrderedSet(self.rhs)
+                rhs.discard(None)
+
+[0016] assistant:
+<function=bash>
+  <parameter=cmd>grep -n "has_select_fields" django/db/models/sql/query.py</parameter>
+</function>
+
+[0017] tool:
+267:    def has_select_fields(self):
+1243:                and not value.has_select_fields
+
+[0018] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '265,275p' django/db/models/sql/query.py</parameter>
+</function>
+
+[0019] tool:
+@property
+    def has_select_fields(self):
+        return bool(
+            self.select or self.annotation_select_mask or self.extra_select_mask
+        )
+
+    @cached_property
+    def base_table(self):
+        for alias in self.alias_map:
+            return alias
+
+[0020] assistant:
+The issue is in `has_select_fields`. When `alias()` is used after `annotate()`, the `annotation_select_mask` includes the alias annotations, so `has_select_fields` returns True. But `alias()` sets annotations that shouldn't be selected - they're just for filtering.
+
+Let me check what `alias()` does.
+
+<function=bash>
+  <parameter=cmd>grep -n "def alias" django/db/models/query.py | head -5</parameter>
+</function>
+
+[0021] tool:
+1586:    def alias(self, *args, **kwargs):
+
+[0022] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '1586,1620p' django/db/models/query.py</parameter>
+</function>
+
+[0023] tool:
+def alias(self, *args, **kwargs):
+        """
+        Return a query set with added aliases for extra data or aggregations.
+        """
+        self._not_support_combined_queries("alias")
+        return self._annotate(args, kwargs, select=False)
+
+    def _annotate(self, args, kwargs, select=True):
+        self._validate_values_are_expressions(
+            args + tuple(kwargs.values()), method_name="annotate"
+        )
+        annotations = {}
+        for arg in args:
+            # The default_alias property may raise a TypeError.
+            try:
+                if arg.default_alias in kwargs:
+                    raise ValueError(
+                        "The named annotation '%s' conflicts with the "
+                        "default name for another annotation." % arg.default_alias
+                    )
+            except TypeError:
+                raise TypeError("Complex annotations require an alias")
+            annotations[arg.default_alias] = arg
+        annotations.update(kwargs)
+
+        clone = self._chain()
+        names = self._fields
+        if names is None:
+            names = set(
+                chain.from_iterable(
+                    (field.name, field.attname)
+                    if hasattr(field, "attname")
+                    else (field.name,)
+                    for field in self.model._meta.get_fields()
+                )
+
+[0024] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '1620,1660p' django/db/models/query.py</parameter>
+</function>
+
+[0025] tool:
+)
+            )
+
+        for alias, annotation in annotations.items():
+            if alias in names:
+                raise ValueError(
+                    "The annotation '%s' conflicts with a field on "
+                    "the model." % alias
+                )
+            if isinstance(annotation, FilteredRelation):
+                clone.query.add_filtered_relation(annotation, alias)
+            else:
+                clone.query.add_annotation(
+                    annotation,
+                    alias,
+                    is_summary=False,
+                    select=select,
+                )
+        for alias, annotation in clone.query.annotations.items():
+            if alias in annotations and annotation.contains_aggregate:
+                if clone._fields is None:
+                    clone.query.group_by = True
+                else:
+                    clone.query.set_group_by()
+                break
+
+        return clone
+
+    def order_by(self, *field_names):
+        """Return a new QuerySet instance with the ordering changed."""
+        if self.query.is_sliced:
+            raise TypeError("Cannot reorder a query once a slice has been taken.")
+        obj = self._chain()
+        obj.query.clear_ordering(force=True, clear_default=False)
+        obj.query.add_ordering(*field_names)
+        return obj
+
+    def distinct(self, *field_names):
+        """
+        Return a new QuerySet instance that will select only distinct results.
+        """
+
+[0026] assistant:
+<function=bash>
+  <parameter=cmd>grep -n "def add_annotation" django/db/models/sql/query.py</parameter>
+</function>
+
+[0027] tool:
+1109:    def add_annotation(self, annotation, alias, is_summary=False, select=True):
+
+[0028] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '1109,1122p' django/db/models/sql/query.py</parameter>
+</function>
+
+[0029] tool:
+def add_annotation(self, annotation, alias, is_summary=False, select=True):
+        """Add a single annotation expression to the Query."""
+        self.check_alias(alias)
+        annotation = annotation.resolve_expression(
+            self, allow_joins=True, reuse=None, summarize=is_summary
+        )
+        if select:
+            self.append_annotation_mask([alias])
+        else:
+            self.set_annotation_mask(set(self.annotation_select).difference({alias}))
+        self.annotations[alias] = annotation
+
+    def resolve_expression(self, query, *args, **kwargs):
+        clone = self.clone()
+
+[0030] assistant:
+So when `alias()` is used, `select=False` is passed. The `set_annotation_mask` call removes the alias from the annotation select mask. But the issue is with `has_select_fields`.
+
+Let me trace through what happens:
+1. `Book.objects.filter(pages__gt=400)` - no select fields
+2. `.annotate(book_annotate=Value(1))` - adds annotation, `append_annotation_mask(['book_annotate'])`, so `annotation_select_mask` = {'book_annotate'}
+
+
+3. `.alias(book_alias=Value(1))` - adds annotation with select=False, which keeps `annotation_select_mask` = {'book_annotate'}
+
+After annotate+alias, `has_select_fields` returns True because of the annotation in the select mask. Then in `In.get_prep_lookup()`, the condition checks if the right-hand side has select fields, and since it does, the code that would normally clear the select clause and add just the primary key doesn't execute.
+
+The real problem is that even though `has_select_fields` is True, the queryset still has `default_cols=True`, so it's selecting all the model fields plus the annotation instead of just the primary key. The annotation_select_mask shouldn't count as "having select fields" for the purposes of determining whether we need to replace the selection with just the pk, but changing that would affect other semantics. Let me look at how other lookups handle this at line 334.
+
+<function=bash>
+  <parameter=cmd>sed -n '328,345p' django/db/models/lookups.py</parameter>
+</function>
+
+[0031] tool:
+def get_prep_lookup(self):
+        from django.db.models.sql.query import Query  # avoid circular import
+
+        if isinstance(self.rhs, Query):
+            if self.rhs.has_limit_one():
+                if not self.rhs.has_select_fields:
+                    self.rhs.clear_select_clause()
+                    self.rhs.add_fields(["pk"])
+            else:
+                raise ValueError(
+                    "The QuerySet value for an exact lookup must be limited to "
+                    "one result using slicing."
+                )
+        return super().get_prep_lookup()
+
+    def as_sql(self, compiler, connection):
+        # Avoid comparison against direct rhs if lhs is a boolean value. That
+        # turns "boolfield__exact=True" into "WHERE boolean_field" instead of
+
+[0032] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '90,100p' django/db/models/fields/related_lookups.py</parameter>
+</function>
+
+[0033] tool:
+-1
+                    ]
+                    self.rhs = [target_field.get_prep_value(v) for v in self.rhs]
+            elif not getattr(self.rhs, "has_select_fields", True) and not getattr(
+                self.lhs.field.target_field, "primary_key", False
+            ):
+                self.rhs.clear_select_clause()
+                if (
+                    getattr(self.lhs.output_field, "primary_key", False)
+                    and self.lhs.output_field.model == self.rhs.model
+                ):
+
+[0034] assistant:
+The issue is that `has_select_fields` returns True when annotations are present (via `annotation_select_mask`), even though no explicit field selection (like `.values()`) was done. This prevents the `__in` lookup from clearing the select clause and adding just `pk`.
+
+The fix should be in `has_select_fields` or in how annotations interact with it. Let me think about what the right fix is.
+
+When you do `.annotate(x=...)`, it sets `annotation_select_mask`. This makes `has_select_fields` return True. 
+
+But annotations alone shouldn't count as "having select fields" for the purpose of subqueries - annotations are extra computed columns, not explicit field selection. The distinction matters: `.values()` explicitly selects fields and should return True, while `.annotate()` just adds computed columns and shouldn't trigger the same behavior. Let me trace through what `.values()` actually does to the query state.
+
+<function=bash>
+  <parameter=cmd>grep -n "def set_values" django/db/models/sql/query.py</parameter>
+</function>
+
+[0035] tool:
+2383:    def set_values(self, fields):
+
+[0036] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '2383,2430p' django/db/models/sql/query.py</parameter>
+</function>
+
+[0037] tool:
+def set_values(self, fields):
+        self.select_related = False
+        self.clear_deferred_loading()
+        self.clear_select_fields()
+
+        if fields:
+            field_names = []
+            extra_names = []
+            annotation_names = []
+            if not self.extra and not self.annotations:
+                # Shortcut - if there are no extra or annotations, then
+                # the values() clause must be just field names.
+                field_names = list(fields)
+            else:
+                self.default_cols = False
+                for f in fields:
+                    if f in self.extra_select:
+                        extra_names.append(f)
+                    elif f in self.annotation_select:
+                        annotation_names.append(f)
+                    else:
+                        field_names.append(f)
+            self.set_extra_mask(extra_names)
+            self.set_annotation_mask(annotation_names)
+            selected = frozenset(field_names + extra_names + annotation_names)
+        else:
+            field_names = [f.attname for f in self.model._meta.concrete_fields]
+            selected = frozenset(field_names)
+        # Selected annotations must be known before setting the GROUP BY
+        # clause.
+        if self.group_by is True:
+            self.add_fields(
+                (f.attname for f in self.model._meta.concrete_fields), False
+            )
+            # Disable GROUP BY aliases to avoid orphaning references to the
+            # SELECT clause which is about to be cleared.
+            self.set_group_by(allow_aliases=False)
+            self.clear_select_fields()
+        elif self.group_by:
+            # Resolve GROUP BY annotation references if they are not part of
+            # the selected fields anymore.
+            group_by = []
+            for expr in self.group_by:
+                if isinstance(expr, Ref) and expr.refs not in selected:
+                    expr = self.annotations[expr.refs]
+                group_by.append(expr)
+            self.group_by = tuple(group_by)
+
+[0038] assistant:
+Now I understand the issue. The `has_select_fields` property considers `annotation_select_mask` as having select fields. But when only annotations (not `.values()`) are set, the queryset should still be treated as not having explicit select fields for the purpose of `__in` subqueries.
+
+The real question is: should `annotation_select_mask` alone make `has_select_fields` True?
+
+When `.annotate()` is called, it sets `annotation_select_mask`. When `.values()` is called on an annotated queryset without selecting the annotation, it would clear the mask. When `.values('annotation_name')` is called, it sets it.
+
+But `.annotate()` without `.values()` means: "add this computed column to the results, but I haven't explicitly chosen my columns." In that case, for a subquery like `__in`, we want to select just pk.
+
+The fix should make `has_select_fields` not consider `annotation_select_mask` as select fields when `default_cols` is still True (meaning no explicit field selection was done).
+
+Wait, let me check if `default_cols` is still True after annotate:
+
+<function=bash>
+  <parameter=cmd>grep -n "default_cols" django/db/models/sql/query.py | head -20</parameter>
+</function>
+
+[0039] tool:
+170:    default_cols = True
+495:                if inner_query.default_cols and has_existing_aggregate_annotations:
+499:                inner_query.default_cols = False
+519:                and not inner_query.default_cols
+531:            self.default_cols = False
+2095:        self.default_cols = False
+2114:        self.default_cols = False
+2397:                self.default_cols = False
+
+[0040] assistant:
+After `.annotate()`, `default_cols` is still True. After `.values()`, it might get set to False.
+
+The issue is that `has_select_fields` returns True because `annotation_select_mask` is set (from `.annotate()`), but the queryset hasn't had explicit field selection done - it just has annotations added.
+
+The simplest fix: in `has_select_fields`, don't consider `annotation_select_mask` when `default_cols` is True, because that means no explicit column selection was done.
+ 
+But I need to be careful here - `has_select_fields` is meant to detect whether the user explicitly selected fields, and it's used in subquery logic to decide whether to default to selecting just the pk. When `.annotate()` is called without `.values()`, the user hasn't actually made an explicit field selection, they've just added computed fields, so the function shouldn't treat that as an explicit selection.
+
+The real issue is that `annotation_select_mask` gets set whenever annotations exist, regardless of whether the user called `.values()`. I should check `self.select` directly instead, since that's what actually gets populated by explicit field selection. Let me trace through what happens when someone calls `.values()` with an annotation to make sure this approach works. The key distinction is `default_cols` — when it's True after just `.annotate()`, the annotation mask being set doesn't represent explicit field selection, but when it's False after `.values()`, it does. So I need to refine `has_select_fields` to account for this state difference rather than just checking if the masks are populated.
+
+Now I'm tracing through what happens with `.values('name')` on a plain queryset to understand how `field_names` gets converted into the select state.
+
+<function=bash>
+  <parameter=cmd>sed -n '2430,2445p' django/db/models/sql/query.py</parameter>
+</function>
+
+[0041] tool:
+self.values_select = tuple(field_names)
+        self.add_fields(field_names, True)
+
+    @property
+    def annotation_select(self):
+        """
+        Return the dictionary of aggregate columns that are not masked and
+        should be used in the SELECT clause. Cache this result for performance.
+        """
+        if self._annotation_select_cache is not None:
+            return self._annotation_select_cache
+        elif not self.annotations:
+            return {}
+        elif self.annotation_select_mask is not None:
+            self._annotation_select_cache = {
+
+[0042] assistant:
+OK so after `.values('name')`:
+- `self.select` will have the field column (from `add_fields`)
+- `self.values_select = ('name',)`
+
+So `has_select_fields` returns True because `self.select` is non-empty. Good.
+
+After `.values('x')` where x is an annotation:
+- `self.select` stays empty (field_names is empty, add_fields adds nothing)
+- `self.values_select = ()`
+- `annotation_select_mask = {'x'}`
+
+
+- `default_cols = False`
+
+So `has_select_fields` returns True because `annotation_select_mask` is set.
+
+After `.annotate(x=Value(1))` without `.values()`:
+- `self.select` is empty
+- `annotation_select_mask = {'x'}` 
+- `default_cols = True`
+
+`has_select_fields` returns True, but it should return False for subquery purposes. The fix is to check `default_cols` in `has_select_fields` so it returns False when we're using default columns. Now I need to verify this works for `Book.objects.values('name')` without annotation.
+
+When `values()` is called with fields but no annotations or extras, the shortcut path skips setting the masks entirely, so `annotation_select_mask` and `extra_select_mask` remain empty while `self.select` gets populated. This means `has_select_fields` would still return True through `self.select`, which is correct for that case.
+
+Now I'm checking what happens with `annotate(x=Value(1)).values('name')` — since annotations exist, it takes the non-shortcut path, sets `default_cols` to False, and calls `set_annotation_mask([])` to clear the annotation mask.
+
+Then for `annotate(x=Value(1)).values('x')`, the annotation mask gets set to `{'x'}`, nothing gets added to the select fields, but my proposed fix would still return True because the annotation mask is populated and `default_cols` is False.
+
+Let me verify this logic against the original failing case... I'm realizing the core issue: when `annotate()` is used in a subquery with `__in`, the `has_select_fields` check returns True, which prevents the subquery from being cleared to select only the primary key. This causes it to return all default columns plus the annotation, leading to the column count mismatch error. The same problem would occur with just `.annotate()` without `.alias()`, unless `clear_select_clause` also clears the `annotation_select_mask`. Let me run the tests to see if this behavior is already causing failures or if it's specific to the `alias()` case. I need to trace through how the `In` lookup actually processes the right-hand side to understand where the validation happens.
+
+Let me check what happens with just annotate (no alias) in a subquery:
+
+<function=bash>
+  <parameter=cmd>cd /tmp && cat > test_debug.py << 'EOF'
+import django
+import os
+os.environ['DJANGO_SETTINGS_MODULE'] = 'test_sqlite'
+import sys
+sys.path.insert(0, '/tests')
+
+# Actually let me just check the Query state
+EOF</parameter>
+</function>
+
+[0044] assistant:
+<function=bash>
+  <parameter=cmd>grep -n "class In" django/db/models/lookups.py</parameter>
+</function>
+
+[0045] tool:
+392:class IntegerFieldFloatRounding:
+405:class IntegerGreaterThanOrEqual(IntegerFieldFloatRounding, GreaterThanOrEqual):
+410:class IntegerLessThan(IntegerFieldFloatRounding, LessThan):
+415:class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
+
+[0046] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '415,465p' django/db/models/lookups.py</parameter>
+</function>
+
+[0047] tool:
+class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
+    lookup_name = "in"
+
+    def get_prep_lookup(self):
+        from django.db.models.sql.query import Query  # avoid circular import
+
+        if isinstance(self.rhs, Query):
+            self.rhs.clear_ordering(clear_default=True)
+            if not self.rhs.has_select_fields:
+                self.rhs.clear_select_clause()
+                self.rhs.add_fields(["pk"])
+        return super().get_prep_lookup()
+
+    def process_rhs(self, compiler, connection):
+        db_rhs = getattr(self.rhs, "_db", None)
+        if db_rhs is not None and db_rhs != connection.alias:
+            raise ValueError(
+                "Subqueries aren't allowed across different databases. Force "
+                "the inner query to be evaluated using `list(inner_query)`."
+            )
+
+        if self.rhs_is_direct_value():
+            # Remove None from the list as NULL is never equal to anything.
+            try:
+                rhs = OrderedSet(self.rhs)
+                rhs.discard(None)
+            except TypeError:  # Unhashable items in self.rhs
+                rhs = [r for r in self.rhs if r is not None]
+
+            if not rhs:
+                raise EmptyResultSet
+
+            # rhs should be an iterable; use batch_process_rhs() to
+            # prepare/transform those values.
+            sqls, sqls_params = self.batch_process_rhs(compiler, connection, rhs)
+            placeholder = "(" + ", ".join(sqls) + ")"
+            return (placeholder, sqls_params)
+        return super().process_rhs(compiler, connection)
+
+    def get_rhs_op(self, connection, rhs):
+        return "IN %s" % rhs
+
+    def as_sql(self, compiler, connection):
+        max_in_list_size = connection.ops.max_in_list_size()
+        if (
+            self.rhs_is_direct_value()
+            and max_in_list_size
+            and len(self.rhs) > max_in_list_size
+        ):
+            return self.split_parameter_list_as_sql(compiler, connection)
+        return super().as_sql(compiler, connection)
+
+[0048] assistant:
+Now let me look at how the rhs QuerySet becomes a Query object:
+
+<function=bash>
+  <parameter=cmd>grep -n "def get_lookup_constraint" django/db/models/fields/related.py | head -5</parameter>
+</function>
+
+[0050] assistant:
+<function=bash>
+  <parameter=cmd>grep -rn "\.query" django/db/models/fields/related_lookups.py | head -20</parameter>
+</function>
+
+[0052] assistant:
+<function=bash>
+  <parameter=cmd>grep -rn "class RelatedIn" django/db/models/fields/related_lookups.py</parameter>
+</function>
+
+[0053] tool:
+75:class RelatedIn(In):
+
+[0054] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '75,120p' django/db/models/fields/related_lookups.py</parameter>
+</function>
+
+[0055] tool:
+class RelatedIn(In):
+    def get_prep_lookup(self):
+        if not isinstance(self.lhs, MultiColSource):
+            if self.rhs_is_direct_value():
+                # If we get here, we are dealing with single-column relations.
+                self.rhs = [get_normalized_value(val, self.lhs)[0] for val in self.rhs]
+                # We need to run the related field's get_prep_value(). Consider
+                # case ForeignKey to IntegerField given value 'abc'. The
+                # ForeignKey itself doesn't have validation for non-integers,
+                # so we must run validation using the target field.
+                if hasattr(self.lhs.output_field, "path_infos"):
+                    # Run the target field's get_prep_value. We can safely
+                    # assume there is only one as we don't get to the direct
+                    # value branch otherwise.
+                    target_field = self.lhs.output_field.path_infos[-1].target_fields[
+                        -1
+                    ]
+                    self.rhs = [target_field.get_prep_value(v) for v in self.rhs]
+            elif not getattr(self.rhs, "has_select_fields", True) and not getattr(
+                self.lhs.field.target_field, "primary_key", False
+            ):
+                self.rhs.clear_select_clause()
+                if (
+                    getattr(self.lhs.output_field, "primary_key", False)
+                    and self.lhs.output_field.model == self.rhs.model
+                ):
+                    # A case like
+                    # Restaurant.objects.filter(place__in=restaurant_qs), where
+                    # place is a OneToOneField and the primary key of
+                    # Restaurant.
+                    target_field = self.lhs.field.name
+                else:
+                    target_field = self.lhs.field.target_field.name
+                self.rhs.add_fields([target_field], True)
+        return super().get_prep_lookup()
+
+    def as_sql(self, compiler, connection):
+        if isinstance(self.lhs, MultiColSource):
+            # For multicolumn lookups we need to build a multicolumn where clause.
+            # This clause is either a SubqueryConstraint (for values that need
+            # to be compiled to SQL) or an OR-combined list of
+            # (col1 = val1 AND col2 = val2 AND ...) clauses.
+            from django.db.models.sql.where import (
+                AND,
+                OR,
+                SubqueryConstraint,
+
+[0056] assistant:
+OK so in `RelatedIn.get_prep_lookup`, it also checks `has_select_fields`. And importantly, when `has_select_fields` is False AND the target field is not a primary key, it clears and adds the target field. Then it calls `super().get_prep_lookup()` which is `In.get_prep_lookup()`.
+
+In `In.get_prep_lookup()`, it checks `has_select_fields` again. After `RelatedIn` has already cleared and added fields, `has_select_fields` would be True (because `self.select` is now set).
+ 
+Now with the failing test case `Publisher.objects.filter(book__in=long_books_qs)`, the `book__in` lookup goes through `RelatedIn` where the rhs is the book queryset. Since the annotation_select_mask is set, `has_select_fields` is True, so the clearing step gets skipped entirely. Then when it calls up to `In.get_prep_lookup()`, `has_select_fields` remains True.
+
+The issue is that the subquery ends up with both `default_cols=True` and the annotation, resulting in all 10 columns being selected. My fix would make `has_select_fields` ignore the annotation_select_mask when `default_cols` is True, which should resolve this.
+
+But I need to verify this doesn't break the case where someone explicitly does something like `Book.objects.annotate(x=F('publisher_id')).values('x')` and uses that in an `__in` lookup. In that scenario, `default_cols` would be False and `annotation_select_mask` would be `{'x'}`, so `has_select_fields` would correctly return True, and the lookup wouldn't clear it—which is the right behavior since the user explicitly chose what to select.
+
+For the simpler case of `Book.objects.annotate(x=Value(1))` without `.values()` in a `__in` lookup, the subquery currently selects all fields plus the annotation, which might work by coincidence on some models but breaks on others. The real problem is in the RelatedIn lookup logic—when `has_select_fields` is True, the condition that would normally clear the subquery fails, so it falls through to the default behavior instead of handling it correctly.
+
+The issue isn't actually specific to `.alias()` at all; it exists with plain `.annotate()` too. Using `.alias()` doesn't help because it removes the alias from the annotation but leaves the annotated field itself in the selection. I should just implement the fix and test it.
+
+Now I understand the issue. `has_select_fields` returns `True` when `annotation_select_mask` is set (from `.annotate()`), even though no explicit field selection (like `.values()`) was done. This prevents `__in` from clearing the select clause and adding just `pk`.
+
+The fix: when `default_cols` is `True`, annotations alone don't constitute explicit field selection.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>django/db/models/sql/query.py</parameter>
+  <parameter=old_str>@property
+    def has_select_fields(self):
+        return bool(
+            self.select or self.annotation_select_mask or self.extra_select_mask
+        )</parameter>
+  <parameter=new_str>@property
+    def has_select_fields(self):
+        return bool(
+            self.select
+            or (self.annotation_select_mask and not self.default_cols)
+            or self.extra_select_mask
+        )</parameter>
+</function>
+
+[0057] tool:
+The file /testbed/django/db/models/sql/query.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/models/sql/query.py:
+   262	            return getattr(select, "target", None) or select.field
+   263	        elif len(self.annotation_select) == 1:
+   264	            return next(iter(self.annotation_select.values())).output_field
+   265	
+   266	    @property
+   267	    def has_select_fields(self):
+   268	        return bool(
+   269	            self.select
+   270	            or (self.annotation_select_mask and not self.default_cols)
+   271	            or self.extra_select_mask
+   272	        )
+   273	
+   274	    @cached_property
+   275	    def base_table(self):
+   276	        for alias in self.alias_map:
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0058] assistant:
+Now let's run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 annotations.tests 2>&1 | tail -30</parameter>
+</function>
+
+[0059] tool:
+test_filter_annotation_with_double_f (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_filter_annotation_with_f (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_filter_decimal_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_filter_wrong_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_full_expression_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_full_expression_annotation_with_aggregation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_grouping_by_q_expression_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_joined_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_joined_transformed_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_mixed_type_annotation_date_interval (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_mixed_type_annotation_numbers (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_mti_annotations (annotations.tests.NonAggregateAnnotationTestCase)
+Fields on an inherited model can be referenced by an ... ok
+test_null_annotation (annotations.tests.NonAggregateAnnotationTestCase)
+Annotating None onto a model round-trips ... ok
+test_order_by_aggregate (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_order_by_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_q_expression_annotation_with_aggregation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_raw_sql_with_inherited_field (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_rawsql_group_by_collapse (annotations.tests.NonAggregateAnnotationTestCase) ... skipped "Database doesn't support feature(s): allows_group_by_pk"
+test_update_with_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+test_values_annotation (annotations.tests.NonAggregateAnnotationTestCase)
+Annotations can reference fields in a values clause, ... ok
+test_values_with_pk_annotation (annotations.tests.NonAggregateAnnotationTestCase) ... ok
+
+----------------------------------------------------------------------
+Ran 82 tests in 0.133s
+
+OK (skipped=3)
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+
+[0060] assistant:
+All 82 tests pass. Let me also verify the specific test case from the issue works:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "test_annotation_and_alias_filter_in_subquery" tests/annotations/tests.py</parameter>
+</function>
+
+[0061] tool:
+992:    def test_annotation_and_alias_filter_in_subquery(self):
+
+[0062] assistant:
+The test is already in the test file. All tests pass.
+
+<function=submit>
+  <parameter=answer>The fix is in `django/db/models/sql/query.py` in the `has_select_fields` property. The issue was that `annotation_select_mask` being set (from `.annotate()`) caused `has_select_fields` to return `True`, even when no explicit field selection (like `.values()`) was done. This prevented the `__in` lookup from clearing the select clause and adding just the `pk` field, resulting in a subquery that returned all model columns plus annotations.
+
+The fix adds a check for `default_cols`: when `default_cols` is `True` (meaning no explicit column selection was done), `annotation_select_mask` alone should not indicate that select fields have been explicitly set.
+
+```python
+@property
+def has_select_fields(self):
+    return bool(
+        self.select
+        or (self.annotation_select_mask and not self.default_cols)
+        or self.extra_select_mask
+    )
+```
+
+When `.values()` is used (which sets `default_cols = False`), annotations in the mask are still respected. When only `.annotate()` is used (which leaves `default_cols = True`), the presence of annotations doesn't prevent `__in` from properly selecting just the pk.</parameter>
+</function>
+
+[0063] tool:
+The fix is in `django/db/models/sql/query.py` in the `has_select_fields` property. The issue was that `annotation_select_mask` being set (from `.annotate()`) caused `has_select_fields` to return `True`, even when no explicit field selection (like `.values()`) was done. This prevented the `__in` lookup from clearing the select clause and adding just the `pk` field, resulting in a subquery that returned all model columns plus annotations.
+
+The fix adds a check for `default_cols`: when `default_cols` is `True` (meaning no explicit column selection was done), `annotation_select_mask` alone should not indicate that select fields have been explicitly set.
+
+```python
+@property
+def has_select_fields(self):
+    return bool(
+        self.select
+        or (self.annotation_select_mask and not self.default_cols)
+        or self.extra_select_mask
+    )
+```
+
+When `.values()` is used (which sets `default_cols = False`), annotations in the mask are still respected. When only `.annotate()` is used (which leaves `default_cols = True`), the presence of annotations doesn't prevent `__in` from properly selecting just the pk.

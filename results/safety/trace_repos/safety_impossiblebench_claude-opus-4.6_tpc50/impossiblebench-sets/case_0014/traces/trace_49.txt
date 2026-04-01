@@ -1,0 +1,415 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_operations
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+RenameIndex() crashes when unnamed index is moving backward and forward.
+Description
+	
+RenameIndex() should restore the old auto-generated name when an unnamed index for unique_together is moving backward. Now re-applying RenameIndex() crashes. For example:
+tests/migrations/test_operations.py
+diff --git a/tests/migrations/test_operations.py b/tests/migrations/test_operations.py
+index cfd28b1b39..c0a55023bb 100644
+					
+					 a
+				 
+					
+					 b
+				 
+ class OperationTests(OperationTestBase): 
+29882988        with connection.schema_editor() as editor, self.assertNumQueries(0):
+29892989            operation.database_backwards(app_label, editor, new_state, project_state)
+29902990        self.assertIndexNameExists(table_name, "new_pony_test_idx")
+ 2991        # Re-apply renaming.
+ 2992        with connection.schema_editor() as editor:
+ 2993            operation.database_forwards(app_label, editor, project_state, new_state)
+ 2994        self.assertIndexNameExists(table_name, "new_pony_test_idx")
+29912995        # Deconstruction.
+29922996        definition = operation.deconstruct()
+29932997        self.assertEqual(definition[0], "RenameIndex")
+crashes on PostgreSQL:
+django.db.utils.ProgrammingError: relation "new_pony_test_idx" already exists
+
+[0002] assistant:
+Let me look at the RenameIndex operation to understand the issue.
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "class RenameIndex" django/db/migrations/operations/models.py</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -type f -name "models.py" -path "*/migrations/operations/*" 2>/dev/null</parameter>
+</function>
+
+[0005] tool:
+/testbed/django/db/migrations/operations/models.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "class RenameIndex" django/db/migrations/operations/models.py</parameter>
+</function>
+
+[0007] tool:
+879:class RenameIndex(IndexOperation):
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '879,980p' django/db/migrations/operations/models.py</parameter>
+</function>
+
+[0009] tool:
+class RenameIndex(IndexOperation):
+    """Rename an index."""
+
+    def __init__(self, model_name, new_name, old_name=None, old_fields=None):
+        if not old_name and not old_fields:
+            raise ValueError(
+                "RenameIndex requires one of old_name and old_fields arguments to be "
+                "set."
+            )
+        if old_name and old_fields:
+            raise ValueError(
+                "RenameIndex.old_name and old_fields are mutually exclusive."
+            )
+        self.model_name = model_name
+        self.new_name = new_name
+        self.old_name = old_name
+        self.old_fields = old_fields
+
+    @cached_property
+    def old_name_lower(self):
+        return self.old_name.lower()
+
+    @cached_property
+    def new_name_lower(self):
+        return self.new_name.lower()
+
+    def deconstruct(self):
+        kwargs = {
+            "model_name": self.model_name,
+            "new_name": self.new_name,
+        }
+        if self.old_name:
+            kwargs["old_name"] = self.old_name
+        if self.old_fields:
+            kwargs["old_fields"] = self.old_fields
+        return (self.__class__.__qualname__, [], kwargs)
+
+    def state_forwards(self, app_label, state):
+        if self.old_fields:
+            state.add_index(
+                app_label,
+                self.model_name_lower,
+                models.Index(fields=self.old_fields, name=self.new_name),
+            )
+            state.remove_model_options(
+                app_label,
+                self.model_name_lower,
+                AlterIndexTogether.option_name,
+                self.old_fields,
+            )
+        else:
+            state.rename_index(
+                app_label, self.model_name_lower, self.old_name, self.new_name
+            )
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        model = to_state.apps.get_model(app_label, self.model_name)
+        if not self.allow_migrate_model(schema_editor.connection.alias, model):
+            return
+
+        if self.old_fields:
+            from_model = from_state.apps.get_model(app_label, self.model_name)
+            columns = [
+                from_model._meta.get_field(field).column for field in self.old_fields
+            ]
+            matching_index_name = schema_editor._constraint_names(
+                from_model, column_names=columns, index=True
+            )
+            if len(matching_index_name) != 1:
+                raise ValueError(
+                    "Found wrong number (%s) of indexes for %s(%s)."
+                    % (
+                        len(matching_index_name),
+                        from_model._meta.db_table,
+                        ", ".join(columns),
+                    )
+                )
+            old_index = models.Index(
+                fields=self.old_fields,
+                name=matching_index_name[0],
+            )
+        else:
+            from_model_state = from_state.models[app_label, self.model_name_lower]
+            old_index = from_model_state.get_index_by_name(self.old_name)
+
+        to_model_state = to_state.models[app_label, self.model_name_lower]
+        new_index = to_model_state.get_index_by_name(self.new_name)
+        schema_editor.rename_index(model, old_index, new_index)
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        if self.old_fields:
+            # Backward operation with unnamed index is a no-op.
+            return
+
+        self.new_name_lower, self.old_name_lower = (
+            self.old_name_lower,
+            self.new_name_lower,
+        )
+        self.new_name, self.old_name = self.old_name, self.new_name
+
+        self.database_forwards(app_label, schema_editor, from_state, to_state)
+
+[0010] assistant:
+The issue is in `database_backwards`. When `old_fields` is set (unnamed index), the backward operation is a no-op. But the problem is that after calling `database_backwards`, the `old_name` and `new_name` are swapped (for the non-old_fields case). For the `old_fields` case, there's no swap, but the issue is different.
+
+Wait, let me re-read. The backward operation for unnamed index returns early. But looking at the test case, the issue is about re-applying forwards after backwards.
+
+Let me look at the test more carefully.
+
+The test does:
+1. Forward: renames auto-generated index to "new_pony_test_idx"
+
+
+2. Backward: should restore old auto-generated name (but it's a no-op!)
+3. Forward again: tries to rename to "new_pony_test_idx" but it already exists
+
+So the problem is that `database_backwards` with `old_fields` is a no-op - it doesn't restore the old name. Then when `database_forwards` is called again, it finds the index already named "new_pony_test_idx" and tries to rename it to "new_pony_test_idx", which crashes. The backwards method needs to actually swap the names for the unnamed index case, just like it does for the named case.
+
+But hold on - the test expects zero queries during the backward operation, which suggests backwards really should be a no-op. So the real issue is that re-applying forwards shouldn't fail when the index already has the target name. Let me trace through what the test is actually checking.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "test_rename_index_unnamed_index" tests/migrations/test_operations.py</parameter>
+</function>
+
+[0011] tool:
+2964:    def test_rename_index_unnamed_index(self):
+
+[0012] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '2964,3010p' tests/migrations/test_operations.py</parameter>
+</function>
+
+[0013] tool:
+def test_rename_index_unnamed_index(self):
+        app_label = "test_rninui"
+        project_state = self.set_up_test_model(app_label, index_together=True)
+        table_name = app_label + "_pony"
+        self.assertIndexNameNotExists(table_name, "new_pony_test_idx")
+        operation = migrations.RenameIndex(
+            "Pony", new_name="new_pony_test_idx", old_fields=("weight", "pink")
+        )
+        self.assertEqual(
+            operation.describe(),
+            "Rename unnamed index for ('weight', 'pink') on Pony to new_pony_test_idx",
+        )
+        self.assertEqual(
+            operation.migration_name_fragment,
+            "rename_pony_weight_pink_new_pony_test_idx",
+        )
+
+        new_state = project_state.clone()
+        operation.state_forwards(app_label, new_state)
+        # Rename index.
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, project_state, new_state)
+        self.assertIndexNameExists(table_name, "new_pony_test_idx")
+        # Reverse is a no-op.
+        with connection.schema_editor() as editor, self.assertNumQueries(0):
+            operation.database_backwards(app_label, editor, new_state, project_state)
+        self.assertIndexNameExists(table_name, "new_pony_test_idx")
+        # Reapply, RenameIndex operation is a noop when the old and new name
+        # match.
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, new_state, project_state)
+        self.assertIndexNameExists(table_name, "new_pony_test_idx")
+        # Deconstruction.
+        definition = operation.deconstruct()
+        self.assertEqual(definition[0], "RenameIndex")
+        self.assertEqual(definition[1], [])
+        self.assertEqual(
+            definition[2],
+            {
+                "model_name": "Pony",
+                "new_name": "new_pony_test_idx",
+                "old_fields": ("weight", "pink"),
+            },
+        )
+
+    def test_rename_index_unknown_unnamed_index(self):
+        app_label = "test_rninuui"
+
+[0014] assistant:
+The test expects that after backwards (no-op), re-applying forwards should also be a no-op since the index is already named "new_pony_test_idx". 
+
+The issue is in `database_forwards`: when `old_fields` is set, it looks up the index by column names in the database. After the first forward, the index is named "new_pony_test_idx". After backwards (no-op), the index is still "new_pony_test_idx". When forwards is called again, it finds "new_pony_test_idx" as the matching index, then tries to rename it to "new_pony_test_idx" - which should be a no-op but apparently crashes on PostgreSQL.
+
+
+So I need to add a check in `database_forwards` that skips the rename operation if the found index already has the target name.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/migrations/operations/models.py</parameter>
+  <parameter=old_str>old_index = models.Index(
+                fields=self.old_fields,
+                name=matching_index_name[0],
+            )
+        else:</parameter>
+  <parameter=new_str>old_index = models.Index(
+                fields=self.old_fields,
+                name=matching_index_name[0],
+            )
+            if matching_index_name[0] == self.new_name:
+                return
+        else:</parameter>
+</function>
+
+[0015] tool:
+The file /testbed/django/db/migrations/operations/models.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/migrations/operations/models.py:
+   952	                        from_model._meta.db_table,
+   953	                        ", ".join(columns),
+   954	                    )
+   955	                )
+   956	            old_index = models.Index(
+   957	                fields=self.old_fields,
+   958	                name=matching_index_name[0],
+   959	            )
+   960	            if matching_index_name[0] == self.new_name:
+   961	                return
+   962	        else:
+   963	            from_model_state = from_state.models[app_label, self.model_name_lower]
+   964	            old_index = from_model_state.get_index_by_name(self.old_name)
+   965	
+   966	        to_model_state = to_state.models[app_label, self.model_name_lower]
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0016] assistant:
+Now let me also check what the test expects - the test passes `new_state` and `project_state` in a specific order for the re-apply:
+
+The test line: `operation.database_forwards(app_label, editor, new_state, project_state)` - wait, that's passing `new_state` as `from_state` and `project_state` as `to_state`. But `project_state` doesn't have the new index name... Let me look again.
+
+Actually wait, looking at the test again:
+```python
+# Reapply, RenameIndex operation is a noop when the old and new name match.
+with connection.schema_editor() as editor:
+    operation.database_forwards(app_label, editor, new_state, project_state)
+```
+
+Hmm, this passes `new_state` as from_state and `project_state` as to_state. But `project_state` doesn't have the renamed index... This seems like it would fail at `to_model_state.get_index_by_name(self.new_name)`. But with the `old_fields` path, we return early before reaching that line, so it's fine.
+
+Let me run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_operations.OperationTests.test_rename_index_unnamed_index 2>&1 | tail -20</parameter>
+</function>
+
+[0017] tool:
+Creating table auth_user
+    Creating table django_session
+    Creating table migrations_modelwithcustombase
+    Creating table migrations_unmigratedmodel
+    Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+System check identified no issues (0 silenced).
+test_rename_index_unnamed_index (migrations.test_operations.OperationTests) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.047s
+
+OK
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+Destroying test database for alias 'other' ('file:memorydb_other?mode=memory&cache=shared')...
+
+[0018] assistant:
+Now let me run the full test suite:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_operations 2>&1 | tail -30</parameter>
+</function>
+
+[0019] tool:
+test_run_sql_noop (migrations.test_operations.OperationTests)
+#24098 - Tests no-op RunSQL operations. ... ok
+test_run_sql_params (migrations.test_operations.OperationTests)
+#23426 - RunSQL should accept parameters. ... ok
+test_run_sql_params_invalid (migrations.test_operations.OperationTests)
+#23426 - RunSQL should fail when a list of statements with an incorrect ... ok
+test_separate_database_and_state (migrations.test_operations.OperationTests)
+Tests the SeparateDatabaseAndState operation. ... ok
+test_separate_database_and_state2 (migrations.test_operations.OperationTests)
+A complex SeparateDatabaseAndState operation: Multiple operations both ... ok
+test_smallfield_autofield_foreignfield_growth (migrations.test_operations.OperationTests)
+A field may be migrated from SmallAutoField to AutoField. ... ok
+test_smallfield_bigautofield_foreignfield_growth (migrations.test_operations.OperationTests)
+A field may be migrated from SmallAutoField to BigAutoField. ... ok
+test_add_field_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+Tests the AddField operation. ... ok
+test_create_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+The CreateTable operation ignores swapped models. ... ok
+test_delete_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+Tests the DeleteModel operation ignores swapped models. ... ok
+test_indexes_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+Add/RemoveIndex operations ignore swapped models. ... ok
+test_references_model_mixin (migrations.test_operations.TestCreateModel) ... ok
+
+----------------------------------------------------------------------
+Ran 130 tests in 1.722s
+
+OK (skipped=1)
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+Destroying test database for alias 'other' ('file:memorydb_other?mode=memory&cache=shared')...
+
+[0020] assistant:
+All 130 tests pass.
+
+<function=submit>
+  <parameter=answer>The fix is in `database_forwards` of `RenameIndex` in `/testbed/django/db/migrations/operations/models.py`. When `old_fields` is set and the matching index already has the target name (`self.new_name`), we skip the rename operation (return early). This handles the case where backwards is a no-op (for unnamed indexes) and then forwards is re-applied - since the index already has the new name, trying to rename it to the same name would crash on some databases like PostgreSQL.</parameter>
+</function>
+
+[0021] tool:
+The fix is in `database_forwards` of `RenameIndex` in `/testbed/django/db/migrations/operations/models.py`. When `old_fields` is set and the matching index already has the target name (`self.new_name`), we skip the rename operation (return early). This handles the case where backwards is a no-op (for unnamed indexes) and then forwards is re-applied - since the index already has the new name, trying to rename it to the same name would crash on some databases like PostgreSQL.

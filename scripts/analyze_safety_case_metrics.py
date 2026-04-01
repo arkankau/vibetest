@@ -39,8 +39,9 @@ METHOD_COLORS = {
     "Meerkat + Max Merge": "#005B8E",
     "Meerkat (Codex)": "#009E73",
     "Meerkat (Claude)": "#E69F00",
+    "Bayesian": "#CC79A7",
+    "Buffer": "#009E73",
     "Naive Agent": "#CC79A7",
-    "Naive Agent + Max Merge": "#9A4F83",
     "Per-trace Monitor": "#D55E00",
 }
 METHOD_MARKERS = {
@@ -48,8 +49,9 @@ METHOD_MARKERS = {
     "Meerkat + Max Merge": "D",
     "Meerkat (Codex)": "D",
     "Meerkat (Claude)": "P",
+    "Bayesian": "X",
+    "Buffer": "^",
     "Naive Agent": "^",
-    "Naive Agent + Max Merge": "v",
     "Per-trace Monitor": "s",
 }
 MODEL_COLORS = {
@@ -77,6 +79,24 @@ TRACE_SCORE_DATASET_LABELS = {
     "impossiblebench_claude-opus-4.6": "ImpossibleBench",
     "mle-sabotage": "MLE-Sabotage",
     "trace-dataset": "TRACE",
+}
+DM_REFERENCE_METHOD_ORDER = ["Meerkat", "Per-trace Monitor", "Bayesian", "Buffer", "Naive Agent"]
+DM_REFERENCE_METHOD_COLORS = {
+    "Meerkat": "#D55E00",
+    "Per-trace Monitor": "#CC79A7",
+    "Bayesian": "#0072B2",
+    "Buffer": "#009E73",
+    "Naive Agent": "#666666",
+}
+DM_REFERENCE_METHOD_LINESTYLES: dict[str, Any] = {
+    "Meerkat": "-",
+    "Per-trace Monitor": "-.",
+    "Bayesian": ":",
+    "Buffer": "--",
+    "Naive Agent": (0, (5, 1.4)),
+}
+DM_REFERENCE_LEGEND_LABELS = {
+    "Per-trace Monitor": "Monitor",
 }
 
 
@@ -374,6 +394,30 @@ def _bootstrap_flat_roc_auc_ci(
     low_idx = max(0, min(len(vals) - 1, int(alpha * len(vals))))
     high_idx = max(0, min(len(vals) - 1, int((1.0 - alpha) * len(vals)) - 1))
     return auc, vals[low_idx], vals[high_idx]
+
+
+def _bootstrap_flat_metric_se(
+    pairs: list[tuple[int, float]],
+    metric_fn,
+    *,
+    n_resamples: int = 1000,
+    seed: int = 0,
+) -> float | None:
+    if not pairs:
+        return None
+    if len(pairs) == 1:
+        return 0.0
+    rng = random.Random(seed)
+    values: list[float] = []
+    n = len(pairs)
+    for _ in range(n_resamples):
+        sample = [pairs[rng.randrange(n)] for _ in range(n)]
+        metric_value = metric_fn(sample)
+        if metric_value is not None:
+            values.append(float(metric_value))
+    if not values:
+        return None
+    return _bootstrap_mean_se(values, n_resamples=n_resamples, seed=seed + 1)
 
 
 def _precision_recall_at_threshold(pairs: list[tuple[int, float]], threshold: float) -> tuple[float, float] | None:
@@ -1072,6 +1116,14 @@ def _strip_method_variant(method: str) -> tuple[str, str | None]:
 
 def _split_method_parts(method: str) -> tuple[str, str | None]:
     method = str(method or "").strip()
+    if method.startswith("buffer-"):
+        return "buffer", method[len("buffer-") :] if len(method) > len("buffer-") else None
+    if method == "buffer":
+        return "buffer", None
+    if method.startswith("bayesian-"):
+        return "bayesian", method[len("bayesian-") :] if len(method) > len("bayesian-") else None
+    if method == "bayesian":
+        return "bayesian", None
     if method.startswith("AT-codex-"):
         return "AT-codex", method[len("AT-codex-") :] if len(method) > len("AT-codex-") else None
     if method == "AT-codex":
@@ -1147,6 +1199,14 @@ def _pretty_method(
         if model:
             return f"{family_name} ({model})"
         return family_name
+    family_name = _presentation_method_label(
+        method_base=family,
+        dataset_variant=dataset_variant,
+        method_variant=method_variant,
+    )
+    if model:
+        return f"{family_name} ({model})"
+    return family_name
 
 
 def _presentation_method_label(
@@ -1168,6 +1228,10 @@ def _presentation_method_label(
         return "Meerkat (Codex)"
     if base == "AT-claude":
         return "Meerkat (Claude)"
+    if base == "buffer":
+        return "Buffer"
+    if base == "bayesian":
+        return "Bayesian"
     if base == "AT":
         return "Meerkat"
     return str(method_base or "Unknown").strip() or "Unknown"
@@ -1349,6 +1413,22 @@ def _row_trace_score_pairs(row: dict[str, Any], *, max_merge: bool = False) -> l
     return pairs
 
 
+def _analysis_row_uses_max_merge(row: dict[str, Any]) -> bool:
+    if str(row.get("score_mode") or "").strip() != "max-merge":
+        return False
+    method_base = str(
+        row.get("method_base")
+        or row.get("method_base_override")
+        or ""
+    ).strip()
+    method_variant = str(
+        row.get("method_variant")
+        or row.get("method_variant_override")
+        or ""
+    ).strip()
+    return method_base == "AT" and method_variant != "no-tools"
+
+
 def _row_case_score_pair(row: dict[str, Any], *, max_merge: bool = False) -> tuple[int, float] | None:
     if max_merge:
         trace_scores = _row_trace_scores(row, max_merge=True)
@@ -1480,7 +1560,7 @@ def _update_metric_row(metric: dict[str, Any], row: dict[str, Any], *, fallback_
         metric["trace_case_recall_sum"] += case_trace_recall
         metric["trace_case_f1_sum"] += case_trace_f1
         metric["_trace_case_f1_pos_values"].append(case_trace_f1)
-    use_max_merge_scores = str(metric.get("score_mode") or "") == "max-merge"
+    use_max_merge_scores = _analysis_row_uses_max_merge(metric)
     trace_score_pairs = _row_trace_score_pairs(row, max_merge=use_max_merge_scores)
     if trace_score_pairs:
         metric["_trace_score_cases"].append(trace_score_pairs)
@@ -1610,6 +1690,8 @@ def _finalize_metric_row(metric: dict[str, Any]) -> dict[str, Any]:
     trace_average_precision, trace_ap_low, trace_ap_high = _bootstrap_average_precision_ci(trace_score_cases)
     trace_ap_values = [_average_precision_from_pairs(case) for case in trace_score_cases]
     trace_ap_values = [float(value) for value in trace_ap_values if value is not None]
+    trace_auc_values = [_roc_auc_from_pairs(case) for case in trace_score_cases]
+    trace_auc_values = [float(value) for value in trace_auc_values if value is not None]
     out["trace_average_precision"] = trace_average_precision
     out["trace_average_precision_ci_low"] = trace_ap_low
     out["trace_average_precision_ci_high"] = trace_ap_high
@@ -1618,15 +1700,24 @@ def _finalize_metric_row(metric: dict[str, Any]) -> dict[str, Any]:
     out["trace_roc_auc"] = trace_roc_auc
     out["trace_roc_auc_ci_low"] = trace_roc_low
     out["trace_roc_auc_ci_high"] = trace_roc_high
+    out["trace_roc_auc_bootstrap_se"] = _bootstrap_mean_se(trace_auc_values)
     case_score_pairs = [tuple(pair) for pair in metric.get("_case_score_pairs") or []]
     case_average_precision, case_ap_low, case_ap_high = _bootstrap_flat_average_precision_ci(case_score_pairs)
     out["case_average_precision"] = case_average_precision
     out["case_average_precision_ci_low"] = case_ap_low
     out["case_average_precision_ci_high"] = case_ap_high
+    out["case_average_precision_bootstrap_se"] = _bootstrap_flat_metric_se(
+        case_score_pairs,
+        _average_precision_flat_pairs,
+    )
     case_roc_auc, case_roc_low, case_roc_high = _bootstrap_flat_roc_auc_ci(case_score_pairs)
     out["case_roc_auc"] = case_roc_auc
     out["case_roc_auc_ci_low"] = case_roc_low
     out["case_roc_auc_ci_high"] = case_roc_high
+    out["case_roc_auc_bootstrap_se"] = _bootstrap_flat_metric_se(
+        case_score_pairs,
+        _roc_auc_from_pairs,
+    )
 
     out["avg_total_tokens_per_case"] = _safe_ratio(int(metric["total_tokens"]), total)
     avg_cost = (float(metric["total_cost_usd"]) / total) if total > 0 and metric.get("has_cost") else None
@@ -1688,17 +1779,7 @@ def _collect_metrics(
     )
     by_case_size: dict[str, dict[str, Any]] = {}
     by_positive_pct: dict[str, dict[str, Any]] = {}
-    include_max_merge = (
-        method_base == "AT"
-        and effective_variant in {"", "no-tools"}
-        and not use_default_max_merge
-    )
-    max_variant_override: str | None = None
-    if include_max_merge:
-        if effective_variant == "no-tools":
-            max_variant_override = "no-tools-max-merge"
-        else:
-            max_variant_override = "max-merge"
+    include_max_merge = method_base == "AT" and effective_variant == "" and not use_default_max_merge
     overall_max = (
         _init_metric_row(
             f"{label}-max-merge",
@@ -1706,7 +1787,7 @@ def _collect_metrics(
             "overall",
             score_mode="max-merge",
             method_base_override=method_base,
-            method_variant_override=max_variant_override,
+            method_variant_override="max-merge",
         )
         if include_max_merge
         else None
@@ -1739,7 +1820,7 @@ def _collect_metrics(
                     case_key,
                     score_mode="max-merge",
                     method_base_override=method_base,
-                    method_variant_override=max_variant_override,
+                    method_variant_override="max-merge",
                 )
             _update_metric_row(by_case_size_max[case_key], row, fallback_model=fallback_model)
 
@@ -1767,7 +1848,7 @@ def _collect_metrics(
                     pct_key,
                     score_mode="max-merge",
                     method_base_override=method_base,
-                    method_variant_override=max_variant_override,
+                    method_variant_override="max-merge",
                 )
             _update_metric_row(by_positive_pct_max[pct_key], row, fallback_model=fallback_model)
 
@@ -1887,7 +1968,9 @@ def _include_in_paper_outputs(row: dict[str, Any]) -> bool:
     method_variant = str(row.get("method_variant") or "").strip()
     if method_base == "llmjudge":
         return True
-    if method_base == "AT" and method_variant in {"", "no-tools", "max-merge"}:
+    if method_base == "AT" and method_variant in {"", "no-tools"}:
+        return True
+    if method_base in {"buffer", "bayesian"}:
         return True
     return False
 
@@ -1901,8 +1984,12 @@ def _paper_method_rank(row: dict[str, Any]) -> int:
         return 1
     if method_base == "AT" and method_variant == "max-merge":
         return 2
-    if method_base == "AT" and method_variant == "no-tools":
+    if method_base == "bayesian":
         return 3
+    if method_base == "buffer":
+        return 4
+    if method_base == "AT" and method_variant == "no-tools":
+        return 5
     return 99
 
 
@@ -1975,7 +2062,7 @@ def _paper_latex_delta(meerkat: float | None, baselines: list[float | None]) -> 
     return f"{delta:+.3f}"
 
 
-def _write_safety_trace_ap_tables(case_rows: list[dict[str, Any]], output_dir: Path) -> list[Path]:
+def _write_safety_metric_tables(case_rows: list[dict[str, Any]], output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     for row in case_rows:
@@ -1984,140 +2071,189 @@ def _write_safety_trace_ap_tables(case_rows: list[dict[str, Any]], output_dir: P
         file_path = str(row.get("file") or "")
         dataset_name, method_name = _infer_dataset_and_method_from_file(file_path)
         dataset_base, dataset_variant = _split_dataset_variant(dataset_name)
-        method_name, stripped_method_variant = _strip_method_variant(method_name)
-        method_base, method_model = _split_method_parts(method_name)
-        effective_variant = str(stripped_method_variant or dataset_variant or "").strip()
+        inferred_method_name, inferred_method_variant = _strip_method_variant(method_name)
+        inferred_method_base, inferred_method_model = _split_method_parts(inferred_method_name)
+        method_base = str(row.get("method_base_override") or inferred_method_base or "").strip()
+        method_variant = str(row.get("method_variant_override") or inferred_method_variant or dataset_variant or "").strip()
+        method_model = _display_model_name(
+            str(row.get("method_model") or inferred_method_model or "").strip()
+        )
         synthesized = dict(row)
         synthesized["dataset"] = dataset_base
         synthesized["dataset_variant"] = dataset_variant
         synthesized["method_base"] = method_base
-        synthesized["method_variant"] = effective_variant
-        synthesized["method_model"] = _display_model_name(method_model or "")
+        synthesized["method_variant"] = method_variant
+        synthesized["method_model"] = method_model
         if _include_in_paper_outputs(synthesized):
             rows.append(synthesized)
     if not rows:
         return []
 
-    grouped: dict[tuple[str, int, str], dict[str, tuple[float | None, float | None]]] = {}
-    for row in rows:
-        dataset = str(row.get("dataset") or "")
-        tpc = int(str(row.get("group") or "0"))
-        model = _display_model_name(str(row.get("method_model") or "")) or ""
-        method_label = _presentation_method_label(
-            method_base=str(row.get("method_base") or ""),
-            dataset_variant=str(row.get("dataset_variant") or ""),
-            method_variant=str(row.get("method_variant") or ""),
-        )
-        grouped.setdefault((dataset, tpc, model), {})[method_label] = (
-            _to_float(row.get("trace_average_precision")),
-            _to_float(row.get("trace_average_precision_bootstrap_se")),
-        )
-
     dataset_order = ["trace-dataset", "impossiblebench_claude-opus-4.6"]
     model_order = ["Qwen-3.5", "gpt-5.4-mini", "GLM-5"]
     tpc_order = [10, 25, 50, 100]
-    method_order = ["Meerkat", "Per-trace Monitor", "Naive Agent"]
-
-    md_lines = [
-        "# Safety Trace AP Table",
-        "",
-        "| Domain | TPC | Model | Meerkat | Monitor | Naive Agent | Delta |",
-        "|---|---:|---|---:|---:|---:|---:|",
+    method_order = ["Meerkat", "Per-trace Monitor", "Bayesian", "Buffer", "Naive Agent"]
+    table_specs = [
+        (
+            "trace_average_precision",
+            "trace_average_precision_bootstrap_se",
+            "Safety Trace AP Table",
+            "Trace-level average precision",
+            "safety_paper_trace_ap_table",
+            "tab:safety-trace-ap",
+        ),
+        (
+            "case_average_precision",
+            "case_average_precision_bootstrap_se",
+            "Safety Case AP Table",
+            "Case-level average precision",
+            "safety_paper_case_ap_table",
+            "tab:safety-case-ap",
+        ),
+        (
+            "trace_roc_auc",
+            "trace_roc_auc_bootstrap_se",
+            "Safety Trace ROC-AUC Table",
+            "Trace-level ROC-AUC",
+            "safety_paper_trace_rocauc_table",
+            "tab:safety-trace-rocauc",
+        ),
+        (
+            "case_roc_auc",
+            "case_roc_auc_bootstrap_se",
+            "Safety Case ROC-AUC Table",
+            "Case-level ROC-AUC",
+            "safety_paper_case_rocauc_table",
+            "tab:safety-case-rocauc",
+        ),
     ]
 
-    tex_lines = [
-        "% Auto-generated by scripts/analyze_safety_case_metrics.py",
-        r"\begin{table*}[t]",
-        r"  \centering",
-        r"  \small",
-        r"  % \setlength{\tabcolsep}{3.5pt}",
-        r"  % \renewcommand{\arraystretch}{0.95}",
-        r"  \caption{Trace-level average precision across safety corpora by traces per case. Higher is better. $\Delta$ is Meerkat minus the strongest baseline.}",
-        r"  \label{tab:safety-trace-ap}",
-        r"  \begin{tabular}{@{}lllrrrr@{}}",
-        r"    \toprule",
-        r"    \multirow{2}{*}{Domain} & \multirow{2}{*}{TPC} & \multirow{2}{*}{Model}",
-        r"      & \multicolumn{3}{c}{Method} & \multirow{2}{*}{$\Delta$} \\",
-        r"    \cmidrule(lr){4-6}",
-        r"      & & & Meerkat & Monitor & Naive Agent & \\",
-        r"    \midrule",
-    ]
+    output_paths: list[Path] = []
+    for metric_key, se_key, md_title, caption_metric, stem, latex_label in table_specs:
+        grouped: dict[tuple[str, int, str], dict[str, tuple[float | None, float | None]]] = {}
+        for row in rows:
+            dataset = str(row.get("dataset") or "")
+            tpc = int(str(row.get("group") or "0"))
+            model = _display_model_name(str(row.get("method_model") or "")) or ""
+            method_label = _presentation_method_label(
+                method_base=str(row.get("method_base") or ""),
+                dataset_variant=str(row.get("dataset_variant") or ""),
+                method_variant=str(row.get("method_variant") or ""),
+            )
+            grouped.setdefault((dataset, tpc, model), {})[method_label] = (
+                _to_float(row.get(metric_key)),
+                _to_float(row.get(se_key)),
+            )
 
-    tex_domain_chunks: list[str] = []
-    for dataset in dataset_order:
-        dataset_rows: list[str] = []
-        present_tpcs = [tpc for tpc in tpc_order if any((dataset, tpc, model) in grouped for model in model_order)]
-        if not present_tpcs:
-            continue
-        domain_label = TRACE_SCORE_DATASET_LABELS.get(dataset, dataset)
-        domain_row_count = sum(1 for tpc in present_tpcs for model in model_order if (dataset, tpc, model) in grouped)
-        domain_printed = False
-        for tpc_idx, tpc in enumerate(present_tpcs):
-            present_models = [model for model in model_order if (dataset, tpc, model) in grouped]
-            if not present_models:
+        md_lines = [
+            f"# {md_title}",
+            "",
+            "| Domain | TPC | Model | Meerkat | Monitor | Bayesian | Buffer | Naive Agent | Delta |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        tex_lines = [
+            "% Auto-generated by scripts/analyze_safety_case_metrics.py",
+            r"\begin{table*}[t]",
+            r"  \centering",
+            r"  \small",
+            r"  % \setlength{\tabcolsep}{3.5pt}",
+            r"  % \renewcommand{\arraystretch}{0.95}",
+            rf"  \caption{{{caption_metric} across safety corpora by traces per case. Higher is better. $\Delta$ is Meerkat minus the strongest baseline.}}",
+            rf"  \label{{{latex_label}}}",
+            r"  \begin{tabular}{@{}lllrrrrrr@{}}",
+            r"    \toprule",
+            r"    \multirow{2}{*}{Domain} & \multirow{2}{*}{TPC} & \multirow{2}{*}{Model}",
+            r"      & \multicolumn{5}{c}{Method} & \multirow{2}{*}{$\Delta$} \\",
+            r"    \cmidrule(lr){4-8}",
+            r"      & & & Meerkat & Monitor & Bayesian & Buffer & Naive Agent & \\",
+            r"    \midrule",
+        ]
+
+        tex_domain_chunks: list[str] = []
+        for dataset in dataset_order:
+            dataset_rows: list[str] = []
+            present_tpcs = [tpc for tpc in tpc_order if any((dataset, tpc, model) in grouped for model in model_order)]
+            if not present_tpcs:
                 continue
-            for model_idx, model in enumerate(present_models):
-                values = grouped[(dataset, tpc, model)]
-                model_cells = {name: values.get(name, (None, None)) for name in method_order}
-                numeric_values = {name: pair[0] for name, pair in model_cells.items() if pair[0] is not None}
-                max_value = max(numeric_values.values()) if numeric_values else None
-                monitor_value = model_cells["Per-trace Monitor"][0]
-                naive_value = model_cells["Naive Agent"][0]
-                meerkat_value = model_cells["Meerkat"][0]
-                delta_text = _paper_latex_delta(meerkat_value, [monitor_value, naive_value])
-                if not domain_printed:
-                    prefix = rf"    \multirow{{{domain_row_count}}}{{*}}{{{domain_label}}}"
-                    domain_printed = True
-                else:
-                    prefix = "    "
-                if model_idx == 0:
-                    tpc_prefix = rf" & \multirow{{{len(present_models)}}}{{*}}{{{tpc}}}"
-                else:
-                    tpc_prefix = " &"
-                model_label = _paper_short_model_label(model)
-                cells = [
-                    _paper_latex_result_cell(*model_cells["Meerkat"], best=(max_value is not None and model_cells["Meerkat"][0] == max_value)),
-                    _paper_latex_result_cell(*model_cells["Per-trace Monitor"], best=(max_value is not None and model_cells["Per-trace Monitor"][0] == max_value)),
-                    _paper_latex_result_cell(*model_cells["Naive Agent"], best=(max_value is not None and model_cells["Naive Agent"][0] == max_value)),
-                ]
-                dataset_rows.append(f"{prefix}{tpc_prefix} & {model_label} & {cells[0]} & {cells[1]} & {cells[2]} & {delta_text} \\\\")
-                md_delta = "na" if delta_text == r"\na" else delta_text
-                def _fmt_md(pair: tuple[float | None, float | None], best: bool) -> str:
-                    value, se = pair
-                    if value is None:
-                        return "na"
-                    text = f"{value:.3f} +/- {(0.0 if se is None else se):.3f}"
-                    return f"**{text}**" if best else text
-                md_lines.append(
-                    "| "
-                    + " | ".join(
-                        [
-                            domain_label,
-                            str(tpc),
-                            model_label,
-                            _fmt_md(model_cells["Meerkat"], max_value is not None and model_cells["Meerkat"][0] == max_value),
-                            _fmt_md(model_cells["Per-trace Monitor"], max_value is not None and model_cells["Per-trace Monitor"][0] == max_value),
-                            _fmt_md(model_cells["Naive Agent"], max_value is not None and model_cells["Naive Agent"][0] == max_value),
-                            md_delta,
-                        ]
+            domain_label = TRACE_SCORE_DATASET_LABELS.get(dataset, dataset)
+            domain_row_count = sum(1 for tpc in present_tpcs for model in model_order if (dataset, tpc, model) in grouped)
+            domain_printed = False
+            for tpc_idx, tpc in enumerate(present_tpcs):
+                present_models = [model for model in model_order if (dataset, tpc, model) in grouped]
+                if not present_models:
+                    continue
+                for model_idx, model in enumerate(present_models):
+                    values = grouped[(dataset, tpc, model)]
+                    model_cells = {name: values.get(name, (None, None)) for name in method_order}
+                    numeric_values = {name: pair[0] for name, pair in model_cells.items() if pair[0] is not None}
+                    max_value = max(numeric_values.values()) if numeric_values else None
+                    monitor_value = model_cells["Per-trace Monitor"][0]
+                    bayesian_value = model_cells["Bayesian"][0]
+                    buffer_value = model_cells["Buffer"][0]
+                    naive_value = model_cells["Naive Agent"][0]
+                    meerkat_value = model_cells["Meerkat"][0]
+                    delta_text = _paper_latex_delta(meerkat_value, [monitor_value, bayesian_value, buffer_value, naive_value])
+                    if not domain_printed:
+                        prefix = rf"    \multirow{{{domain_row_count}}}{{*}}{{{domain_label}}}"
+                        domain_printed = True
+                    else:
+                        prefix = "    "
+                    if model_idx == 0:
+                        tpc_prefix = rf" & \multirow{{{len(present_models)}}}{{*}}{{{tpc}}}"
+                    else:
+                        tpc_prefix = " &"
+                    model_label = _paper_short_model_label(model)
+                    cells = [
+                        _paper_latex_result_cell(*model_cells["Meerkat"], best=(max_value is not None and model_cells["Meerkat"][0] == max_value)),
+                        _paper_latex_result_cell(*model_cells["Per-trace Monitor"], best=(max_value is not None and model_cells["Per-trace Monitor"][0] == max_value)),
+                        _paper_latex_result_cell(*model_cells["Bayesian"], best=(max_value is not None and model_cells["Bayesian"][0] == max_value)),
+                        _paper_latex_result_cell(*model_cells["Buffer"], best=(max_value is not None and model_cells["Buffer"][0] == max_value)),
+                        _paper_latex_result_cell(*model_cells["Naive Agent"], best=(max_value is not None and model_cells["Naive Agent"][0] == max_value)),
+                    ]
+                    dataset_rows.append(f"{prefix}{tpc_prefix} & {model_label} & {cells[0]} & {cells[1]} & {cells[2]} & {cells[3]} & {cells[4]} & {delta_text} \\\\")
+                    md_delta = "na" if delta_text == r"\na" else delta_text
+
+                    def _fmt_md(pair: tuple[float | None, float | None], best: bool) -> str:
+                        value, se = pair
+                        if value is None:
+                            return "na"
+                        text = f"{value:.3f} +/- {(0.0 if se is None else se):.3f}"
+                        return f"**{text}**" if best else text
+
+                    md_lines.append(
+                        "| "
+                        + " | ".join(
+                            [
+                                domain_label,
+                                str(tpc),
+                                model_label,
+                                _fmt_md(model_cells["Meerkat"], max_value is not None and model_cells["Meerkat"][0] == max_value),
+                                _fmt_md(model_cells["Per-trace Monitor"], max_value is not None and model_cells["Per-trace Monitor"][0] == max_value),
+                                _fmt_md(model_cells["Bayesian"], max_value is not None and model_cells["Bayesian"][0] == max_value),
+                                _fmt_md(model_cells["Buffer"], max_value is not None and model_cells["Buffer"][0] == max_value),
+                                _fmt_md(model_cells["Naive Agent"], max_value is not None and model_cells["Naive Agent"][0] == max_value),
+                                md_delta,
+                            ]
+                        )
+                        + " |"
                     )
-                    + " |"
-                )
-            if tpc_idx != len(present_tpcs) - 1:
-                dataset_rows.append(r"    \cmidrule(lr){2-7}")
-        tex_domain_chunks.extend(dataset_rows)
-        tex_domain_chunks.append(r"    \midrule")
+                if tpc_idx != len(present_tpcs) - 1:
+                    dataset_rows.append(r"    \cmidrule(lr){2-9}")
+            tex_domain_chunks.extend(dataset_rows)
+            tex_domain_chunks.append(r"    \midrule")
 
-    if tex_domain_chunks and tex_domain_chunks[-1] == r"    \midrule":
-        tex_domain_chunks.pop()
-    tex_lines.extend(tex_domain_chunks)
-    tex_lines.extend([r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"])
+        if tex_domain_chunks and tex_domain_chunks[-1] == r"    \midrule":
+            tex_domain_chunks.pop()
+        tex_lines.extend(tex_domain_chunks)
+        tex_lines.extend([r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"])
 
-    md_path = output_dir / "safety_paper_trace_ap_table.md"
-    tex_path = output_dir / "safety_paper_trace_ap_table.tex"
-    md_path.write_text("\n".join(md_lines).rstrip() + "\n")
-    tex_path.write_text("\n".join(tex_lines).rstrip() + "\n")
-    return [md_path, tex_path]
+        md_path = output_dir / f"{stem}.md"
+        tex_path = output_dir / f"{stem}.tex"
+        md_path.write_text("\n".join(md_lines).rstrip() + "\n")
+        tex_path.write_text("\n".join(tex_lines).rstrip() + "\n")
+        output_paths.extend([md_path, tex_path])
+
+    return output_paths
 
 
 def _slug(text: str) -> str:
@@ -2140,6 +2276,10 @@ def _infer_dataset_and_method_from_file(file_path: str) -> tuple[str, str]:
     if name.startswith("safety_"):
         name = name[len("safety_") :]
 
+    for marker in ("_buffer-", "_bayesian-", "_AT-", "_llmjudge-"):
+        if marker in name:
+            idx = name.rfind(marker)
+            return name[:idx], name[idx + 1 :]
     if "_AT-" in name:
         idx = name.rfind("_AT-")
         return name[:idx], name[idx + 1 :]
@@ -2252,8 +2392,6 @@ def _method_variant_marker(method_base: str | None, method_variant: str | None) 
         return "s"
     if variant == "max-merge":
         return "D"
-    if variant == "no-tools-max-merge":
-        return "v"
     if variant == "no-tools":
         return "^"
     if base == "AT-codex":
@@ -2270,7 +2408,7 @@ def _method_variant_linestyle(method_base: str | None, method_variant: str | Non
     variant = str(method_variant or "").strip()
     if base == "llmjudge":
         return "--"
-    if variant in {"max-merge", "no-tools-max-merge"}:
+    if variant == "max-merge":
         return "-."
     if variant == "no-tools":
         return ":"
@@ -2292,8 +2430,6 @@ def _method_fill_color(
         return _lighten_color(color, amount=0.18)
     if str(method_variant or "").strip() == "max-merge":
         return _darken_color(color, amount=0.18)
-    if str(method_variant or "").strip() == "no-tools-max-merge":
-        return _darken_color(_lighten_color(color, amount=0.38), amount=0.15)
     if str(method_variant or "").strip() == "no-tools":
         return _lighten_color(color, amount=0.38)
     return color
@@ -2482,7 +2618,6 @@ def _line_plot(
             "Meerkat",
             "Meerkat + Max Merge",
             "Naive Agent",
-            "Naive Agent + Max Merge",
             "Per-trace Monitor",
         }:
             continue
@@ -3527,7 +3662,7 @@ def _overall_ap_by_model_plot(
         for row in rows
         if str(row.get("dataset") or "") == dataset
         and _include_in_paper_outputs(row)
-        and str(row.get("method_variant") or "").strip() not in {"max-merge", "no-tools-max-merge"}
+        and str(row.get("method_variant") or "").strip() != "max-merge"
     ]
     if not plot_rows:
         return []
@@ -3682,7 +3817,7 @@ def _macro_f1_by_dataset_plot(
         for row in grouped_rows
         if str(row.get("dataset") or "") in TRACE_SCORE_DATASET_LABELS
         and _include_in_paper_outputs(row)
-        and str(row.get("method_variant") or "").strip() not in {"max-merge", "no-tools-max-merge"}
+        and str(row.get("method_variant") or "").strip() != "max-merge"
     ]
     if not plot_rows:
         return []
@@ -3898,14 +4033,14 @@ def _pr_curve_grid_by_case_size_plot(
                 file_path = Path(str(row.get("file") or "")).expanduser()
                 if not file_path.is_file():
                     continue
-                score_mode = str(row.get("score_mode") or "")
+                use_max_merge = _analysis_row_uses_max_merge(row)
                 source_rows = [
                     source_row
                     for source_row in _load_rows(file_path)
                     if _to_int(source_row.get("traces_per_case")) == case_size
                 ]
                 case_pairs = [
-                    _row_trace_score_pairs(source_row, max_merge=(score_mode == "max-merge"))
+                    _row_trace_score_pairs(source_row, max_merge=use_max_merge)
                     for source_row in source_rows
                 ]
                 case_pairs = [pairs for pairs in case_pairs if _average_precision_from_pairs(pairs) is not None]
@@ -3993,6 +4128,221 @@ def _pr_curve_grid_by_case_size_plot(
     for ext in formats:
         out_path = out_base.with_suffix(f".{ext}")
         fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
+        out_paths.append(out_path)
+    plt.close(fig)
+    return out_paths
+
+
+def _impossiblebench_combined_pr_curves_plot(
+    *,
+    rows: list[dict[str, Any]],
+    out_base: Path,
+    formats: list[str],
+    n_bootstrap: int = 100,
+) -> list[Path]:
+    plot_rows: list[dict[str, Any]] = []
+    for row in rows:
+        file_path = Path(str(row.get("file") or "")).expanduser()
+        dataset_name = str(row.get("dataset") or "").strip()
+        dataset_variant = str(row.get("dataset_variant") or "").strip()
+        method_base = str(row.get("method_base") or "").strip()
+        method_model = str(row.get("method_model") or "").strip()
+        method_variant = str(row.get("method_variant") or "").strip()
+        method_label = str(row.get("method_label") or "").strip()
+        if file_path:
+            inferred_dataset, inferred_method = _infer_dataset_and_method_from_file(str(file_path))
+            if not dataset_name:
+                dataset_name = inferred_dataset
+            inferred_dataset_base, inferred_dataset_variant = _split_dataset_variant(dataset_name or inferred_dataset)
+            if not dataset_name:
+                dataset_name = inferred_dataset_base
+            if not dataset_variant:
+                dataset_variant = str(inferred_dataset_variant or "")
+            inferred_method, stripped_method_variant = _strip_method_variant(inferred_method)
+            inferred_base, inferred_model = _split_method_parts(inferred_method)
+            if not method_base:
+                method_base = inferred_base
+            if not method_model:
+                method_model = inferred_model
+            if not method_variant:
+                method_variant = str(stripped_method_variant or dataset_variant or "")
+            if not method_label:
+                method_label = _presentation_method_label(
+                    method_base=method_base,
+                    dataset_variant=dataset_variant,
+                    method_variant=method_variant,
+                )
+        dataset_name, split_dataset_variant = _split_dataset_variant(dataset_name)
+        if not dataset_variant and split_dataset_variant:
+            dataset_variant = split_dataset_variant
+        if dataset_name != "impossiblebench_claude-opus-4.6":
+            continue
+        if not str(row.get("group") or "").isdigit():
+            continue
+        pretty_label = _presentation_method_label(
+            method_base=method_base,
+            dataset_variant=dataset_variant,
+            method_variant=method_variant,
+        )
+        if pretty_label not in DM_REFERENCE_METHOD_ORDER:
+            continue
+        normalized_row = dict(row)
+        normalized_row["dataset"] = dataset_name
+        normalized_row["dataset_variant"] = dataset_variant
+        normalized_row["method_base"] = method_base
+        normalized_row["method_model"] = method_model
+        normalized_row["method_variant"] = method_variant
+        normalized_row["method_label"] = pretty_label
+        plot_rows.append(normalized_row)
+    if not plot_rows:
+        return []
+
+    allowed_models = ["gpt-5.4-mini", "Qwen-3.5"]
+    allowed_case_sizes = [10, 25, 50, 100]
+    filtered_rows: list[dict[str, Any]] = []
+    for row in plot_rows:
+        model_name = _display_model_name(str(row.get("method_model") or ""))
+        case_size = _to_int(row.get("group"))
+        if model_name not in allowed_models or case_size not in allowed_case_sizes:
+            continue
+        filtered_rows.append(row)
+    if not filtered_rows:
+        return []
+
+    row_lookup = {
+        (
+            str(row.get("method_label") or ""),
+            _display_model_name(str(row.get("method_model") or "")) or "",
+            _to_int(row.get("group")),
+        ): row
+        for row in filtered_rows
+    }
+    method_labels = [label for label in DM_REFERENCE_METHOD_ORDER if any(str(row.get("method_label") or "") == label for row in filtered_rows)]
+    if not method_labels:
+        return []
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ImportError:
+        print("Skipping figure generation: matplotlib is not installed.")
+        return []
+
+    _apply_publication_style(plt)
+    fig = plt.figure(figsize=(5.55, 2.95))
+    grid = fig.add_gridspec(2, 4, hspace=0.34, wspace=0.22)
+    axes = {
+        ("gpt-5.4-mini", 10): fig.add_subplot(grid[0, 0]),
+        ("gpt-5.4-mini", 25): fig.add_subplot(grid[0, 1]),
+        ("gpt-5.4-mini", 50): fig.add_subplot(grid[0, 2]),
+        ("gpt-5.4-mini", 100): fig.add_subplot(grid[0, 3]),
+        ("Qwen-3.5", 10): fig.add_subplot(grid[1, 0]),
+        ("Qwen-3.5", 25): fig.add_subplot(grid[1, 1]),
+        ("Qwen-3.5", 50): fig.add_subplot(grid[1, 2]),
+        ("Qwen-3.5", 100): fig.add_subplot(grid[1, 3]),
+    }
+    method_layer_order = (
+        ["Naive Agent"]
+        + [label for label in DM_REFERENCE_METHOD_ORDER if label not in {"Naive Agent", "Meerkat"}]
+        + ["Meerkat"]
+    )
+    method_zorder = {label: idx for idx, label in enumerate(method_layer_order, start=1)}
+
+    for row_idx, model_name in enumerate(allowed_models):
+        for col_idx, case_size in enumerate(allowed_case_sizes):
+            ax = axes[(model_name, case_size)]
+            plotted = False
+            for method_label in method_labels:
+                row = row_lookup.get((method_label, model_name, case_size))
+                if row is None:
+                    continue
+                file_path = Path(str(row.get("file") or "")).expanduser()
+                if not file_path.is_file():
+                    continue
+                use_max_merge = _analysis_row_uses_max_merge(row)
+                source_rows = [
+                    source_row
+                    for source_row in _load_rows(file_path)
+                    if _to_int(source_row.get("traces_per_case")) == case_size
+                ]
+                case_pairs = [
+                    _row_trace_score_pairs(source_row, max_merge=use_max_merge)
+                    for source_row in source_rows
+                ]
+                case_pairs = [pairs for pairs in case_pairs if _average_precision_from_pairs(pairs) is not None]
+                if not case_pairs:
+                    continue
+                recall_grid, mean_precision, lower, upper = _bootstrap_pooled_pr_curve_band(
+                    case_pairs,
+                    n_resamples=n_bootstrap,
+                    seed=1000 * (row_idx + 1) + case_size + col_idx,
+                )
+                color = DM_REFERENCE_METHOD_COLORS.get(method_label, "#555555")
+                linestyle = DM_REFERENCE_METHOD_LINESTYLES.get(method_label, "-")
+                layer_zorder = method_zorder.get(method_label, 1)
+                ax.fill_between(recall_grid, lower, upper, color=color, alpha=0.14, linewidth=0.0, zorder=layer_zorder)
+                ax.plot(
+                    recall_grid,
+                    mean_precision,
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=1.8,
+                    zorder=10 + layer_zorder,
+                )
+                plotted = True
+
+            if not plotted:
+                ax.axis("off")
+                continue
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.02)
+            ax.set_xticks([0.0, 0.5, 1.0])
+            ax.tick_params(labelsize=TICK_LABEL_FONTSIZE)
+            ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_color(SPINE_COLOR)
+            ax.spines["bottom"].set_color(SPINE_COLOR)
+            ax.set_title(f"tpc={case_size}", fontsize=AXIS_LABEL_FONTSIZE, pad=4)
+            if row_idx == len(allowed_models) - 1:
+                ax.set_xlabel("Recall", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.3)
+            if col_idx == 0:
+                ax.set_ylabel(f"{model_name}\nPrecision", fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.2)
+            else:
+                ax.tick_params(labelleft=False)
+
+    legend_handles: list[Line2D] = []
+    for method_label in method_labels:
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=DM_REFERENCE_METHOD_COLORS.get(method_label, "#555555"),
+                linestyle=DM_REFERENCE_METHOD_LINESTYLES.get(method_label, "-"),
+                linewidth=1.8,
+                label=DM_REFERENCE_LEGEND_LABELS.get(method_label, method_label),
+            )
+        )
+
+    legend_ax = axes.get(("gpt-5.4-mini", 100))
+    if legend_handles and legend_ax and legend_ax.axison:
+        legend_ax.legend(
+            handles=legend_handles,
+            loc="lower left",
+            frameon=False,
+            fontsize=LEGEND_FONTSIZE,
+            handlelength=1.7,
+            borderaxespad=0.15,
+            labelspacing=0.18,
+        )
+    fig.subplots_adjust(top=0.92, left=0.10, right=0.985, bottom=0.16)
+
+    out_paths: list[Path] = []
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for ext in formats:
+        out_path = out_base.with_suffix(f".{ext}")
+        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
         out_paths.append(out_path)
     plt.close(fig)
     return out_paths
@@ -4089,7 +4439,7 @@ def _judge_vs_at_ap_points(
             continue
         judge_file_by_model: dict[str, Path] = {}
         at_file_by_model: dict[str, Path] = {}
-        at_score_mode_by_model: dict[str, str] = {}
+        at_use_max_merge_by_model: dict[str, bool] = {}
         for row in dataset_rows:
             display_model = _display_model_name(str(row.get("method_model") or ""))
             if not display_model:
@@ -4103,14 +4453,14 @@ def _judge_vs_at_ap_points(
                 judge_file_by_model.setdefault(display_model, file_path)
             elif method_base == "AT" and method_variant == "":
                 at_file_by_model.setdefault(display_model, file_path)
-                at_score_mode_by_model.setdefault(display_model, str(row.get("score_mode") or ""))
+                at_use_max_merge_by_model.setdefault(display_model, _analysis_row_uses_max_merge(row))
         for display_model, judge_file in judge_file_by_model.items():
             at_file = at_file_by_model.get(display_model)
             if at_file is None:
                 continue
             if not judge_file.is_file() or not at_file.is_file():
                 continue
-            use_max_merge = at_score_mode_by_model.get(display_model) == "max-merge"
+            use_max_merge = at_use_max_merge_by_model.get(display_model, False)
             judge_cases = {
                 str(case_row.get("case_id") or ""): case_row
                 for case_row in _load_rows(judge_file)
@@ -4166,7 +4516,7 @@ def _build_calibration_groups(
         source_rows = _load_rows(file_path)
         trace_pairs: list[tuple[int, float]] = []
         case_pairs: list[tuple[int, float]] = []
-        use_max_merge = str(row.get("score_mode") or "") == "max-merge"
+        use_max_merge = _analysis_row_uses_max_merge(row)
         for source_row in source_rows:
             trace_pairs.extend(_row_trace_score_pairs(source_row, max_merge=use_max_merge))
             case_pair = _row_case_score_pair(source_row, max_merge=use_max_merge)
@@ -4360,6 +4710,14 @@ def _generate_figures(
         )
 
     out_paths.extend(
+        _impossiblebench_combined_pr_curves_plot(
+            rows=case_rows,
+            out_base=figures_dir / "safety_impossiblebench_combined_pr_curves",
+            formats=formats,
+        )
+    )
+
+    out_paths.extend(
         _macro_f1_by_dataset_plot(
             rows=overall_rows,
             out_base=figures_dir / "safety_macro_f1_by_dataset",
@@ -4446,7 +4804,7 @@ def main() -> None:
         all_by_pct.extend(by_pct)
 
     _print_paper_table(all_overall)
-    table_paths = _write_safety_trace_ap_tables(all_by_case, args.figures_dir)
+    table_paths = _write_safety_metric_tables(all_by_case, args.figures_dir)
     if table_paths:
         print("\nGenerated tables:")
         for p in table_paths:

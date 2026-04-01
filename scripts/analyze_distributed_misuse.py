@@ -6,6 +6,7 @@ import json
 import math
 import random
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,143 @@ from typing import Any
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+
+
+AXIS_LABEL_FONTSIZE = 7.0
+TICK_LABEL_FONTSIZE = 6.0
+LEGEND_FONTSIZE = 6.0
+GRID_COLOR = "#D9D9D9"
+GRID_ALPHA = 0.55
+SPINE_COLOR = "#666666"
+PR_LOG_FLOOR = 1e-2
+RECALL_LOG_FLOOR = 1e-2
+DM_METHOD_ORDER = ["Meerkat", "Monitor", "Bayesian", "Buffer", "Naive Agent"]
+DM_METHOD_COLORS = {
+    "Meerkat": "#D55E00",
+    "Monitor": "#CC79A7",
+    "Bayesian": "#0072B2",
+    "Buffer": "#009E73",
+    "Naive Agent": "#666666",
+}
+DM_METHOD_LINESTYLES = {
+    "Meerkat": "-",
+    "Monitor": "-.",
+    "Bayesian": ":",
+    "Buffer": "--",
+    "Naive Agent": (0, (5, 1.4)),
+}
+DM_MODEL_COLORS = {
+    "gpt-5.4-mini": "#56B4E9",
+    "Qwen-3.5": "#CC79A7",
+}
+_DM_MISSING_RESULT_WARNINGS: set[tuple[str, str, str, int, str]] = set()
+
+
+def _dm_rc_context() -> dict[str, Any]:
+    return {
+        "font.family": "serif",
+        "font.serif": ["Computer Modern Roman", "CMU Serif", "STIX Two Text", "DejaVu Serif"],
+        "mathtext.fontset": "cm",
+        "axes.unicode_minus": False,
+        "axes.labelsize": AXIS_LABEL_FONTSIZE,
+        "xtick.labelsize": TICK_LABEL_FONTSIZE,
+        "ytick.labelsize": TICK_LABEL_FONTSIZE,
+        "legend.fontsize": LEGEND_FONTSIZE,
+        "axes.titlesize": AXIS_LABEL_FONTSIZE,
+        "axes.edgecolor": SPINE_COLOR,
+        "axes.linewidth": 0.8,
+        "grid.color": GRID_COLOR,
+        "grid.alpha": GRID_ALPHA,
+        "grid.linewidth": 0.6,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 3.0,
+        "ytick.major.size": 3.0,
+    }
+
+
+def _style_dm_axis(ax, *, x_label: str | None = None, y_label: str | None = None, title: str | None = None) -> None:
+    if title:
+        ax.set_title(title, fontsize=AXIS_LABEL_FONTSIZE, pad=4)
+    if x_label:
+        ax.set_xlabel(x_label, fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.3)
+    if y_label:
+        ax.set_ylabel(y_label, fontsize=AXIS_LABEL_FONTSIZE, labelpad=1.2)
+    ax.grid(True, which="major", color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.6)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(SPINE_COLOR)
+    ax.spines["bottom"].set_color(SPINE_COLOR)
+
+
+def _dm_legend_handles(*, linewidth: float, method_order: list[str] | None = None) -> list[Line2D]:
+    order = method_order or DM_METHOD_ORDER
+    return [
+        Line2D([0], [0], color=DM_METHOD_COLORS[method], linestyle=DM_METHOD_LINESTYLES[method], linewidth=linewidth)
+        for method in order
+    ]
+
+
+def _clip_precision_for_log(values: list[float], *, floor: float = PR_LOG_FLOOR) -> list[float]:
+    return [min(1.0, max(floor, float(value))) for value in values]
+
+
+def _clip_recall_for_log(values: list[float], *, floor: float = RECALL_LOG_FLOOR) -> list[float]:
+    return [min(1.0, max(floor, float(value))) for value in values]
+
+
+def _dm_model_slug(model_label: str) -> str:
+    if model_label == "Qwen-3.5":
+        return "qwen35"
+    if model_label == "gpt-5.4-mini":
+        return "gpt-5.4-mini"
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", model_label).strip("-")
+
+
+def _dm_meerkat_result_path(results_dir: Path, *, domain: str, bg: int, model_label: str) -> Path:
+    slug = _dm_model_slug(model_label)
+    mapping = {
+        ("cyber", 20, "gpt-5.4-mini"): "dm_cyber_d6_bg20_v6.jsonl",
+        ("cyber", 100, "gpt-5.4-mini"): "dm_cyber_d6_bg100_n15.jsonl",
+        ("cyber", 20, "qwen35"): "dm_cyber_d6_bg20_qwen35_n20.jsonl",
+        ("cyber", 100, "qwen35"): "dm_cyber_d6_bg100_qwen35_n50.jsonl",
+        ("bio", 20, "gpt-5.4-mini"): "dm_bio_d6_bg20_v6.jsonl",
+        ("bio", 100, "gpt-5.4-mini"): "dm_bio_d6_bg100_v6.jsonl",
+        ("bio", 20, "qwen35"): "dm_bio_d6_bg20_qwen35_n20.jsonl",
+        ("bio", 100, "qwen35"): "dm_bio_d6_bg100_qwen35_v4_n50.jsonl",
+    }
+    filename = mapping.get((domain, bg, slug))
+    if filename is None:
+        raise ValueError(f"No canonical DM Meerkat filename for domain={domain} bg={bg} model={model_label}")
+    return results_dir / filename
+
+
+def _warn_missing_dm_result(path: Path, *, domain: str, bg: int, model_label: str, method_label: str) -> None:
+    key = (domain, model_label, method_label, bg, str(path))
+    if key in _DM_MISSING_RESULT_WARNINGS:
+        return
+    _DM_MISSING_RESULT_WARNINGS.add(key)
+    print(
+        f"Missing canonical DM {method_label} result for domain={domain} bg={bg} model={model_label}: {path}",
+        file=sys.stderr,
+    )
+
+
+def _dm_bayesian_result_candidates(results_dir: Path, *, domain: str, bg: int, model_label: str) -> list[Path]:
+    return [results_dir / f"dm_{domain}_d6_bg{bg}_{_dm_model_slug(model_label)}_bayesian.jsonl"]
+
+
+def _dm_buffer_result_candidates(results_dir: Path, *, domain: str, bg: int, model_label: str) -> list[Path]:
+    return [results_dir / f"dm_{domain}_d6_bg{bg}_{_dm_model_slug(model_label)}_buffer.jsonl"]
+
+
+def _dm_naive_agent_result_candidates(results_dir: Path, *, domain: str, bg: int, model_label: str) -> list[Path]:
+    return [results_dir / f"dm_{domain}_d6_bg{bg}_{_dm_model_slug(model_label)}_naive.jsonl"]
+
+
+def _dm_monitor_result_candidates(results_dir: Path, *, domain: str, bg: int, model_label: str) -> list[Path]:
+    return [results_dir / f"dm_{domain}_d6_bg{bg}_{_dm_model_slug(model_label)}_llmjudge.jsonl"]
 
 
 
@@ -767,6 +905,28 @@ def _bootstrap_mean_se(
     return _stddev(means)
 
 
+def _bootstrap_flat_metric_se(
+    pairs: list[tuple[int, float]],
+    metric_fn,
+    *,
+    n_bootstrap: int = 100,
+    seed: int = 0,
+) -> float | None:
+    if not pairs:
+        return None
+    if len(pairs) == 1:
+        return 0.0
+    rng = random.Random(seed)
+    n = len(pairs)
+    values: list[float] = []
+    for _ in range(n_bootstrap):
+        sample = [pairs[rng.randrange(n)] for _ in range(n)]
+        metric_value = metric_fn(sample)
+        if metric_value is not None:
+            values.append(float(metric_value))
+    return _stddev(values)
+
+
 def _bootstrap_pr_band(
     per_case_scores: list[tuple[dict[str, float], set[str]]],
     *,
@@ -836,6 +996,18 @@ def _collect_stage2_cases(path: Path) -> tuple[list[tuple[dict[str, float], set[
     return stage2_cases, len(rows)
 
 
+def _collect_case_score_pairs(path: Path) -> tuple[list[tuple[int, float]], int]:
+    rows = _load_rows(path)
+    pairs: list[tuple[int, float]] = []
+    for row in rows:
+        scores = _row_trace_scores(row)
+        if not scores:
+            continue
+        gt_case_label = 1 if bool(row.get("ground_truth", {}).get("has_distributed_misuse")) else 0
+        pairs.append((gt_case_label, max(scores.values())))
+    return pairs, len(rows)
+
+
 def _row_case_id(row: dict[str, Any], fallback_index: int) -> str:
     return str(row.get("case_id") or row.get("repo_name") or fallback_index)
 
@@ -868,6 +1040,203 @@ def _merged_cases_with_monitor(agent_path: Path, monitor_path: Path | None) -> t
     return merged_cases, case_count
 
 
+def _merged_case_score_pairs_with_monitor(
+    agent_path: Path,
+    monitor_path: Path | None,
+) -> tuple[list[tuple[int, float]], int]:
+    rows = _load_rows(agent_path)
+    monitor_cases, _ = _collect_monitor_case_rows(agent_path, monitor_path)
+    monitor_by_case = {case_id: scores for case_id, scores, _ in monitor_cases}
+    pairs: list[tuple[int, float]] = []
+    for idx, row in enumerate(rows):
+        case_id = _row_case_id(row, idx)
+        agent_scores = _row_trace_scores(row)
+        merged_scores = dict(agent_scores)
+        for trace_key, score in (monitor_by_case.get(case_id) or {}).items():
+            merged_scores[trace_key] = max(float(merged_scores.get(trace_key, 0.0)), float(score))
+        if not merged_scores:
+            continue
+        gt_case_label = 1 if bool(row.get("ground_truth", {}).get("has_distributed_misuse")) else 0
+        pairs.append((gt_case_label, max(merged_scores.values())))
+    return pairs, len(rows)
+
+
+def _collect_stage1_case_rows(path: Path) -> tuple[list[tuple[str, dict[str, float], set[str]]], int]:
+    rows = _load_rows(path)
+    cases: list[tuple[str, dict[str, float], set[str]]] = []
+    for idx, row in enumerate(rows):
+        gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
+        scores = _load_stage1_scores_from_repo(Path(str(row.get("repo") or ""))) or {}
+        if scores and gt:
+            cases.append((_row_case_id(row, idx), scores, gt))
+    return cases, len(rows)
+
+
+def _collect_monitor_case_rows(agent_path: Path, monitor_path: Path | None) -> tuple[list[tuple[str, dict[str, float], set[str]]], int]:
+    if monitor_path is not None and monitor_path.is_file():
+        return _collect_case_rows(monitor_path)
+    return _collect_stage1_case_rows(agent_path)
+
+
+def _merged_case_rows_with_monitor(
+    agent_path: Path,
+    monitor_path: Path | None,
+) -> tuple[list[tuple[str, dict[str, float], set[str]]], int]:
+    agent_cases, case_count = _collect_case_rows(agent_path)
+    monitor_cases, _ = _collect_monitor_case_rows(agent_path, monitor_path)
+    monitor_by_case = {case_id: scores for case_id, scores, _ in monitor_cases}
+    merged_cases: list[tuple[str, dict[str, float], set[str]]] = []
+    for case_id, agent_scores, gt in agent_cases:
+        merged = dict(agent_scores)
+        monitor_scores = monitor_by_case.get(case_id) or {}
+        for trace_key, score in monitor_scores.items():
+            merged[trace_key] = max(float(merged.get(trace_key, 0.0)), float(score))
+        merged_cases.append((case_id, merged, gt))
+    return merged_cases, case_count
+
+
+def _paper_curve_candidates(
+    results_dir: Path,
+    explicit_inputs: list[Path] | None = None,
+    *,
+    domain: str = "cyber",
+) -> list[tuple[Path, str, str, int]]:
+    explicit_set = {path.resolve() for path in explicit_inputs or []}
+
+    def _want(path: Path) -> bool:
+        return not explicit_set or path.resolve() in explicit_set
+
+    def _add_if_present(path: Path, *, model_label: str, method_label: str, bg: int) -> None:
+        if path.is_file() and _want(path):
+            candidates.append((path, model_label, method_label, bg))
+            return
+        if not explicit_set and not path.is_file():
+            _warn_missing_dm_result(path, domain=domain, bg=bg, model_label=model_label, method_label=method_label)
+
+    candidates: list[tuple[Path, str, str, int]] = []
+    if domain == "cyber":
+        for bg, model_label in ((20, "gpt-5.4-mini"), (100, "gpt-5.4-mini"), (20, "Qwen-3.5"), (100, "Qwen-3.5")):
+            _add_if_present(
+                _dm_meerkat_result_path(results_dir, domain="cyber", bg=bg, model_label=model_label),
+                model_label=model_label,
+                method_label="Meerkat",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_bayesian_result_candidates(results_dir, domain="cyber", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Bayesian",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_monitor_result_candidates(results_dir, domain="cyber", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Monitor",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_buffer_result_candidates(results_dir, domain="cyber", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Buffer",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_naive_agent_result_candidates(results_dir, domain="cyber", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Naive Agent",
+                bg=bg,
+            )
+    elif domain == "bio":
+        for bg, model_label in ((20, "gpt-5.4-mini"), (100, "gpt-5.4-mini"), (20, "Qwen-3.5"), (100, "Qwen-3.5")):
+            _add_if_present(
+                _dm_meerkat_result_path(results_dir, domain="bio", bg=bg, model_label=model_label),
+                model_label=model_label,
+                method_label="Meerkat",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_bayesian_result_candidates(results_dir, domain="bio", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Bayesian",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_monitor_result_candidates(results_dir, domain="bio", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Monitor",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_buffer_result_candidates(results_dir, domain="bio", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Buffer",
+                bg=bg,
+            )
+        for bg, model_label in (
+            (20, "gpt-5.4-mini"),
+            (100, "gpt-5.4-mini"),
+            (20, "Qwen-3.5"),
+            (100, "Qwen-3.5"),
+        ):
+            path = _dm_naive_agent_result_candidates(results_dir, domain="bio", bg=bg, model_label=model_label)[0]
+            _add_if_present(
+                path,
+                model_label=model_label,
+                method_label="Naive Agent",
+                bg=bg,
+            )
+    return candidates
+
+
 def _paper_curve_runs(
     results_dir: Path,
     explicit_inputs: list[Path] | None = None,
@@ -875,85 +1244,7 @@ def _paper_curve_runs(
     domain: str = "cyber",
     bootstrap_samples: int = 100,
 ) -> list[PaperCurveRun]:
-    explicit_set = {path.resolve() for path in explicit_inputs or []}
-
-    def _want(path: Path) -> bool:
-        return not explicit_set or path.resolve() in explicit_set
-
-    candidates: list[tuple[Path, str, str, int]] = []
-    if domain == "cyber":
-        for bg, filename in ((20, "dm_cyber_d6_bg20_v6.jsonl"), (100, "dm_cyber_d6_bg100_n15.jsonl")):
-            path = results_dir / filename
-            if path.is_file() and _want(path):
-                candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
-        for bg in (20, 100):
-            path = results_dir / f"dm_cyber_d6_bg{bg}_qwen35_n{20 if bg == 20 else 50}.jsonl"
-            if path.is_file() and _want(path):
-                candidates.append((path, "Qwen-3.5", "Meerkat", bg))
-        for bg, model_label, suffixes in (
-            (20, "gpt-5.4-mini", ["gpt-5.4-mini"]),
-            (100, "gpt-5.4-mini", ["gpt-5.4-mini"]),
-            (20, "Qwen-3.5", ["qwen35"]),
-            (100, "Qwen-3.5", ["qwen35"]),
-        ):
-            bayesian_candidates = [results_dir / f"dm_cyber_d6_bg{bg}_{suffix}_bayesian.jsonl" for suffix in suffixes]
-            if model_label == "Qwen-3.5":
-                bayesian_candidates.append(results_dir / f"dm_cyber_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl")
-            path = _first_existing(bayesian_candidates, _want)
-            if path is not None:
-                candidates.append((path, model_label, "Bayesian", bg))
-        for path, model_label, bg in (
-            (results_dir / "safety_safety_dm_cyber_d6_bg20_qwen35_bayesian_boost_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 20),
-            (results_dir / "safety_safety_dm_cyber_d6_bg20_qwen35_bayesian_boost_llmjudge-gpt-5.4-mini.jsonl", "gpt-5.4-mini", 20),
-            (results_dir / "safety_safety_dm_cyber_d6_bg100_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 100),
-        ):
-            if path.is_file() and _want(path):
-                candidates.append((path, model_label, "Monitor", bg))
-        for bg, model_label, paths in (
-            (20, "gpt-5.4-mini", [results_dir / "dm_cyber_d6_bg20_gpt-5.4-mini_buffer.jsonl"]),
-            (100, "gpt-5.4-mini", [results_dir / "dm_cyber_d6_bg100_gpt-5.4-mini_buffer.jsonl", results_dir / "dm_cyber_d6_bg100_buffer.jsonl"]),
-            (20, "Qwen-3.5", [results_dir / "dm_cyber_d6_bg20_qwen35_buffer.jsonl"]),
-            (100, "Qwen-3.5", [results_dir / "dm_cyber_d6_bg100_qwen35_buffer.jsonl", results_dir / "dm_cyber_d6_bg100_buffer_qwen35.jsonl"]),
-        ):
-            path = _first_existing(paths, _want)
-            if path is not None:
-                candidates.append((path, model_label, "Buffer", bg))
-    elif domain == "bio":
-        for bg in (20, 100):
-            path = results_dir / f"dm_bio_d6_bg{bg}_v6.jsonl"
-            if path.is_file() and _want(path):
-                candidates.append((path, "gpt-5.4-mini", "Meerkat", bg))
-        for bg, suffix in ((20, "n20"), (100, "v4_n50")):
-            path = results_dir / f"dm_bio_d6_bg{bg}_qwen35_{suffix}.jsonl"
-            if path.is_file() and _want(path):
-                candidates.append((path, "Qwen-3.5", "Meerkat", bg))
-        for bg, model_label, suffixes in (
-            (20, "gpt-5.4-mini", ["gpt-5.4-mini"]),
-            (100, "gpt-5.4-mini", ["gpt-5.4-mini"]),
-            (20, "Qwen-3.5", ["qwen35"]),
-            (100, "Qwen-3.5", ["qwen35"]),
-        ):
-            bayesian_candidates = [results_dir / f"dm_bio_d6_bg{bg}_{suffix}_bayesian.jsonl" for suffix in suffixes]
-            if model_label == "Qwen-3.5":
-                bayesian_candidates.append(results_dir / f"dm_bio_d6_bg{bg}_qwen35_bayesian_no_cluster.jsonl")
-            path = _first_existing(bayesian_candidates, _want)
-            if path is not None:
-                candidates.append((path, model_label, "Bayesian", bg))
-        for path, model_label, bg in (
-            (results_dir / "safety_safety_dm_bio_d6_bg20_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 20),
-            (results_dir / "safety_safety_dm_bio_d6_bg100_qwen35_bayesian_boost_attack_auditor_note_llmjudge-Qwen-Qwen3.5-397B-A17B-FP8.jsonl", "Qwen-3.5", 100),
-        ):
-            if path.is_file() and _want(path):
-                candidates.append((path, model_label, "Monitor", bg))
-        for bg, model_label, paths in (
-            (20, "gpt-5.4-mini", [results_dir / "dm_bio_d6_bg20_gpt-5.4-mini_buffer.jsonl"]),
-            (100, "gpt-5.4-mini", [results_dir / "dm_bio_d6_bg100_gpt-5.4-mini_buffer.jsonl", results_dir / "dm_bio_d6_bg100_buffer.jsonl"]),
-            (20, "Qwen-3.5", [results_dir / "dm_bio_d6_bg20_qwen35_buffer.jsonl"]),
-            (100, "Qwen-3.5", [results_dir / "dm_bio_d6_bg100_qwen35_buffer.jsonl", results_dir / "dm_bio_d6_bg100_buffer_qwen35.jsonl"]),
-        ):
-            path = _first_existing(paths, _want)
-            if path is not None:
-                candidates.append((path, model_label, "Buffer", bg))
+    candidates = _paper_curve_candidates(results_dir, explicit_inputs, domain=domain)
 
     monitor_paths: dict[tuple[str, int], Path] = {}
     for candidate_path, model_label, method_label, bg in candidates:
@@ -965,56 +1256,20 @@ def _paper_curve_runs(
     for path, model_label, method_label, bg in candidates:
         if method_label == "Meerkat":
             per_case_scores, case_count = _merged_cases_with_monitor(path, monitor_paths.get((model_label, bg)))
-            if not per_case_scores:
-                continue
-            ap_values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
-            ap_values = [float(ap) for ap in ap_values if ap is not None]
-            _, curve, _, _ = _average_curves(per_case_scores)
-            recall_grid, lower, upper, ap = _bootstrap_pr_band(
-                per_case_scores,
-                n_bootstrap=bootstrap_samples,
-                seed=bg + len(runs) * 17,
-            )
-            ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
-            precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
         else:
-            per_case_curves, case_count = _collect_stage2_case_curves(path)
-            if per_case_curves:
-                curve_samples = [_interp_precision_at_recalls(curve, recall_grid) for curve in per_case_curves]
-                precision_curve = [sum(sample[i] for sample in curve_samples) / len(curve_samples) for i in range(len(recall_grid))]
-                ap_values = [_average_precision_from_pr_curve(curve) for curve in per_case_curves]
-                ap_values = [float(ap) for ap in ap_values if ap is not None]
-                ap = (sum(ap_values) / len(ap_values)) if ap_values else None
-                ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
-                rng = random.Random(bg + len(runs) * 17)
-                lower = []
-                upper = []
-                if len(curve_samples) == 1:
-                    lower = precision_curve[:]
-                    upper = precision_curve[:]
-                else:
-                    boot_means: list[list[float]] = []
-                    for _ in range(bootstrap_samples):
-                        sampled = [curve_samples[rng.randrange(len(curve_samples))] for _ in range(len(curve_samples))]
-                        boot_means.append([sum(sample[i] for sample in sampled) / len(sampled) for i in range(len(recall_grid))])
-                    for idx in range(len(recall_grid)):
-                        vals = sorted(sample[idx] for sample in boot_means)
-                        lower.append(vals[max(0, int(0.025 * len(vals)) - 1)])
-                        upper.append(vals[min(len(vals) - 1, int(0.975 * len(vals)))])
-            else:
-                per_case_scores, case_count = _collect_stage2_cases(path)
-                if not per_case_scores:
-                    continue
-                ap_values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
-                ap_values = [float(ap) for ap in ap_values if ap is not None]
-                _, curve, _, _ = _average_curves(per_case_scores)
-                recall_grid, lower, upper, ap = _bootstrap_pr_band(
-                    per_case_scores,
-                    n_bootstrap=bootstrap_samples,
-                    seed=bg + len(runs) * 17,
-                )
-                ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
-                precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
+            per_case_scores, case_count = _collect_stage2_cases(path)
+        if not per_case_scores:
+            continue
+        ap_values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
+        ap_values = [float(ap) for ap in ap_values if ap is not None]
+        _, curve, _, _ = _average_curves(per_case_scores)
+        recall_grid, lower, upper, ap = _bootstrap_pr_band(
+            per_case_scores,
+            n_bootstrap=bootstrap_samples,
+            seed=bg + len(runs) * 17,
+        )
+        ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
+        precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
         runs.append(
             PaperCurveRun(
                 path=path,
@@ -1031,6 +1286,119 @@ def _paper_curve_runs(
             )
         )
     return runs
+
+
+def _meerkat_vs_monitor_rocauc_points(
+    results_dir: Path,
+    input_paths: list[Path],
+) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for domain in ("cyber", "bio"):
+        candidates = _paper_curve_candidates(results_dir, input_paths, domain=domain)
+        monitor_paths: dict[tuple[str, int], Path] = {}
+        for candidate_path, model_label, method_label, bg in candidates:
+            if method_label == "Monitor":
+                monitor_paths[(model_label, bg)] = candidate_path
+        for path, model_label, method_label, bg in candidates:
+            if method_label != "Meerkat":
+                continue
+            monitor_path = monitor_paths.get((model_label, bg))
+            merged_cases, _ = _merged_case_rows_with_monitor(path, monitor_path)
+            monitor_cases, _ = _collect_monitor_case_rows(path, monitor_path)
+            monitor_by_case = {case_id: scores for case_id, scores, _ in monitor_cases}
+            for case_id, merged_scores, gt in merged_cases:
+                monitor_scores = monitor_by_case.get(case_id)
+                if not monitor_scores or not gt:
+                    continue
+                monitor_rocauc = _roc_auc_for_case(monitor_scores, gt)
+                meerkat_rocauc = _roc_auc_for_case(merged_scores, gt)
+                if monitor_rocauc is None or meerkat_rocauc is None:
+                    continue
+                points.append(
+                    {
+                        "domain": domain,
+                        "model_label": model_label,
+                        "background_multiplier": bg,
+                        "case_id": case_id,
+                        "monitor_rocauc": float(monitor_rocauc),
+                        "meerkat_rocauc": float(meerkat_rocauc),
+                    }
+                )
+    return points
+
+
+def _method_metric_summary(
+    path: Path,
+    *,
+    method_label: str,
+    monitor_path: Path | None,
+    metric_key: str,
+    bootstrap_samples: int,
+    seed: int,
+) -> tuple[float | None, float | None]:
+    if metric_key == "trace_ap":
+        if method_label == "Meerkat":
+            per_case_scores, _ = _merged_cases_with_monitor(path, monitor_path)
+        else:
+            per_case_scores, _ = _collect_stage2_cases(path)
+        if not per_case_scores:
+            return None, None
+        values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
+        values = [float(value) for value in values if value is not None]
+        if not values:
+            return None, None
+        mean_value = sum(values) / len(values)
+        return mean_value, _bootstrap_mean_se(values, n_bootstrap=bootstrap_samples, seed=seed)
+
+    if metric_key == "trace_roc_auc":
+        if method_label == "Meerkat":
+            per_case_scores, _ = _merged_cases_with_monitor(path, monitor_path)
+        else:
+            per_case_scores, _ = _collect_stage2_cases(path)
+        if not per_case_scores:
+            return None, None
+        values = [_roc_auc_for_case(scores, gt) for scores, gt in per_case_scores]
+        values = [float(value) for value in values if value is not None]
+        if not values:
+            return None, None
+        mean_value = sum(values) / len(values)
+        return mean_value, _bootstrap_mean_se(values, n_bootstrap=bootstrap_samples, seed=seed)
+
+    if metric_key == "case_ap":
+        if method_label == "Meerkat":
+            case_pairs, _ = _merged_case_score_pairs_with_monitor(path, monitor_path)
+        else:
+            case_pairs, _ = _collect_case_score_pairs(path)
+        if not case_pairs:
+            return None, None
+        mean_value = _flat_average_precision(case_pairs)
+        if mean_value is None:
+            return None, None
+        return mean_value, _bootstrap_flat_metric_se(
+            case_pairs,
+            _flat_average_precision,
+            n_bootstrap=bootstrap_samples,
+            seed=seed,
+        )
+
+    if metric_key == "case_roc_auc":
+        if method_label == "Meerkat":
+            case_pairs, _ = _merged_case_score_pairs_with_monitor(path, monitor_path)
+        else:
+            case_pairs, _ = _collect_case_score_pairs(path)
+        if not case_pairs:
+            return None, None
+        mean_value = _flat_roc_auc(case_pairs)
+        if mean_value is None:
+            return None, None
+        return mean_value, _bootstrap_flat_metric_se(
+            case_pairs,
+            _flat_roc_auc,
+            n_bootstrap=bootstrap_samples,
+            seed=seed,
+        )
+
+    raise ValueError(f"Unsupported metric_key: {metric_key}")
 
 
 def _plot_ap_bars(
@@ -1572,15 +1940,8 @@ def _plot_combined_paper_pr_figure(
     runs = cyber_runs + bio_runs
     if not runs:
         return []
-    with mpl.rc_context(
-        {
-            "font.family": "serif",
-            "font.serif": ["Computer Modern Roman", "CMU Serif", "STIX Two Text", "DejaVu Serif"],
-            "mathtext.fontset": "cm",
-            "axes.unicode_minus": False,
-        }
-    ):
-        fig = plt.figure(figsize=(5.5, 2.85))
+    with mpl.rc_context(_dm_rc_context()):
+        fig = plt.figure(figsize=(5.55, 2.95))
         grid = fig.add_gridspec(2, 4, hspace=0.34, wspace=0.22)
         axes = {
             ("gpt-5.4-mini", "cyber", 20): fig.add_subplot(grid[0, 0]),
@@ -1592,67 +1953,69 @@ def _plot_combined_paper_pr_figure(
             ("Qwen-3.5", "bio", 20): fig.add_subplot(grid[1, 2]),
             ("Qwen-3.5", "bio", 100): fig.add_subplot(grid[1, 3]),
         }
-        method_order = ["Meerkat", "Monitor", "Bayesian", "Buffer"]
-        method_colors = {
-            "Meerkat": "#D55E00",
-            "Monitor": "#CC79A7",
-            "Bayesian": "#0072B2",
-            "Buffer": "#009E73",
-        }
-        method_linestyles = {
-            "Meerkat": "-",
-            "Monitor": "-.",
-            "Bayesian": ":",
-            "Buffer": "--",
-        }
-        shared_legend_handles = [
-            Line2D([0], [0], color=method_colors[method], linestyle=method_linestyles[method], linewidth=1.8)
-            for method in method_order
-        ]
         runs_by_panel: dict[tuple[str, str, int], list[PaperCurveRun]] = {}
         for run in cyber_runs:
             runs_by_panel.setdefault((run.model_label, "cyber", run.background_multiplier), []).append(run)
         for run in bio_runs:
             runs_by_panel.setdefault((run.model_label, "bio", run.background_multiplier), []).append(run)
+        present_methods = [method for method in DM_METHOD_ORDER if any(run.method_label == method for run in runs)]
+        shared_legend_handles = _dm_legend_handles(linewidth=1.8, method_order=present_methods)
+        method_layer_order = [method for method in DM_METHOD_ORDER if method != "Meerkat"] + ["Meerkat"]
+        method_zorder = {method: idx for idx, method in enumerate(method_layer_order, start=1)}
 
         for panel_key, ax in axes.items():
             panel_runs = sorted(
                 runs_by_panel.get(panel_key, []),
-                key=lambda run: method_order.index(run.method_label) if run.method_label in method_order else 99,
+                key=lambda run: DM_METHOD_ORDER.index(run.method_label) if run.method_label in DM_METHOD_ORDER else 99,
             )
             if not panel_runs:
                 ax.axis("off")
                 continue
             for run in panel_runs:
-                color = method_colors.get(run.method_label, "#555555")
-                linestyle = method_linestyles.get(run.method_label, "-")
+                color = DM_METHOD_COLORS.get(run.method_label, "#555555")
+                linestyle = DM_METHOD_LINESTYLES.get(run.method_label, "-")
+                recall_grid = _clip_recall_for_log(run.recall_grid)
+                lower = _clip_precision_for_log(run.precision_lower)
+                upper = _clip_precision_for_log(run.precision_upper)
+                precision_curve = _clip_precision_for_log(run.precision_curve)
+                layer_zorder = method_zorder.get(run.method_label, 1)
                 ax.fill_between(
-                    run.recall_grid,
-                    run.precision_lower,
-                    run.precision_upper,
+                    recall_grid,
+                    lower,
+                    upper,
                     color=color,
-                    alpha=0.12,
+                    alpha=0.14,
                     linewidth=0.0,
-                    zorder=1,
+                    zorder=layer_zorder,
                 )
                 ax.plot(
-                    run.recall_grid,
-                    run.precision_curve,
+                    recall_grid,
+                    precision_curve,
                     color=color,
                     linestyle=linestyle,
                     linewidth=1.8,
-                    zorder=2,
+                    zorder=10 + layer_zorder,
                 )
             _, domain, bg = panel_key
             domain_label = "Cyber" if domain == "cyber" else "Bio"
-            ax.set_title(f"{domain_label} (bg={bg}x)", fontsize=7.5, pad=3)
-            ax.set_xlim(0.0, 1.0)
-            ax.set_ylim(0.0, 1.02)
-            ax.grid(alpha=0.22)
-            ax.set_xticks([0.0, 0.5, 1.0])
-            ax.tick_params(labelsize=6.2)
-            if panel_key[0] == "Qwen-3.5":
-                ax.set_xlabel("Recall", fontsize=7.5)
+            ax.set_xscale("log")
+            ax.set_xlim(RECALL_LOG_FLOOR, 1.0)
+            ax.set_yscale("log")
+            ax.set_ylim(PR_LOG_FLOOR, 1.02)
+            ax.set_xticks([RECALL_LOG_FLOOR, 0.1, 1.0])
+            ax.set_xticklabels([f"{RECALL_LOG_FLOOR:.2f}", "0.1", "1.0"])
+            ax.set_yticks([PR_LOG_FLOOR, 0.1, 1.0])
+            ax.set_yticklabels([f"{PR_LOG_FLOOR:.2f}", "0.1", "1.0"])
+            ax.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+            ax.yaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+            ax.tick_params(labelsize=TICK_LABEL_FONTSIZE)
+            x_label = "Recall" if panel_key[0] == "Qwen-3.5" else None
+            y_label = None
+            if panel_key == ("gpt-5.4-mini", "cyber", 20):
+                y_label = "gpt-5.4-mini\nPrecision"
+            elif panel_key == ("Qwen-3.5", "cyber", 20):
+                y_label = "Qwen-3.5\nPrecision"
+            _style_dm_axis(ax, x_label=x_label, y_label=y_label, title=f"{domain_label} (bg={bg}x)")
             if panel_key not in (("gpt-5.4-mini", "cyber", 20), ("Qwen-3.5", "cyber", 20)):
                 ax.tick_params(labelleft=False)
 
@@ -1660,29 +2023,99 @@ def _plot_combined_paper_pr_figure(
         if legend_ax and legend_ax.axison:
             legend_ax.legend(
                 shared_legend_handles,
-                method_order,
-                loc="upper right",
+                present_methods,
+                loc="lower left",
                 frameon=False,
-                fontsize=5.8,
+                fontsize=LEGEND_FONTSIZE,
                 handlelength=1.7,
                 borderaxespad=0.15,
                 labelspacing=0.18,
             )
-
-        left_top = axes.get(("gpt-5.4-mini", "cyber", 20))
-        if left_top and left_top.axison:
-            left_top.set_ylabel("gpt-5.4-mini\nPrecision", fontsize=7.5)
-        left_bottom = axes.get(("Qwen-3.5", "cyber", 20))
-        if left_bottom and left_bottom.axison:
-            left_bottom.set_ylabel("Qwen-3.5\nPrecision", fontsize=7.5)
-
-        fig.subplots_adjust(top=0.92, left=0.12, right=0.985, bottom=0.16)
+        fig.subplots_adjust(top=0.92, left=0.10, right=0.985, bottom=0.16)
 
         output_paths: list[Path] = []
         out_base = figures_dir / "dm_combined_paper_pr_curves"
         for fmt in figure_formats:
             out_path = out_base.with_suffix(f".{fmt}")
-            fig.savefig(out_path)
+            fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
+            output_paths.append(out_path)
+        plt.close(fig)
+        return output_paths
+
+
+def _plot_meerkat_vs_monitor_rocauc_scatter(
+    *,
+    results_dir: Path,
+    figures_dir: Path,
+    figure_formats: list[str],
+    input_paths: list[Path],
+) -> list[Path]:
+    points = _meerkat_vs_monitor_rocauc_points(results_dir, input_paths)
+    if not points:
+        return []
+
+    with mpl.rc_context(_dm_rc_context()):
+        fig = plt.figure(figsize=(7.45, 3.6))
+        grid = fig.add_gridspec(2, 4, hspace=0.28, wspace=0.24)
+        axes = {
+            ("gpt-5.4-mini", "cyber", 20): fig.add_subplot(grid[0, 0]),
+            ("gpt-5.4-mini", "cyber", 100): fig.add_subplot(grid[0, 1]),
+            ("gpt-5.4-mini", "bio", 20): fig.add_subplot(grid[0, 2]),
+            ("gpt-5.4-mini", "bio", 100): fig.add_subplot(grid[0, 3]),
+            ("Qwen-3.5", "cyber", 20): fig.add_subplot(grid[1, 0]),
+            ("Qwen-3.5", "cyber", 100): fig.add_subplot(grid[1, 1]),
+            ("Qwen-3.5", "bio", 20): fig.add_subplot(grid[1, 2]),
+            ("Qwen-3.5", "bio", 100): fig.add_subplot(grid[1, 3]),
+        }
+        points_by_panel: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+        for point in points:
+            points_by_panel.setdefault(
+                (str(point["model_label"]), str(point["domain"]), int(point["background_multiplier"])),
+                [],
+            ).append(point)
+
+        for panel_key, ax in axes.items():
+            model_label, domain, bg = panel_key
+            panel_points = points_by_panel.get(panel_key, [])
+            color = DM_MODEL_COLORS.get(model_label, "#888888")
+            x_values = [float(point["monitor_rocauc"]) for point in panel_points]
+            y_values = [float(point["meerkat_rocauc"]) for point in panel_points]
+            ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.0, color="#B3B3B3", zorder=1)
+            if panel_points:
+                ax.scatter(
+                    x_values,
+                    y_values,
+                    s=56,
+                    marker="o",
+                    facecolors=color,
+                    edgecolors="#4D4D4D",
+                    linewidths=0.8,
+                    alpha=0.82,
+                    zorder=3,
+                )
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_xticks([0.0, 0.5, 1.0])
+            ax.set_yticks([0.0, 0.5, 1.0])
+            domain_label = "Cyber" if domain == "cyber" else "Bio"
+            title = f"{domain_label} (bg={bg}x)"
+            x_label = "Per-trace Monitor ROC-AUC" if model_label == "Qwen-3.5" else None
+            y_label = None
+            if panel_key == ("gpt-5.4-mini", "cyber", 20):
+                y_label = "gpt-5.4-mini\nMeerkat ROC-AUC"
+            elif panel_key == ("Qwen-3.5", "cyber", 20):
+                y_label = "Qwen-3.5\nMeerkat ROC-AUC"
+            _style_dm_axis(ax, x_label=x_label, y_label=y_label, title=title)
+            if panel_key not in (("gpt-5.4-mini", "cyber", 20), ("Qwen-3.5", "cyber", 20)):
+                ax.tick_params(labelleft=False)
+
+        fig.subplots_adjust(left=0.10, right=0.972, bottom=0.16, top=0.90)
+
+        output_paths: list[Path] = []
+        out_base = figures_dir / "dm_meerkat_vs_monitor_rocauc_scatter"
+        for fmt in figure_formats:
+            out_path = out_base.with_suffix(f".{fmt}")
+            fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
             output_paths.append(out_path)
         plt.close(fig)
         return output_paths
@@ -1701,7 +2134,7 @@ def _print_summary_table(metrics: list[SettingMetrics]) -> None:
         )
 
 
-def _write_paper_ap_tables(
+def _write_paper_metric_tables(
     results_dir: Path,
     input_paths: list[Path],
     output_dir: Path,
@@ -1710,28 +2143,11 @@ def _write_paper_ap_tables(
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_paths: list[Path] = []
-    md_lines = [
-        "# Distributed-Misuse Trace AP Table",
-        "",
-        "| Domain | BG | Model | Meerkat | Monitor | Bayesian | Buffer | Delta |",
-        "|---|---:|---|---:|---:|---:|---:|---:|",
-    ]
-    tex_lines = [
-        "% Auto-generated by scripts/analyze_distributed_misuse.py",
-        r"\begin{table*}[t]",
-        r"  \centering",
-        r"  \small",
-        r"  % \setlength{\tabcolsep}{3.5pt}",
-        r"  % \renewcommand{\arraystretch}{0.95}",
-        r"  \caption{RQ1 results for distributed misuse. Higher is better. $\Delta$ is Meerkat minus the strongest baseline.}",
-        r"  \label{tab:rq1-dm}",
-        r"  \begin{tabular}{@{}lllrrrrr@{}}",
-        r"    \toprule",
-        r"    \multirow{2}{*}{Domain} & \multirow{2}{*}{BG} & \multirow{2}{*}{Model}",
-        r"      & \multicolumn{4}{c}{Method} & \multirow{2}{*}{$\Delta$} \\",
-        r"    \cmidrule(lr){4-7}",
-        r"      & & & Meerkat & Monitor & Bayesian & Buffer & \\",
-        r"    \midrule",
+    table_specs = [
+        ("trace_ap", "Distributed-Misuse Trace AP Table", "Trace-level average precision", "dm_paper_trace_ap_table", "tab:rq1-dm-trace-ap"),
+        ("case_ap", "Distributed-Misuse Case AP Table", "Case-level average precision", "dm_paper_case_ap_table", "tab:rq1-dm-case-ap"),
+        ("trace_roc_auc", "Distributed-Misuse Trace ROC-AUC Table", "Trace-level ROC-AUC", "dm_paper_trace_rocauc_table", "tab:rq1-dm-trace-rocauc"),
+        ("case_roc_auc", "Distributed-Misuse Case ROC-AUC Table", "Case-level ROC-AUC", "dm_paper_case_rocauc_table", "tab:rq1-dm-case-rocauc"),
     ]
     def _short_model(model_label: str) -> str:
         if model_label == "Qwen-3.5":
@@ -1751,71 +2167,109 @@ def _write_paper_ap_tables(
         if meerkat is None or not valid:
             return r"\na"
         return f"{(meerkat - max(valid)):+.3f}"
+    model_order = ["Qwen-3.5", "gpt-5.4-mini"]
 
-    for domain in ("cyber", "bio"):
-        runs = _paper_curve_runs(results_dir, input_paths, domain=domain, bootstrap_samples=bootstrap_samples)
-        if not runs:
-            continue
-        rows: dict[tuple[str, int], dict[str, tuple[float | None, float | None]]] = {}
-        for run in runs:
-            rows.setdefault((run.model_label, run.background_multiplier), {})[run.method_label] = (run.average_precision, run.average_precision_bootstrap_se)
-        domain_label = "DM-Cyber" if domain == "cyber" else "DM-Bio"
-        bg_order = sorted({bg for _, bg in rows})
-        model_order = ["Qwen-3.5", "gpt-5.4-mini"]
-        domain_row_count = sum(1 for bg in bg_order for model in model_order if (model, bg) in rows)
-        domain_printed = False
-        for bg_idx, bg in enumerate(bg_order):
-            present_models = [model for model in model_order if (model, bg) in rows]
-            if not present_models:
+    for metric_key, md_title, caption_metric, stem, latex_label in table_specs:
+        md_lines = [
+            f"# {md_title}",
+            "",
+            "| Domain | BG | Model | Meerkat | Naive Agent | Monitor | Bayesian | Buffer | Delta |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        tex_lines = [
+            "% Auto-generated by scripts/analyze_distributed_misuse.py",
+            r"\begin{table*}[t]",
+            r"  \centering",
+            r"  \small",
+            r"  % \setlength{\tabcolsep}{3.5pt}",
+            r"  % \renewcommand{\arraystretch}{0.95}",
+            rf"  \caption{{RQ1 results for distributed misuse using {caption_metric}. Higher is better. $\Delta$ is Meerkat minus the strongest baseline.}}",
+            rf"  \label{{{latex_label}}}",
+            r"  \begin{tabular}{@{}lllrrrrrr@{}}",
+            r"    \toprule",
+            r"    \multirow{2}{*}{Domain} & \multirow{2}{*}{BG} & \multirow{2}{*}{Model}",
+            r"      & \multicolumn{5}{c}{Method} & \multirow{2}{*}{$\Delta$} \\",
+            r"    \cmidrule(lr){4-8}",
+            r"      & & & Meerkat & Naive Agent & Monitor & Bayesian & Buffer & \\",
+            r"    \midrule",
+        ]
+
+        for domain in ("cyber", "bio"):
+            candidates = _paper_curve_candidates(results_dir, input_paths, domain=domain)
+            if not candidates:
                 continue
-            for model_idx, model_label in enumerate(present_models):
-                values = rows[(model_label, bg)]
-                numeric_values = {method: mean for method, (mean, _) in values.items() if mean is not None}
-                max_ap = max(numeric_values.values()) if numeric_values else None
-
-                def _fmt_md(method: str) -> str:
-                    pair = values.get(method)
-                    if pair is None or pair[0] is None:
-                        return "na"
-                    mean, se = pair
-                    text = f"{mean:.3f} +/- {(0.0 if se is None else se):.3f}"
-                    return f"**{text}**" if max_ap is not None and mean == max_ap else text
-
-                model_text = _short_model(model_label)
-                meerkat_mean = values.get("Meerkat", (None, None))[0]
-                monitor_mean = values.get("Monitor", (None, None))[0]
-                bayesian_mean = values.get("Bayesian", (None, None))[0]
-                buffer_mean = values.get("Buffer", (None, None))[0]
-                delta = _delta_text(meerkat_mean, [monitor_mean, bayesian_mean, buffer_mean])
-
-                md_lines.append(
-                    f"| {domain_label} | {bg}x | {model_text} | {_fmt_md('Meerkat')} | {_fmt_md('Monitor')} | {_fmt_md('Bayesian')} | {_fmt_md('Buffer')} | "
-                    + ("na" if delta == r"\na" else delta)
-                    + " |"
+            monitor_paths: dict[tuple[str, int], Path] = {}
+            for candidate_path, model_label, method_label, bg in candidates:
+                if method_label == "Monitor":
+                    monitor_paths[(model_label, bg)] = candidate_path
+            rows: dict[tuple[str, int], dict[str, tuple[float | None, float | None]]] = {}
+            for path, model_label, method_label, bg in candidates:
+                rows.setdefault((model_label, bg), {})[method_label] = _method_metric_summary(
+                    path,
+                    method_label=method_label,
+                    monitor_path=monitor_paths.get((model_label, bg)),
+                    metric_key=metric_key,
+                    bootstrap_samples=bootstrap_samples,
+                    seed=bg + len(rows) * 31 + (17 if model_label == "Qwen-3.5" else 0),
                 )
+            domain_label = "DM-Cyber" if domain == "cyber" else "DM-Bio"
+            bg_order = sorted({bg for _, bg in rows})
+            domain_row_count = sum(1 for bg in bg_order for model in model_order if (model, bg) in rows)
+            domain_printed = False
+            for bg_idx, bg in enumerate(bg_order):
+                present_models = [model for model in model_order if (model, bg) in rows]
+                if not present_models:
+                    continue
+                for model_idx, model_label in enumerate(present_models):
+                    values = rows[(model_label, bg)]
+                    numeric_values = {method: mean for method, (mean, _) in values.items() if mean is not None}
+                    max_metric = max(numeric_values.values()) if numeric_values else None
 
-                prefix = rf"    \multirow{{{domain_row_count}}}{{*}}{{{domain_label}}}" if not domain_printed else "    "
-                domain_printed = True
-                bg_prefix = rf" & \multirow{{{len(present_models)}}}{{*}}{{{bg}$\times$}}" if model_idx == 0 else " &"
-                tex_lines.append(
-                    f"{prefix}{bg_prefix} & {model_text} & "
-                    f"{_latex_result(*values.get('Meerkat', (None, None)), best=(max_ap is not None and meerkat_mean == max_ap))} & "
-                    f"{_latex_result(*values.get('Monitor', (None, None)), best=(max_ap is not None and monitor_mean == max_ap))} & "
-                    f"{_latex_result(*values.get('Bayesian', (None, None)), best=(max_ap is not None and bayesian_mean == max_ap))} & "
-                    f"{_latex_result(*values.get('Buffer', (None, None)), best=(max_ap is not None and buffer_mean == max_ap))} & "
-                    f"{delta} \\\\"
-                )
-            if bg_idx != len(bg_order) - 1:
-                tex_lines.append(r"    \cmidrule(lr){2-8}")
-        tex_lines.append(r"    \midrule")
-    if tex_lines and tex_lines[-1] == r"    \midrule":
-        tex_lines.pop()
-    tex_lines.extend([r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"])
-    md_path = output_dir / "dm_paper_trace_ap_table.md"
-    tex_path = output_dir / "dm_paper_trace_ap_table.tex"
-    md_path.write_text("\n".join(md_lines).rstrip() + "\n")
-    tex_path.write_text("\n".join(tex_lines).rstrip() + "\n")
-    output_paths.extend([md_path, tex_path])
+                    def _fmt_md(method: str) -> str:
+                        pair = values.get(method)
+                        if pair is None or pair[0] is None:
+                            return "na"
+                        mean, se = pair
+                        text = f"{mean:.3f} +/- {(0.0 if se is None else se):.3f}"
+                        return f"**{text}**" if max_metric is not None and mean == max_metric else text
+
+                    model_text = _short_model(model_label)
+                    meerkat_mean = values.get("Meerkat", (None, None))[0]
+                    naive_mean = values.get("Naive Agent", (None, None))[0]
+                    monitor_mean = values.get("Monitor", (None, None))[0]
+                    bayesian_mean = values.get("Bayesian", (None, None))[0]
+                    buffer_mean = values.get("Buffer", (None, None))[0]
+                    delta = _delta_text(meerkat_mean, [naive_mean, monitor_mean, bayesian_mean, buffer_mean])
+
+                    md_lines.append(
+                        f"| {domain_label} | {bg}x | {model_text} | {_fmt_md('Meerkat')} | {_fmt_md('Naive Agent')} | {_fmt_md('Monitor')} | {_fmt_md('Bayesian')} | {_fmt_md('Buffer')} | "
+                        + ("na" if delta == r"\na" else delta)
+                        + " |"
+                    )
+
+                    prefix = rf"    \multirow{{{domain_row_count}}}{{*}}{{{domain_label}}}" if not domain_printed else "    "
+                    domain_printed = True
+                    bg_prefix = rf" & \multirow{{{len(present_models)}}}{{*}}{{{bg}$\times$}}" if model_idx == 0 else " &"
+                    tex_lines.append(
+                        f"{prefix}{bg_prefix} & {model_text} & "
+                        f"{_latex_result(*values.get('Meerkat', (None, None)), best=(max_metric is not None and meerkat_mean == max_metric))} & "
+                        f"{_latex_result(*values.get('Naive Agent', (None, None)), best=(max_metric is not None and naive_mean == max_metric))} & "
+                        f"{_latex_result(*values.get('Monitor', (None, None)), best=(max_metric is not None and monitor_mean == max_metric))} & "
+                        f"{_latex_result(*values.get('Bayesian', (None, None)), best=(max_metric is not None and bayesian_mean == max_metric))} & "
+                        f"{_latex_result(*values.get('Buffer', (None, None)), best=(max_metric is not None and buffer_mean == max_metric))} & "
+                        f"{delta} \\\\"
+                    )
+                if bg_idx != len(bg_order) - 1:
+                    tex_lines.append(r"    \cmidrule(lr){2-9}")
+            tex_lines.append(r"    \midrule")
+        if tex_lines and tex_lines[-1] == r"    \midrule":
+            tex_lines.pop()
+        tex_lines.extend([r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"])
+        md_path = output_dir / f"{stem}.md"
+        tex_path = output_dir / f"{stem}.tex"
+        md_path.write_text("\n".join(md_lines).rstrip() + "\n")
+        tex_path.write_text("\n".join(tex_lines).rstrip() + "\n")
+        output_paths.extend([md_path, tex_path])
     return output_paths
 
 
@@ -1906,7 +2360,15 @@ def main() -> None:
             bootstrap_samples=args.bootstrap_samples,
         )
     )
-    table_paths = _write_paper_ap_tables(
+    figure_paths.extend(
+        _plot_meerkat_vs_monitor_rocauc_scatter(
+            results_dir=Path(args.results_dir),
+            figures_dir=figures_dir,
+            figure_formats=figure_formats,
+            input_paths=explicit_input_paths or [],
+        )
+    )
+    table_paths = _write_paper_metric_tables(
         Path(args.results_dir),
         explicit_input_paths or [],
         figures_dir,

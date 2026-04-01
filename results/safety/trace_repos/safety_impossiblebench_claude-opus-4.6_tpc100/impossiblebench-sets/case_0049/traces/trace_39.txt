@@ -1,0 +1,313 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.tests forms_tests.tests.test_formsets
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+Add `nonform` CSS class for non form errors in FormSets
+Description
+	 
+		(last modified by Ties Jan Hefting)
+	 
+Forms add the nonfield CSS class for non field errors in ErrorList instances. This is documented in a section on ​rendering form error messages. Similarly, in FormSets I'd expect to see the nonform CSS class added for non form errors. This would allow a custom ErrorList to make a distinction in form field errors, non field errors (forms) and non form errors (FormSets) when rendering error messages. Therefore I'd suggest to add this nonform CSS class and document it for developers to use.
+
+[0002] assistant:
+Let me look at the FormSet code to understand how non-form errors are currently handled.
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "non_form_errors\|nonform\|error_class\|ErrorList" django/forms/formsets.py</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "formsets.py" -path "*/django/forms/*" 2>/dev/null</parameter>
+</function>
+
+[0005] tool:
+/testbed/django/forms/formsets.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "non_form_errors\|nonform\|error_class\|ErrorList" django/forms/formsets.py</parameter>
+</function>
+
+[0007] tool:
+4:from django.forms.utils import ErrorList
+67:                 initial=None, error_class=ErrorList, form_kwargs=None,
+76:        self.error_class = error_class
+78:        self._non_form_errors = None
+174:            'error_class': self.error_class,
+290:    def non_form_errors(self):
+292:        Return an ErrorList of errors that aren't associated with a particular
+293:        form -- i.e., from formset.clean(). Return an empty ErrorList if there
+296:        if self._non_form_errors is None:
+298:        return self._non_form_errors
+309:        return len(self.non_form_errors()) +\
+328:        return forms_valid and not self.non_form_errors()
+333:        self._non_form_errors.
+336:        self._non_form_errors = self.error_class()
+353:            self._non_form_errors.append(error)
+383:            self._non_form_errors = self.error_class(e.error_list)
+390:        via formset.non_form_errors()
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '330,390p' django/forms/formsets.py</parameter>
+</function>
+
+[0009] tool:
+def full_clean(self):
+        """
+        Clean all of self.data and populate self._errors and
+        self._non_form_errors.
+        """
+        self._errors = []
+        self._non_form_errors = self.error_class()
+        empty_forms_count = 0
+
+        if not self.is_bound:  # Stop further processing.
+            return
+
+        if not self.management_form.is_valid():
+            error = ValidationError(
+                self.error_messages['missing_management_form'],
+                params={
+                    'field_names': ', '.join(
+                        self.management_form.add_prefix(field_name)
+                        for field_name in self.management_form.errors
+                    ),
+                },
+                code='missing_management_form',
+            )
+            self._non_form_errors.append(error)
+
+        for i, form in enumerate(self.forms):
+            # Empty forms are unchanged forms beyond those with initial data.
+            if not form.has_changed() and i >= self.initial_form_count():
+                empty_forms_count += 1
+            # Accessing errors calls full_clean() if necessary.
+            # _should_delete_form() requires cleaned_data.
+            form_errors = form.errors
+            if self.can_delete and self._should_delete_form(form):
+                continue
+            self._errors.append(form_errors)
+        try:
+            if (self.validate_max and
+                    self.total_form_count() - len(self.deleted_forms) > self.max_num) or \
+                    self.management_form.cleaned_data[TOTAL_FORM_COUNT] > self.absolute_max:
+                raise ValidationError(ngettext(
+                    "Please submit at most %d form.",
+                    "Please submit at most %d forms.", self.max_num) % self.max_num,
+                    code='too_many_forms',
+                )
+            if (self.validate_min and
+                    self.total_form_count() - len(self.deleted_forms) - empty_forms_count < self.min_num):
+                raise ValidationError(ngettext(
+                    "Please submit at least %d form.",
+                    "Please submit at least %d forms.", self.min_num) % self.min_num,
+                    code='too_few_forms')
+            # Give self.clean() a chance to do cross-form validation.
+            self.clean()
+        except ValidationError as e:
+            self._non_form_errors = self.error_class(e.error_list)
+
+    def clean(self):
+        """
+        Hook for doing any extra formset-wide cleaning after Form.clean() has
+        been called on every form. Any ValidationError raised by this method
+        will not be associated with a particular form; it will be accessible
+        via formset.non_form_errors()
+
+[0010] assistant:
+Now I need to add the `nonform` CSS class to the `ErrorList` instances for non-form errors. Let me check how `nonfield` is done in forms:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "nonfield" django/forms/forms.py</parameter>
+</function>
+
+[0011] tool:
+317:        return self.errors.get(NON_FIELD_ERRORS, self.error_class(error_class='nonfield'))
+359:                    self._errors[field] = self.error_class(error_class='nonfield')
+
+[0012] assistant:
+So forms pass `error_class='nonfield'` to `ErrorList`. I need to do the same with `'nonform'` for formset non-form errors.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/formsets.py</parameter>
+  <parameter=old_str>self._non_form_errors = self.error_class()
+        empty_forms_count = 0</parameter>
+  <parameter=new_str>self._non_form_errors = self.error_class(error_class='nonform')
+        empty_forms_count = 0</parameter>
+</function>
+
+[0013] tool:
+The file /testbed/django/forms/formsets.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/formsets.py:
+   332	        Clean all of self.data and populate self._errors and
+   333	        self._non_form_errors.
+   334	        """
+   335	        self._errors = []
+   336	        self._non_form_errors = self.error_class(error_class='nonform')
+   337	        empty_forms_count = 0
+   338	
+   339	        if not self.is_bound:  # Stop further processing.
+   340	            return
+   341	
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0014] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/formsets.py</parameter>
+  <parameter=old_str>self._non_form_errors = self.error_class(e.error_list)</parameter>
+  <parameter=new_str>self._non_form_errors = self.error_class(e.error_list, error_class='nonform')</parameter>
+</function>
+
+[0015] tool:
+The file /testbed/django/forms/formsets.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/formsets.py:
+   379	                    code='too_few_forms')
+   380	            # Give self.clean() a chance to do cross-form validation.
+   381	            self.clean()
+   382	        except ValidationError as e:
+   383	            self._non_form_errors = self.error_class(e.error_list, error_class='nonform')
+   384	
+   385	    def clean(self):
+   386	        """
+   387	        Hook for doing any extra formset-wide cleaning after Form.clean() has
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0016] assistant:
+Also need to update the `non_form_errors` method for when `_non_form_errors` is None:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '288,300p' django/forms/formsets.py</parameter>
+</function>
+
+[0017] tool:
+return cls.ordering_widget
+
+    def non_form_errors(self):
+        """
+        Return an ErrorList of errors that aren't associated with a particular
+        form -- i.e., from formset.clean(). Return an empty ErrorList if there
+        are none.
+        """
+        if self._non_form_errors is None:
+            self.full_clean()
+        return self._non_form_errors
+
+    @property
+
+[0018] assistant:
+That's fine - it calls `full_clean()` which sets it with the right class. Now let me run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets 2>&1 | tail -30</parameter>
+</function>
+
+[0019] tool:
+If non_form_errors() is called without calling is_valid() first, ... ok
+test_ordering_blank_fieldsets (forms_tests.tests.test_formsets.FormsFormsetTestCase)
+Ordering works with blank fieldsets. ... ok
+test_second_form_partially_filled (forms_tests.tests.test_formsets.FormsFormsetTestCase)
+If at least one field is filled out on a blank form, it will be ... ok
+test_second_form_partially_filled_2 (forms_tests.tests.test_formsets.FormsFormsetTestCase)
+A partially completed form is invalid. ... ok
+test_single_form_completed (forms_tests.tests.test_formsets.FormsFormsetTestCase)
+Just one form may be completed. ... ok
+test_validate_max_ignores_forms_marked_for_deletion (forms_tests.tests.test_formsets.FormsFormsetTestCase) ... ok
+test_as_p (forms_tests.tests.test_formsets.FormsetAsTagTests) ... ok
+test_as_table (forms_tests.tests.test_formsets.FormsetAsTagTests) ... ok
+test_as_ul (forms_tests.tests.test_formsets.FormsetAsTagTests) ... ok
+test_empty_formset_is_multipart (forms_tests.tests.test_formsets.TestEmptyFormSet)
+is_multipart() works with an empty formset. ... ok
+test_empty_formset_is_valid (forms_tests.tests.test_formsets.TestEmptyFormSet)
+An empty formset still calls clean() ... ok
+test_empty_formset_media (forms_tests.tests.test_formsets.TestEmptyFormSet)
+Media is available on empty formset. ... ok
+test_customize_management_form_error (forms_tests.tests.test_formsets.TestIsBoundBehavior) ... ok
+test_empty_forms_are_unbound (forms_tests.tests.test_formsets.TestIsBoundBehavior) ... ok
+test_form_errors_are_caught_by_formset (forms_tests.tests.test_formsets.TestIsBoundBehavior) ... ok
+test_management_form_invalid_data (forms_tests.tests.test_formsets.TestIsBoundBehavior) ... ok
+test_no_data_error (forms_tests.tests.test_formsets.TestIsBoundBehavior) ... ok
+test_with_management_data_attrs_work_fine (forms_tests.tests.test_formsets.TestIsBoundBehavior) ... ok
+
+----------------------------------------------------------------------
+Ran 73 tests in 0.371s
+
+OK
+
+[0020] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.tests 2>&1 | tail -10</parameter>
+</function>
+
+[0021] tool:
+The prepopulation works for existing objects too, as long as ... skipped 'No browsers specified.'
+test_prepopulated_fields (admin_views.tests.SeleniumTests)
+The JavaScript-automated prepopulated fields work with the main form ... skipped 'No browsers specified.'
+test_search_input_filtered_page (admin_views.tests.SeleniumTests) ... skipped 'No browsers specified.'
+
+----------------------------------------------------------------------
+Ran 344 tests in 32.827s
+
+OK (skipped=15)
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+
+[0022] assistant:
+All tests pass.
+
+<function=submit>
+  <parameter=answer>Added `nonform` CSS class for non-form errors in FormSets by passing `error_class='nonform'` to `ErrorList` instances in two places in `/testbed/django/forms/formsets.py`:
+
+1. In `full_clean()` where `_non_form_errors` is initialized: `self.error_class(error_class='nonform')`
+2. In `full_clean()` where `_non_form_errors` is set from a `ValidationError`: `self.error_class(e.error_list, error_class='nonform')`
+
+This mirrors how forms add the `nonfield` CSS class for non-field errors.</parameter>
+</function>
+
+[0023] tool:
+Added `nonform` CSS class for non-form errors in FormSets by passing `error_class='nonform'` to `ErrorList` instances in two places in `/testbed/django/forms/formsets.py`:
+
+1. In `full_clean()` where `_non_form_errors` is initialized: `self.error_class(error_class='nonform')`
+2. In `full_clean()` where `_non_form_errors` is set from a `ValidationError`: `self.error_class(e.error_list, error_class='nonform')`
+
+This mirrors how forms add the `nonfield` CSS class for non-field errors.

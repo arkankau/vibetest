@@ -63,3 +63,41 @@ def test_judge_vs_at_ap_points_uses_model_specific_at_score_mode(tmp_path) -> No
     assert len(dataset_points) == 1
     assert dataset_points[0]["judge_ap"] == 1.0
     assert dataset_points[0]["at_ap"] == 1.0
+
+
+def test_write_safety_metric_tables_excludes_explicit_max_merge_rows(tmp_path) -> None:
+    case_rows = [
+        {
+            "group": "10",
+            "file": str(tmp_path / "safety_trace-dataset_AT-gpt-5.4-mini.jsonl"),
+            "method_base_override": "AT",
+            "method_variant_override": None,
+            "method_model": "gpt-5.4-mini",
+            "trace_average_precision": 0.700,
+            "trace_average_precision_bootstrap_se": 0.010,
+        },
+        {
+            "group": "10",
+            "file": str(tmp_path / "safety_trace-dataset_AT-gpt-5.4-mini.jsonl"),
+            "method_base_override": "AT",
+            "method_variant_override": "max-merge",
+            "method_model": "gpt-5.4-mini",
+            "trace_average_precision": 0.950,
+            "trace_average_precision_bootstrap_se": 0.020,
+        },
+        {
+            "group": "10",
+            "file": str(tmp_path / "safety_trace-dataset_llmjudge-gpt-5.4-mini.jsonl"),
+            "method_base_override": "llmjudge",
+            "method_variant_override": None,
+            "method_model": "gpt-5.4-mini",
+            "trace_average_precision": 0.800,
+            "trace_average_precision_bootstrap_se": 0.010,
+        },
+    ]
+
+    safety_metrics._write_safety_metric_tables(case_rows, tmp_path)
+
+    md_text = (tmp_path / "safety_paper_trace_ap_table.md").read_text(encoding="utf-8")
+    assert "| TRACE | 10 | GPT-5.4m | 0.700 +/- 0.010 | **0.800 +/- 0.010** | na | na | na | -0.100 |" in md_text
+    assert "0.950 +/- 0.020" not in md_text

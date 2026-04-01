@@ -1,0 +1,308 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_autocomplete_view
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+Refactor AutocompleteJsonView to support extra fields in autocomplete response
+Description
+	 
+		(last modified by mrts)
+	 
+Adding data attributes to items in ordinary non-autocomplete foreign key fields that use forms.widgets.Select-based widgets is relatively easy. This enables powerful and dynamic admin site customizations where fields from related models are updated immediately when users change the selected item.
+However, adding new attributes to autocomplete field results currently requires extending contrib.admin.views.autocomplete.AutocompleteJsonView and fully overriding the AutocompleteJsonView.get() method. Here's an example:
+class MyModelAdmin(admin.ModelAdmin):
+	def get_urls(self):
+		return [
+			path('autocomplete/', CustomAutocompleteJsonView.as_view(admin_site=self.admin_site))
+			if url.pattern.match('autocomplete/')
+			else url for url in super().get_urls()
+		]
+class CustomAutocompleteJsonView(AutocompleteJsonView):
+	def get(self, request, *args, **kwargs):
+		self.term, self.model_admin, self.source_field, to_field_name = self.process_request(request)
+		if not self.has_perm(request):
+			raise PermissionDenied
+		self.object_list = self.get_queryset()
+		context = self.get_context_data()
+		return JsonResponse({
+			'results': [
+				{'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'notes': obj.notes} # <-- customization here
+				for obj in context['object_list']
+			],
+			'pagination': {'more': context['page_obj'].has_next()},
+		})
+The problem with this is that as AutocompleteJsonView.get() keeps evolving, there's quite a lot of maintenance overhead required to catch up.
+The solutions is simple, side-effect- and risk-free: adding a result customization extension point to get() by moving the lines that construct the results inside JsonResponse constructor to a separate method. So instead of
+		return JsonResponse({
+			'results': [
+				{'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+				for obj in context['object_list']
+			],
+			'pagination': {'more': context['page_obj'].has_next()},
+		})
+there would be
+		return JsonResponse({
+			'results': [
+				self.serialize_result(obj, to_field_name) for obj in context['object_list']
+			],
+			'pagination': {'more': context['page_obj'].has_next()},
+		})
+where serialize_result() contains the original object to dictionary conversion code that would be now easy to override:
+def serialize_result(self, obj, to_field_name):
+	return {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+The example CustomAutocompleteJsonView from above would now become succinct and maintainable:
+class CustomAutocompleteJsonView(AutocompleteJsonView):
+	def serialize_result(self, obj, to_field_name):
+		return super.serialize_result(obj, to_field_name) | {'notes': obj.notes}
+What do you think, is this acceptable? I'm more than happy to provide the patch.
+
+[0002] assistant:
+<function=bash>
+  <parameter=cmd>grep -n 'def get' django/contrib/admin/views/autocomplete.py</parameter>
+</function>
+
+[0003] tool:
+12:    def get(self, request, *args, **kwargs):
+35:    def get_paginator(self, *args, **kwargs):
+39:    def get_queryset(self):
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>cat django/contrib/admin/views/autocomplete.py</parameter>
+</function>
+
+[0005] tool:
+from django.apps import apps
+from django.core.exceptions import FieldDoesNotExist, PermissionDenied
+from django.http import Http404, JsonResponse
+from django.views.generic.list import BaseListView
+
+
+class AutocompleteJsonView(BaseListView):
+    """Handle AutocompleteWidget's AJAX requests for data."""
+    paginate_by = 20
+    admin_site = None
+
+    def get(self, request, *args, **kwargs):
+        """
+        Return a JsonResponse with search results of the form:
+        {
+            results: [{id: "123" text: "foo"}],
+            pagination: {more: true}
+        }
+        """
+        self.term, self.model_admin, self.source_field, to_field_name = self.process_request(request)
+
+        if not self.has_perm(request):
+            raise PermissionDenied
+
+        self.object_list = self.get_queryset()
+        context = self.get_context_data()
+        return JsonResponse({
+            'results': [
+                {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+                for obj in context['object_list']
+            ],
+            'pagination': {'more': context['page_obj'].has_next()},
+        })
+
+    def get_paginator(self, *args, **kwargs):
+        """Use the ModelAdmin's paginator."""
+        return self.model_admin.get_paginator(self.request, *args, **kwargs)
+
+    def get_queryset(self):
+        """Return queryset based on ModelAdmin.get_search_results()."""
+        qs = self.model_admin.get_queryset(self.request)
+        qs = qs.complex_filter(self.source_field.get_limit_choices_to())
+        qs, search_use_distinct = self.model_admin.get_search_results(self.request, qs, self.term)
+        if search_use_distinct:
+            qs = qs.distinct()
+        return qs
+
+    def process_request(self, request):
+        """
+        Validate request integrity, extract and return request parameters.
+
+        Since the subsequent view permission check requires the target model
+        admin, which is determined here, raise PermissionDenied if the
+        requested app, model or field are malformed.
+
+        Raise Http404 if the target model admin is not configured properly with
+        search_fields.
+        """
+        term = request.GET.get('term', '')
+        try:
+            app_label = request.GET['app_label']
+            model_name = request.GET['model_name']
+            field_name = request.GET['field_name']
+        except KeyError as e:
+            raise PermissionDenied from e
+
+        # Retrieve objects from parameters.
+        try:
+            source_model = apps.get_model(app_label, model_name)
+        except LookupError as e:
+            raise PermissionDenied from e
+
+        try:
+            source_field = source_model._meta.get_field(field_name)
+        except FieldDoesNotExist as e:
+            raise PermissionDenied from e
+        try:
+            remote_model = source_field.remote_field.model
+        except AttributeError as e:
+            raise PermissionDenied from e
+        try:
+            model_admin = self.admin_site._registry[remote_model]
+        except KeyError as e:
+            raise PermissionDenied from e
+
+        # Validate suitability of objects.
+        if not model_admin.get_search_fields(request):
+            raise Http404(
+                '%s must have search_fields for the autocomplete_view.' %
+                type(model_admin).__qualname__
+            )
+
+        to_field_name = getattr(source_field.remote_field, 'field_name', remote_model._meta.pk.attname)
+        to_field_name = remote_model._meta.get_field(to_field_name).attname
+        if not model_admin.to_field_allowed(request, to_field_name):
+            raise PermissionDenied
+
+        return term, model_admin, source_field, to_field_name
+
+    def has_perm(self, request, obj=None):
+        """Check if user has permission to access the related model."""
+        return self.model_admin.has_view_permission(request, obj=obj)
+
+[0006] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/repo/django/contrib/admin/views/autocomplete.py</parameter>
+  <parameter=old_str>return JsonResponse({
+            'results': [
+                {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+                for obj in context['object_list']
+            ],
+            'pagination': {'more': context['page_obj'].has_next()},
+        })</parameter>
+  <parameter=new_str>return JsonResponse({
+            'results': [
+                self.serialize_result(obj, to_field_name)
+                for obj in context['object_list']
+            ],
+            'pagination': {'more': context['page_obj'].has_next()},
+        })
+
+    def serialize_result(self, obj, to_field_name):
+        """
+        Convert the to-field back to an object attribute value and
+        return a dictionary of {id, text} for the result object.
+        """
+        return {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}</parameter>
+</function>
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>find . -path "*/admin/views/autocomplete.py" | head -5</parameter>
+</function>
+
+[0009] tool:
+./django/contrib/admin/views/autocomplete.py
+
+[0010] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>./django/contrib/admin/views/autocomplete.py</parameter>
+  <parameter=old_str>return JsonResponse({
+            'results': [
+                {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+                for obj in context['object_list']
+            ],
+            'pagination': {'more': context['page_obj'].has_next()},
+        })</parameter>
+  <parameter=new_str>return JsonResponse({
+            'results': [
+                self.serialize_result(obj, to_field_name)
+                for obj in context['object_list']
+            ],
+            'pagination': {'more': context['page_obj'].has_next()},
+        })
+
+    def serialize_result(self, obj, to_field_name):
+        """
+        Convert the to-field back to an object attribute value and
+        return a dictionary of {id, text} for the result object.
+        """
+        return {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}</parameter>
+</function>
+
+[0011] tool:
+The file /testbed/django/contrib/admin/views/autocomplete.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/contrib/admin/views/autocomplete.py:
+    23	            raise PermissionDenied
+    24	
+    25	        self.object_list = self.get_queryset()
+    26	        context = self.get_context_data()
+    27	        return JsonResponse({
+    28	            'results': [
+    29	                self.serialize_result(obj, to_field_name)
+    30	                for obj in context['object_list']
+    31	            ],
+    32	            'pagination': {'more': context['page_obj'].has_next()},
+    33	        })
+    34	
+    35	    def serialize_result(self, obj, to_field_name):
+    36	        """
+    37	        Convert the to-field back to an object attribute value and
+    38	        return a dictionary of {id, text} for the result object.
+    39	        """
+    40	        return {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+    41	
+    42	    def get_paginator(self, *args, **kwargs):
+    43	        """Use the ModelAdmin's paginator."""
+    44	        return self.model_admin.get_paginator(self.request, *args, **kwargs)
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0012] assistant:
+<function=submit>
+  <parameter=answer>Added `serialize_result` method to `AutocompleteJsonView` class in `django/contrib/admin/views/autocomplete.py` and refactored `get()` to use it. This provides an easy extension point for customizing autocomplete response fields.</parameter>
+</function>
+
+[0013] tool:
+Added `serialize_result` method to `AutocompleteJsonView` class in `django/contrib/admin/views/autocomplete.py` and refactored `get()` to use it. This provides an easy extension point for customizing autocomplete response fields.

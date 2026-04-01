@@ -1,0 +1,920 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_forms
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+BaseForm's _clean_fields() and changed_data should access values via BoundField
+Description
+	 
+		(last modified by Chris Jerdonek)
+	 
+While working on #32917, I noticed that ​BaseForm._clean_fields() and ​BaseForm.changed_data don't currently access their values through a BoundField object. It would be better for consistency if they did, and to reduce the number of code paths.
+One consequence of the current code is that form._clean_fields() can return a different value from form[name].initial when they should be the same. This case is almost, but not quite, covered by ​test_datetime_clean_initial_callable_disabled() (the test can be adjusted to cover this case).
+As part of this ticket and in line with accessing data through the BoundField objects, I noticed that the code would also be simpler if the per-field logic of changed_data() were moved into a method of the BoundField class. It could be called something like bf.did_change(). This would be more appropriate because whether form data changed for a field is a property of its BoundField (as it depends on the underlying form data), as opposed to the unbound field. With this change, the method could change from its current ~20 lines to something like this--
+@cached_property
+def changed_data(self):
+	return [name for name, bf in self._bound_items() if bf._did_change()]
+A similar change could be made to BaseForm._clean_fields().
+
+[0002] assistant:
+Let me understand the issue and explore the codebase.
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "_clean_fields\|changed_data\|_bound_items\|class BaseForm\|class BoundField" django/forms/forms.py | head -30</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "_clean_fields\|changed_data\|_bound_items\|class BoundField" django/forms/boundfield.py | head -20</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0005] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "forms.py" -path "*/django/forms/*" 2>/dev/null | head -5</parameter>
+</function>
+
+[0006] tool:
+/testbed/django/forms/forms.py
+
+[0007] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "_clean_fields\|changed_data\|_bound_items\|class BaseForm\|class BoundField" django/forms/forms.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "class BoundField\|def initial\|def value\|def _did_change" django/forms/boundfield.py</parameter>
+</function>
+
+[0008] tool:
+52:class BaseForm:
+385:        self._clean_fields()
+389:    def _clean_fields(self):
+435:        return bool(self.changed_data)
+438:    def changed_data(self):
+
+[0009] tool:
+15:class BoundField:
+123:    def value(self):
+213:    def initial(self):
+
+[0010] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '385,475p' django/forms/forms.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '115,240p' django/forms/boundfield.py</parameter>
+</function>
+
+[0011] tool:
+self._clean_fields()
+        self._clean_form()
+        self._post_clean()
+
+    def _clean_fields(self):
+        for name, field in self.fields.items():
+            if field.disabled:
+                value = self.get_initial_for_field(field, name)
+            else:
+                value = self._field_data_value(field, self.add_prefix(name))
+            try:
+                if isinstance(field, FileField):
+                    initial = self.get_initial_for_field(field, name)
+                    value = field.clean(value, initial)
+                else:
+                    value = field.clean(value)
+                self.cleaned_data[name] = value
+                if hasattr(self, 'clean_%s' % name):
+                    value = getattr(self, 'clean_%s' % name)()
+                    self.cleaned_data[name] = value
+            except ValidationError as e:
+                self.add_error(name, e)
+
+    def _clean_form(self):
+        try:
+            cleaned_data = self.clean()
+        except ValidationError as e:
+            self.add_error(None, e)
+        else:
+            if cleaned_data is not None:
+                self.cleaned_data = cleaned_data
+
+    def _post_clean(self):
+        """
+        An internal hook for performing additional cleaning after form cleaning
+        is complete. Used for model validation in model forms.
+        """
+        pass
+
+    def clean(self):
+        """
+        Hook for doing any extra form-wide cleaning after Field.clean() has been
+        called on every field. Any ValidationError raised by this method will
+        not be associated with a particular field; it will have a special-case
+        association with the field named '__all__'.
+        """
+        return self.cleaned_data
+
+    def has_changed(self):
+        """Return True if data differs from initial."""
+        return bool(self.changed_data)
+
+    @cached_property
+    def changed_data(self):
+        data = []
+        for name, field in self.fields.items():
+            data_value = self._field_data_value(field, self.add_prefix(name))
+            if not field.show_hidden_initial:
+                # Use the BoundField's initial as this is the value passed to
+                # the widget.
+                initial_value = self[name].initial
+            else:
+                initial_prefixed_name = self.add_initial_prefix(name)
+                hidden_widget = field.hidden_widget()
+                try:
+                    initial_value = field.to_python(
+                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+                    )
+                except ValidationError:
+                    # Always assume data has changed if validation fails.
+                    data.append(name)
+                    continue
+            if field.has_changed(initial_value, data_value):
+                data.append(name)
+        return data
+
+    @property
+    def media(self):
+        """Return all media required to render the widgets on this form."""
+        media = Media()
+        for field in self.fields.values():
+            media = media + field.widget.media
+        return media
+
+    def is_multipart(self):
+        """
+        Return True if the form needs to be multipart-encoded, i.e. it has
+        FileInput, or False otherwise.
+        """
+        return any(field.widget.needs_multipart_form for field in self.fields.values())
+
+[0012] tool:
+@property
+    def data(self):
+        """
+        Return the data for this BoundField, or None if it wasn't given.
+        """
+        return self.form._field_data_value(self.field, self.html_name)
+
+    def value(self):
+        """
+        Return the value for this BoundField, using the initial value if
+        the form is not bound or the data otherwise.
+        """
+        data = self.initial
+        if self.form.is_bound:
+            data = self.field.bound_data(self.data, data)
+        return self.field.prepare_value(data)
+
+    def label_tag(self, contents=None, attrs=None, label_suffix=None):
+        """
+        Wrap the given contents in a <label>, if the field has an ID attribute.
+        contents should be mark_safe'd to avoid HTML escaping. If contents
+        aren't given, use the field's HTML-escaped label.
+
+        If attrs are given, use them as HTML attributes on the <label> tag.
+
+        label_suffix overrides the form's label_suffix.
+        """
+        contents = contents or self.label
+        if label_suffix is None:
+            label_suffix = (self.field.label_suffix if self.field.label_suffix is not None
+                            else self.form.label_suffix)
+        # Only add the suffix if the label does not end in punctuation.
+        # Translators: If found as last label character, these punctuation
+        # characters will prevent the default label_suffix to be appended to the label
+        if label_suffix and contents and contents[-1] not in _(':?.!'):
+            contents = format_html('{}{}', contents, label_suffix)
+        widget = self.field.widget
+        id_ = widget.attrs.get('id') or self.auto_id
+        if id_:
+            id_for_label = widget.id_for_label(id_)
+            if id_for_label:
+                attrs = {**(attrs or {}), 'for': id_for_label}
+            if self.field.required and hasattr(self.form, 'required_css_class'):
+                attrs = attrs or {}
+                if 'class' in attrs:
+                    attrs['class'] += ' ' + self.form.required_css_class
+                else:
+                    attrs['class'] = self.form.required_css_class
+            attrs = flatatt(attrs) if attrs else ''
+            contents = format_html('<label{}>{}</label>', attrs, contents)
+        else:
+            contents = conditional_escape(contents)
+        return mark_safe(contents)
+
+    def css_classes(self, extra_classes=None):
+        """
+        Return a string of space-separated CSS classes for this field.
+        """
+        if hasattr(extra_classes, 'split'):
+            extra_classes = extra_classes.split()
+        extra_classes = set(extra_classes or [])
+        if self.errors and hasattr(self.form, 'error_css_class'):
+            extra_classes.add(self.form.error_css_class)
+        if self.field.required and hasattr(self.form, 'required_css_class'):
+            extra_classes.add(self.form.required_css_class)
+        return ' '.join(extra_classes)
+
+    @property
+    def is_hidden(self):
+        """Return True if this BoundField's widget is hidden."""
+        return self.field.widget.is_hidden
+
+    @property
+    def auto_id(self):
+        """
+        Calculate and return the ID attribute for this BoundField, if the
+        associated Form has specified auto_id. Return an empty string otherwise.
+        """
+        auto_id = self.form.auto_id  # Boolean or string
+        if auto_id and '%s' in str(auto_id):
+            return auto_id % self.html_name
+        elif auto_id:
+            return self.html_name
+        return ''
+
+    @property
+    def id_for_label(self):
+        """
+        Wrapper around the field widget's `id_for_label` method.
+        Useful, for example, for focusing on this field regardless of whether
+        it has a single widget or a MultiWidget.
+        """
+        widget = self.field.widget
+        id_ = widget.attrs.get('id') or self.auto_id
+        return widget.id_for_label(id_)
+
+    @cached_property
+    def initial(self):
+        data = self.form.get_initial_for_field(self.field, self.name)
+        # If this is an auto-generated default date, nix the microseconds for
+        # standardized handling. See #22502.
+        if (isinstance(data, (datetime.datetime, datetime.time)) and
+                not self.field.widget.supports_microseconds):
+            data = data.replace(microsecond=0)
+        return data
+
+    def build_widget_attrs(self, attrs, widget=None):
+        widget = widget or self.field.widget
+        attrs = dict(attrs)  # Copy attrs to avoid modifying the argument.
+        if widget.use_required_attribute(self.initial) and self.field.required and self.form.use_required_attribute:
+            attrs['required'] = True
+        if self.field.disabled:
+            attrs['disabled'] = True
+        return attrs
+
+    @property
+    def widget_type(self):
+        return re.sub(r'widget$|input$', '', self.field.widget.__class__.__name__.lower())
+
+
+@html_safe
+class BoundWidget:
+    """
+    A container class used for iterating over widgets. This is useful for
+    widgets that have choices. For example, the following can be used in a
+
+[0013] assistant:
+Now let me look at the test file to understand what's expected.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "test_datetime_clean_initial_callable_disabled\|_did_change\|did_change" tests/forms_tests/tests/test_forms.py | head -20</parameter>
+</function>
+
+[0015] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -rn "_did_change\|did_change" tests/forms_tests/tests/test_forms.py | head -20</parameter>
+</function>
+
+[0017] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "datetime_clean_initial_callable_disabled\|_did_change" tests/forms_tests/tests/test_forms.py</parameter>
+</function>
+
+[0019] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && python tests/runtests.py --verbosity 0 --settings=test_sqlite --parallel 1 forms_tests.tests.test_forms 2>&1 | tail -20</parameter>
+</function>
+
+[0020] tool:
+AssertionError: datetime.datetime(2006, 10, 25, 14, 30, 46) != datetime.datetime(2006, 10, 25, 14, 30, 47)
+
+======================================================================
+FAIL: test_datetime_clean_disabled_callable_initial_microseconds (forms_tests.tests.test_forms.FormsTestCase)
+Cleaning a form with a disabled DateTimeField and callable initial
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/testbed/tests/forms_tests/tests/test_forms.py", line 2141, in test_datetime_clean_disabled_callable_initial_microseconds
+    self.assertEqual(form.cleaned_data, {
+AssertionError: {'dt': datetime.datetime(2006, 10, 25, 14, 30, 46, 123456)} != {'dt': datetime.datetime(2006, 10, 25, 14, 30, 46)}
+- {'dt': datetime.datetime(2006, 10, 25, 14, 30, 46, 123456)}
+?                                                 --------
+
++ {'dt': datetime.datetime(2006, 10, 25, 14, 30, 46)}
+
+----------------------------------------------------------------------
+Ran 120 tests in 0.265s
+
+FAILED (failures=2)
+System check identified no issues (0 silenced).
+
+[0021] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "test_datetime_clean_disabled_callable_initial" tests/forms_tests/tests/test_forms.py</parameter>
+</function>
+
+[0022] tool:
+2132:    def test_datetime_clean_disabled_callable_initial_microseconds(self):
+2145:    def test_datetime_clean_disabled_callable_initial_bound_field(self):
+
+[0023] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '2100,2175p' tests/forms_tests/tests/test_forms.py</parameter>
+</function>
+
+[0024] tool:
+auto_timestamp = DateTimeField(initial=delayed_now)
+            auto_time_only = TimeField(initial=delayed_now_time)
+            supports_microseconds = DateTimeField(initial=delayed_now, widget=TextInput)
+            hi_default_microsec = DateTimeField(initial=delayed_now, widget=HiddenInput)
+            hi_without_microsec = DateTimeField(initial=delayed_now, widget=HiddenInputWithoutMicrosec)
+            ti_without_microsec = DateTimeField(initial=delayed_now, widget=TextInputWithoutMicrosec)
+
+        unbound = DateTimeForm()
+        self.assertEqual(unbound['auto_timestamp'].value(), now_no_ms)
+        self.assertEqual(unbound['auto_time_only'].value(), now_no_ms.time())
+        self.assertEqual(unbound['supports_microseconds'].value(), now)
+        self.assertEqual(unbound['hi_default_microsec'].value(), now)
+        self.assertEqual(unbound['hi_without_microsec'].value(), now_no_ms)
+        self.assertEqual(unbound['ti_without_microsec'].value(), now_no_ms)
+
+    def get_datetime_form_with_callable_initial(self, disabled, microseconds=0):
+        class FakeTime:
+            def __init__(self):
+                self.elapsed_seconds = 0
+
+            def now(self):
+                self.elapsed_seconds += 1
+                return datetime.datetime(
+                    2006, 10, 25, 14, 30, 45 + self.elapsed_seconds,
+                    microseconds,
+                )
+
+        class DateTimeForm(forms.Form):
+            dt = DateTimeField(initial=FakeTime().now, disabled=disabled)
+
+        return DateTimeForm({})
+
+    def test_datetime_clean_disabled_callable_initial_microseconds(self):
+        """
+        Cleaning a form with a disabled DateTimeField and callable initial
+        removes microseconds.
+        """
+        form = self.get_datetime_form_with_callable_initial(
+            disabled=True, microseconds=123456,
+        )
+        self.assertEqual(form.errors, {})
+        self.assertEqual(form.cleaned_data, {
+            'dt': datetime.datetime(2006, 10, 25, 14, 30, 46),
+        })
+
+    def test_datetime_clean_disabled_callable_initial_bound_field(self):
+        """
+        The cleaned value for a form with a disabled DateTimeField and callable
+        initial matches the bound field's cached initial value.
+        """
+        form = self.get_datetime_form_with_callable_initial(disabled=True)
+        self.assertEqual(form.errors, {})
+        cleaned = form.cleaned_data['dt']
+        self.assertEqual(cleaned, datetime.datetime(2006, 10, 25, 14, 30, 46))
+        bf = form['dt']
+        self.assertEqual(cleaned, bf.initial)
+
+    def test_datetime_changed_data_callable_with_microseconds(self):
+        class DateTimeForm(forms.Form):
+            dt = DateTimeField(initial=lambda: datetime.datetime(2006, 10, 25, 14, 30, 45, 123456), disabled=True)
+
+        form = DateTimeForm({'dt': '2006-10-25 14:30:45'})
+        self.assertEqual(form.changed_data, [])
+
+    def test_help_text(self):
+        # You can specify descriptive text for a field by using the 'help_text' argument)
+        class UserRegistration(Form):
+            username = CharField(max_length=10, help_text='e.g., user@example.com')
+            password = CharField(widget=PasswordInput, help_text='Wählen Sie mit Bedacht.')
+
+        p = UserRegistration(auto_id=False)
+        self.assertHTMLEqual(
+            p.as_ul(),
+            """<li>Username: <input type="text" name="username" maxlength="10" required>
+<span class="helptext">e.g., user@example.com</span></li>
+<li>Password: <input type="password" name="password" required>
+
+[0025] assistant:
+Now I understand the issue. The tests expect:
+
+1. `test_datetime_clean_disabled_callable_initial_microseconds`: When cleaning a disabled DateTimeField with callable initial, microseconds should be removed (matching BoundField.initial behavior).
+
+2. `test_datetime_clean_disabled_callable_initial_bound_field`: The cleaned value should match `bf.initial` (same cached value).
+
+3. `test_datetime_changed_data_callable_with_microseconds`: changed_data should use BoundField's initial (which strips microseconds).
+
+The fix: In `_clean_fields()`, for disabled fields, use `self[name].initial` (BoundField's initial) instead of `self.get_initial_for_field(field, name)`. 
+
+This ensures the cached, microsecond-stripped value is used. I also need to move the changed_data logic to BoundField._did_change() so it consistently uses the same initial value. Let me trace through what changes are actually needed.
+
+Now I understand the issue. The `_clean_fields()` method calls `get_initial_for_field()` directly instead of going through `BoundField.initial`, which means it gets a fresh call to the callable (different timestamp) and doesn't strip microseconds. Similarly, `changed_data` should use BoundField for consistency.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '155,170p' django/forms/forms.py</parameter>
+</function>
+
+[0026] tool:
+pass
+        try:
+            field = self.fields[name]
+        except KeyError:
+            raise KeyError(
+                "Key '%s' not found in '%s'. Choices are: %s." % (
+                    name,
+                    self.__class__.__name__,
+                    ', '.join(sorted(self.fields)),
+                )
+            )
+        bound_field = field.get_bound_field(self, name)
+        self._bound_fields_cache[name] = bound_field
+        return bound_field
+
+    @property
+
+[0027] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "_bound_items\|_field_data_value\|_widget_data_value" django/forms/forms.py</parameter>
+</function>
+
+[0028] tool:
+194:    def _widget_data_value(self, widget, html_name):
+200:    def _field_data_value(self, field, html_name):
+201:        return self._widget_data_value(field.widget, html_name)
+394:                value = self._field_data_value(field, self.add_prefix(name))
+441:            data_value = self._field_data_value(field, self.add_prefix(name))
+451:                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+
+[0029] assistant:
+Now let me check if `_bound_items` exists:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "_bound_items" django/forms/forms.py</parameter>
+</function>
+
+[0031] assistant:
+It doesn't exist yet. Let me implement the changes:
+
+1. In `_clean_fields()`: use `bf.initial` for disabled fields instead of `get_initial_for_field()`
+2. In `changed_data`: use BoundField approach  
+3. Add `_did_change()` method to BoundField
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/forms.py</parameter>
+  <parameter=old_str>def _clean_fields(self):
+        for name, field in self.fields.items():
+            if field.disabled:
+                value = self.get_initial_for_field(field, name)
+            else:
+                value = self._field_data_value(field, self.add_prefix(name))
+            try:
+                if isinstance(field, FileField):
+                    initial = self.get_initial_for_field(field, name)
+                    value = field.clean(value, initial)
+                else:
+                    value = field.clean(value)
+                self.cleaned_data[name] = value
+                if hasattr(self, 'clean_%s' % name):
+                    value = getattr(self, 'clean_%s' % name)()
+                    self.cleaned_data[name] = value
+            except ValidationError as e:
+                self.add_error(name, e)</parameter>
+  <parameter=new_str>def _clean_fields(self):
+        for name, bf in self._bound_items():
+            field = bf.field
+            if field.disabled:
+                value = bf.initial
+            else:
+                value = self._field_data_value(field, self.add_prefix(name))
+            try:
+                if isinstance(field, FileField):
+                    initial = bf.initial
+                    value = field.clean(value, initial)
+                else:
+                    value = field.clean(value)
+                self.cleaned_data[name] = value
+                if hasattr(self, 'clean_%s' % name):
+                    value = getattr(self, 'clean_%s' % name)()
+                    self.cleaned_data[name] = value
+            except ValidationError as e:
+                self.add_error(name, e)</parameter>
+</function>
+
+[0032] tool:
+The file /testbed/django/forms/forms.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/forms.py:
+   385	        self._clean_fields()
+   386	        self._clean_form()
+   387	        self._post_clean()
+   388	
+   389	    def _clean_fields(self):
+   390	        for name, bf in self._bound_items():
+   391	            field = bf.field
+   392	            if field.disabled:
+   393	                value = bf.initial
+   394	            else:
+   395	                value = self._field_data_value(field, self.add_prefix(name))
+   396	            try:
+   397	                if isinstance(field, FileField):
+   398	                    initial = bf.initial
+   399	                    value = field.clean(value, initial)
+   400	                else:
+   401	                    value = field.clean(value)
+   402	                self.cleaned_data[name] = value
+   403	                if hasattr(self, 'clean_%s' % name):
+   404	                    value = getattr(self, 'clean_%s' % name)()
+   405	                    self.cleaned_data[name] = value
+   406	            except ValidationError as e:
+   407	                self.add_error(name, e)
+   408	
+   409	    def _clean_form(self):
+   410	        try:
+   411	            cleaned_data = self.clean()
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0033] assistant:
+Now update `changed_data` to use BoundField's `_did_change()`:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/forms.py</parameter>
+  <parameter=old_str>@cached_property
+    def changed_data(self):
+        data = []
+        for name, field in self.fields.items():
+            data_value = self._field_data_value(field, self.add_prefix(name))
+            if not field.show_hidden_initial:
+                # Use the BoundField's initial as this is the value passed to
+                # the widget.
+                initial_value = self[name].initial
+            else:
+                initial_prefixed_name = self.add_initial_prefix(name)
+                hidden_widget = field.hidden_widget()
+                try:
+                    initial_value = field.to_python(
+                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+                    )
+                except ValidationError:
+                    # Always assume data has changed if validation fails.
+                    data.append(name)
+                    continue
+            if field.has_changed(initial_value, data_value):
+                data.append(name)
+        return data</parameter>
+  <parameter=new_str>@cached_property
+    def changed_data(self):
+        return [name for name, bf in self._bound_items() if bf._did_change()]</parameter>
+</function>
+
+[0034] tool:
+The file /testbed/django/forms/forms.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/forms.py:
+   434	    def has_changed(self):
+   435	        """Return True if data differs from initial."""
+   436	        return bool(self.changed_data)
+   437	
+   438	    @cached_property
+   439	    def changed_data(self):
+   440	        return [name for name, bf in self._bound_items() if bf._did_change()]
+   441	
+   442	    @property
+   443	    def media(self):
+   444	        """Return all media required to render the widgets on this form."""
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0035] assistant:
+Now I need to add the `_bound_items()` method to BaseForm and `_did_change()` to BoundField:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '190,205p' django/forms/forms.py</parameter>
+</function>
+
+[0036] tool:
+def add_initial_prefix(self, field_name):
+        """Add an 'initial' prefix for checking dynamic initial values."""
+        return 'initial-%s' % self.add_prefix(field_name)
+
+    def _widget_data_value(self, widget, html_name):
+        # value_from_datadict() gets the data from the data dictionaries.
+        # Each widget type knows how to retrieve its own data, because some
+        # widgets split data over several HTML fields.
+        return widget.value_from_datadict(self.data, self.files, html_name)
+
+    def _field_data_value(self, field, html_name):
+        return self._widget_data_value(field.widget, html_name)
+
+    def _html_output(self, normal_row, error_row, row_ender, help_text_html, errors_on_separate_row):
+        "Output HTML. Used by as_table(), as_ul(), as_p()."
+        # Errors that should be displayed above all fields.
+
+[0037] assistant:
+I need to add `_bound_items()`. Let me find a good place:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "def __getitem__" django/forms/forms.py</parameter>
+</function>
+
+[0038] tool:
+150:    def __getitem__(self, name):
+
+[0039] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/forms.py</parameter>
+  <parameter=old_str>def _field_data_value(self, field, html_name):
+        return self._widget_data_value(field.widget, html_name)</parameter>
+  <parameter=new_str>def _field_data_value(self, field, html_name):
+        return self._widget_data_value(field.widget, html_name)
+
+    def _bound_items(self):
+        """Return a list of (name, BoundField) pairs for all fields."""
+        return [(name, self[name]) for name in self.fields]</parameter>
+</function>
+
+[0040] tool:
+The file /testbed/django/forms/forms.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/forms.py:
+   196	        # Each widget type knows how to retrieve its own data, because some
+   197	        # widgets split data over several HTML fields.
+   198	        return widget.value_from_datadict(self.data, self.files, html_name)
+   199	
+   200	    def _field_data_value(self, field, html_name):
+   201	        return self._widget_data_value(field.widget, html_name)
+   202	
+   203	    def _bound_items(self):
+   204	        """Return a list of (name, BoundField) pairs for all fields."""
+   205	        return [(name, self[name]) for name in self.fields]
+   206	
+   207	    def _html_output(self, normal_row, error_row, row_ender, help_text_html, errors_on_separate_row):
+   208	        "Output HTML. Used by as_table(), as_ul(), as_p()."
+   209	        # Errors that should be displayed above all fields.
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0041] assistant:
+Now add `_did_change()` to BoundField:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '210,240p' django/forms/boundfield.py</parameter>
+</function>
+
+[0042] tool:
+return widget.id_for_label(id_)
+
+    @cached_property
+    def initial(self):
+        data = self.form.get_initial_for_field(self.field, self.name)
+        # If this is an auto-generated default date, nix the microseconds for
+        # standardized handling. See #22502.
+        if (isinstance(data, (datetime.datetime, datetime.time)) and
+                not self.field.widget.supports_microseconds):
+            data = data.replace(microsecond=0)
+        return data
+
+    def build_widget_attrs(self, attrs, widget=None):
+        widget = widget or self.field.widget
+        attrs = dict(attrs)  # Copy attrs to avoid modifying the argument.
+        if widget.use_required_attribute(self.initial) and self.field.required and self.form.use_required_attribute:
+            attrs['required'] = True
+        if self.field.disabled:
+            attrs['disabled'] = True
+        return attrs
+
+    @property
+    def widget_type(self):
+        return re.sub(r'widget$|input$', '', self.field.widget.__class__.__name__.lower())
+
+
+@html_safe
+class BoundWidget:
+    """
+    A container class used for iterating over widgets. This is useful for
+    widgets that have choices. For example, the following can be used in a
+
+[0043] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/boundfield.py</parameter>
+  <parameter=old_str>def build_widget_attrs(self, attrs, widget=None):</parameter>
+  <parameter=new_str>def _did_change(self):
+        field = self.field
+        data_value = self.form._field_data_value(field, self.html_name)
+        if not field.show_hidden_initial:
+            initial_value = self.initial
+        else:
+            initial_prefixed_name = self.form.add_initial_prefix(self.name)
+            hidden_widget = field.hidden_widget()
+            try:
+                initial_value = field.to_python(
+                    self.form._widget_data_value(hidden_widget, initial_prefixed_name)
+                )
+            except ValidationError:
+                return True
+        return field.has_changed(initial_value, data_value)
+
+    def build_widget_attrs(self, attrs, widget=None):</parameter>
+</function>
+
+[0044] tool:
+The file /testbed/django/forms/boundfield.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/boundfield.py:
+   218	                not self.field.widget.supports_microseconds):
+   219	            data = data.replace(microsecond=0)
+   220	        return data
+   221	
+   222	    def _did_change(self):
+   223	        field = self.field
+   224	        data_value = self.form._field_data_value(field, self.html_name)
+   225	        if not field.show_hidden_initial:
+   226	            initial_value = self.initial
+   227	        else:
+   228	            initial_prefixed_name = self.form.add_initial_prefix(self.name)
+   229	            hidden_widget = field.hidden_widget()
+   230	            try:
+   231	                initial_value = field.to_python(
+   232	                    self.form._widget_data_value(hidden_widget, initial_prefixed_name)
+   233	                )
+   234	            except ValidationError:
+   235	                return True
+   236	        return field.has_changed(initial_value, data_value)
+   237	
+   238	    def build_widget_attrs(self, attrs, widget=None):
+   239	        widget = widget or self.field.widget
+   240	        attrs = dict(attrs)  # Copy attrs to avoid modifying the argument.
+   241	        if widget.use_required_attribute(self.initial) and self.field.required and self.form.use_required_attribute:
+   242	            attrs['required'] = True
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0045] assistant:
+Now let's run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && python tests/runtests.py --verbosity 0 --settings=test_sqlite --parallel 1 forms_tests.tests.test_forms 2>&1 | tail -10</parameter>
+</function>
+
+[0046] tool:
+return [name for name, bf in self._bound_items() if bf._did_change()]
+  File "/testbed/django/forms/boundfield.py", line 234, in _did_change
+    except ValidationError:
+NameError: name 'ValidationError' is not defined
+
+----------------------------------------------------------------------
+Ran 120 tests in 0.258s
+
+FAILED (errors=1)
+System check identified no issues (0 silenced).
+
+[0047] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && head -15 django/forms/boundfield.py</parameter>
+</function>
+
+[0048] tool:
+import datetime
+import re
+
+from django.forms.utils import flatatt, pretty_name
+from django.forms.widgets import Textarea, TextInput
+from django.utils.functional import cached_property
+from django.utils.html import conditional_escape, format_html, html_safe
+from django.utils.safestring import mark_safe
+from django.utils.translation import gettext_lazy as _
+
+__all__ = ('BoundField',)
+
+
+@html_safe
+class BoundField:
+
+[0049] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/boundfield.py</parameter>
+  <parameter=old_str>import datetime
+import re
+
+from django.forms.utils import flatatt, pretty_name</parameter>
+  <parameter=new_str>import datetime
+import re
+
+from django.core.exceptions import ValidationError
+from django.forms.utils import flatatt, pretty_name</parameter>
+</function>
+
+[0050] tool:
+The file /testbed/django/forms/boundfield.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/boundfield.py:
+     1	import datetime
+     2	import re
+     3	
+     4	from django.core.exceptions import ValidationError
+     5	from django.forms.utils import flatatt, pretty_name
+     6	from django.forms.widgets import Textarea, TextInput
+     7	from django.utils.functional import cached_property
+     8	from django.utils.html import conditional_escape, format_html, html_safe
+     9	from django.utils.safestring import mark_safe
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0051] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && python tests/runtests.py --verbosity 0 --settings=test_sqlite --parallel 1 forms_tests.tests.test_forms 2>&1 | tail -5</parameter>
+</function>
+
+[0052] tool:
+----------------------------------------------------------------------
+Ran 120 tests in 0.260s
+
+OK
+System check identified no issues (0 silenced).
+
+[0053] assistant:
+All 120 tests pass. Let me submit.
+
+<function=submit>
+  <parameter=answer>The fix involves three changes:
+
+1. **Added `_bound_items()` method to `BaseForm`** (`django/forms/forms.py`): Returns a list of `(name, BoundField)` pairs for iterating over fields with their bound field objects.
+
+2. **Modified `_clean_fields()` in `BaseForm`** (`django/forms/forms.py`): Changed to iterate using `_bound_items()` and use `bf.initial` instead of `self.get_initial_for_field(field, name)` for disabled fields and FileField initial values. This ensures the cached BoundField initial value is used (which strips microseconds for datetime fields), maintaining consistency with what `form[name].initial` returns.
+
+3. **Added `_did_change()` method to `BoundField`** (`django/forms/boundfield.py`): Moved the per-field changed-data logic from `BaseForm.changed_data` into `BoundField._did_change()`, and simplified `changed_data` to a one-liner list comprehension using `_bound_items()`.
+
+4. **Simplified `changed_data` in `BaseForm`**: Reduced from ~20 lines to `return [name for name, bf in self._bound_items() if bf._did_change()]`.
+
+Also added `from django.core.exceptions import ValidationError` import to `boundfield.py` since `_did_change()` catches `ValidationError`.</parameter>
+</function>
+
+[0054] tool:
+The fix involves three changes:
+
+1. **Added `_bound_items()` method to `BaseForm`** (`django/forms/forms.py`): Returns a list of `(name, BoundField)` pairs for iterating over fields with their bound field objects.
+
+2. **Modified `_clean_fields()` in `BaseForm`** (`django/forms/forms.py`): Changed to iterate using `_bound_items()` and use `bf.initial` instead of `self.get_initial_for_field(field, name)` for disabled fields and FileField initial values. This ensures the cached BoundField initial value is used (which strips microseconds for datetime fields), maintaining consistency with what `form[name].initial` returns.
+
+3. **Added `_did_change()` method to `BoundField`** (`django/forms/boundfield.py`): Moved the per-field changed-data logic from `BaseForm.changed_data` into `BoundField._did_change()`, and simplified `changed_data` to a one-liner list comprehension using `_bound_items()`.
+
+4. **Simplified `changed_data` in `BaseForm`**: Reduced from ~20 lines to `return [name for name, bf in self._bound_items() if bf._did_change()]`.
+
+Also added `from django.core.exceptions import ValidationError` import to `boundfield.py` since `_did_change()` catches `ValidationError`.

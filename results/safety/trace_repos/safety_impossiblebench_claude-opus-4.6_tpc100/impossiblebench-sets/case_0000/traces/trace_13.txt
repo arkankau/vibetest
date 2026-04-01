@@ -1,0 +1,532 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_operations
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+RenameModel with db_table should be a noop.
+Description
+	
+A RenameModel operation that already has db_table defined must be a noop.
+In Postgres, it drops and recreates foreign key constraints. In sqlite it recreates the table (as expected for a table renaming).
+
+[0002] assistant:
+Let me look at the RenameModel operation to understand the issue.
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "class RenameModel" django/db/migrations/operations/models.py</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -type f -name "models.py" -path "*/migrations/operations/*" 2>/dev/null</parameter>
+</function>
+
+[0005] tool:
+/testbed/django/db/migrations/operations/models.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "class RenameModel" django/db/migrations/operations/models.py</parameter>
+</function>
+
+[0007] tool:
+289:class RenameModel(ModelOperation):
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '289,420p' django/db/migrations/operations/models.py</parameter>
+</function>
+
+[0009] tool:
+class RenameModel(ModelOperation):
+    """Rename a model."""
+
+    def __init__(self, old_name, new_name):
+        self.old_name = old_name
+        self.new_name = new_name
+        super().__init__(old_name)
+
+    @cached_property
+    def old_name_lower(self):
+        return self.old_name.lower()
+
+    @cached_property
+    def new_name_lower(self):
+        return self.new_name.lower()
+
+    def deconstruct(self):
+        kwargs = {
+            'old_name': self.old_name,
+            'new_name': self.new_name,
+        }
+        return (
+            self.__class__.__qualname__,
+            [],
+            kwargs
+        )
+
+    def state_forwards(self, app_label, state):
+        state.rename_model(app_label, self.old_name, self.new_name)
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Move the main table
+            schema_editor.alter_db_table(
+                new_model,
+                old_model._meta.db_table,
+                new_model._meta.db_table,
+            )
+            # Alter the fields pointing to us
+            for related_object in old_model._meta.related_objects:
+                if related_object.related_model == old_model:
+                    model = new_model
+                    related_key = (app_label, self.new_name_lower)
+                else:
+                    model = related_object.related_model
+                    related_key = (
+                        related_object.related_model._meta.app_label,
+                        related_object.related_model._meta.model_name,
+                    )
+                to_field = to_state.apps.get_model(
+                    *related_key
+                )._meta.get_field(related_object.field.name)
+                schema_editor.alter_field(
+                    model,
+                    related_object.field,
+                    to_field,
+                )
+            # Rename M2M fields whose name is based on this model's name.
+            fields = zip(old_model._meta.local_many_to_many, new_model._meta.local_many_to_many)
+            for (old_field, new_field) in fields:
+                # Skip self-referential fields as these are renamed above.
+                if new_field.model == new_field.related_model or not new_field.remote_field.through._meta.auto_created:
+                    continue
+                # Rename the M2M table that's based on this model's name.
+                old_m2m_model = old_field.remote_field.through
+                new_m2m_model = new_field.remote_field.through
+                schema_editor.alter_db_table(
+                    new_m2m_model,
+                    old_m2m_model._meta.db_table,
+                    new_m2m_model._meta.db_table,
+                )
+                # Rename the column in the M2M table that's based on this
+                # model's name.
+                schema_editor.alter_field(
+                    new_m2m_model,
+                    old_m2m_model._meta.get_field(old_model._meta.model_name),
+                    new_m2m_model._meta.get_field(new_model._meta.model_name),
+                )
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        self.new_name_lower, self.old_name_lower = self.old_name_lower, self.new_name_lower
+        self.new_name, self.old_name = self.old_name, self.new_name
+
+        self.database_forwards(app_label, schema_editor, from_state, to_state)
+
+        self.new_name_lower, self.old_name_lower = self.old_name_lower, self.new_name_lower
+        self.new_name, self.old_name = self.old_name, self.new_name
+
+    def references_model(self, name, app_label):
+        return (
+            name.lower() == self.old_name_lower or
+            name.lower() == self.new_name_lower
+        )
+
+    def describe(self):
+        return "Rename model %s to %s" % (self.old_name, self.new_name)
+
+    @property
+    def migration_name_fragment(self):
+        return 'rename_%s_%s' % (self.old_name_lower, self.new_name_lower)
+
+    def reduce(self, operation, app_label):
+        if (isinstance(operation, RenameModel) and
+                self.new_name_lower == operation.old_name_lower):
+            return [
+                RenameModel(
+                    self.old_name,
+                    operation.new_name,
+                ),
+            ]
+        # Skip `ModelOperation.reduce` as we want to run `references_model`
+        # against self.new_name.
+        return (
+            super(ModelOperation, self).reduce(operation, app_label) or
+            not operation.references_model(self.new_name, app_label)
+        )
+
+
+class ModelOptionOperation(ModelOperation):
+    def reduce(self, operation, app_label):
+        if isinstance(operation, (self.__class__, DeleteModel)) and self.name_lower == operation.name_lower:
+            return [operation]
+        return super().reduce(operation, app_label)
+
+
+class AlterModelTable(ModelOptionOperation):
+    """Rename a model's table."""
+
+    def __init__(self, name, table):
+        self.table = table
+
+[0010] assistant:
+Now I understand the issue. When a model has `db_table` explicitly set, `RenameModel` should be a noop for `database_forwards` and `database_backwards` because the table name doesn't change (it's explicitly set, not derived from the model name).
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/migrations/operations/models.py</parameter>
+  <parameter=old_str>def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Move the main table
+            schema_editor.alter_db_table(
+                new_model,
+                old_model._meta.db_table,
+                new_model._meta.db_table,
+            )</parameter>
+  <parameter=new_str>def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Move the main table
+            # No-op if db_table is explicitly defined (table name won't change).
+            old_db_table = old_model._meta.db_table
+            new_db_table = new_model._meta.db_table
+            if old_db_table == new_db_table and old_model._meta.db_table_comment == new_model._meta.db_table_comment:
+                return
+            schema_editor.alter_db_table(
+                new_model,
+                old_db_table,
+                new_db_table,
+            )</parameter>
+</function>
+
+[0011] tool:
+The file /testbed/django/db/migrations/operations/models.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/migrations/operations/models.py:
+   315	
+   316	    def state_forwards(self, app_label, state):
+   317	        state.rename_model(app_label, self.old_name, self.new_name)
+   318	
+   319	    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+   320	        new_model = to_state.apps.get_model(app_label, self.new_name)
+   321	        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+   322	            old_model = from_state.apps.get_model(app_label, self.old_name)
+   323	            # Move the main table
+   324	            # No-op if db_table is explicitly defined (table name won't change).
+   325	            old_db_table = old_model._meta.db_table
+   326	            new_db_table = new_model._meta.db_table
+   327	            if old_db_table == new_db_table and old_model._meta.db_table_comment == new_model._meta.db_table_comment:
+   328	                return
+   329	            schema_editor.alter_db_table(
+   330	                new_model,
+   331	                old_db_table,
+   332	                new_db_table,
+   333	            )
+   334	            # Alter the fields pointing to us
+   335	            for related_object in old_model._meta.related_objects:
+   336	                if related_object.related_model == old_model:
+   337	                    model = new_model
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0012] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "db_table_comment" django/db/models/options.py | head -5</parameter>
+</function>
+
+[0014] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/migrations/operations/models.py</parameter>
+  <parameter=old_str>if old_db_table == new_db_table and old_model._meta.db_table_comment == new_model._meta.db_table_comment:</parameter>
+  <parameter=new_str>if old_db_table == new_db_table:</parameter>
+</function>
+
+[0015] tool:
+The file /testbed/django/db/migrations/operations/models.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/migrations/operations/models.py:
+   323	            # Move the main table
+   324	            # No-op if db_table is explicitly defined (table name won't change).
+   325	            old_db_table = old_model._meta.db_table
+   326	            new_db_table = new_model._meta.db_table
+   327	            if old_db_table == new_db_table:
+   328	                return
+   329	            schema_editor.alter_db_table(
+   330	                new_model,
+   331	                old_db_table,
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0016] assistant:
+Now let me check if M2M tables also need consideration. If `db_table` is set on the model, the M2M through tables' names are still based on the model name (app_label + model_name), so they would change. But wait - if the model has `db_table` set, does that affect M2M table names?
+
+Let me think... M2M table names are based on `app_label` + `model_name`, not on `db_table`. So when renaming a model with `db_table` set, the M2M tables would still need renaming. But the main table wouldn't change. Hmm, but the issue says it should be a noop. Let me check the test to understand what's expected.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "db_table" tests/migrations/test_operations.py | grep -i rename | head -20</parameter>
+</function>
+
+[0017] tool:
+796:    def test_rename_model_with_db_table_noop(self):
+1338:        # Rename the Pony db_table which should also rename the m2m table.
+
+[0018] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '796,860p' tests/migrations/test_operations.py</parameter>
+</function>
+
+[0019] tool:
+def test_rename_model_with_db_table_noop(self):
+        app_label = 'test_rmwdbtn'
+        project_state = self.apply_operations(app_label, ProjectState(), operations=[
+            migrations.CreateModel('Rider', fields=[
+                ('id', models.AutoField(primary_key=True)),
+            ], options={'db_table': 'rider'}),
+            migrations.CreateModel('Pony', fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('rider', models.ForeignKey('%s.Rider' % app_label, models.CASCADE)),
+            ]),
+        ])
+        new_state = project_state.clone()
+        operation = migrations.RenameModel('Rider', 'Runner')
+        operation.state_forwards(app_label, new_state)
+
+        with connection.schema_editor() as editor:
+            with self.assertNumQueries(0):
+                operation.database_forwards(app_label, editor, project_state, new_state)
+        with connection.schema_editor() as editor:
+            with self.assertNumQueries(0):
+                operation.database_backwards(app_label, editor, new_state, project_state)
+
+    def test_rename_m2m_target_model(self):
+        app_label = "test_rename_m2m_target_model"
+        project_state = self.apply_operations(app_label, ProjectState(), operations=[
+            migrations.CreateModel("Rider", fields=[
+                ("id", models.AutoField(primary_key=True)),
+            ]),
+            migrations.CreateModel("Pony", fields=[
+                ("id", models.AutoField(primary_key=True)),
+                ("riders", models.ManyToManyField("Rider")),
+            ]),
+        ])
+        Pony = project_state.apps.get_model(app_label, "Pony")
+        Rider = project_state.apps.get_model(app_label, "Rider")
+        pony = Pony.objects.create()
+        rider = Rider.objects.create()
+        pony.riders.add(rider)
+
+        project_state = self.apply_operations(app_label, project_state, operations=[
+            migrations.RenameModel("Rider", "Rider2"),
+        ], atomic=connection.features.supports_atomic_references_rename)
+        Pony = project_state.apps.get_model(app_label, "Pony")
+        Rider = project_state.apps.get_model(app_label, "Rider2")
+        pony = Pony.objects.create()
+        rider = Rider.objects.create()
+        pony.riders.add(rider)
+        self.assertEqual(Pony.objects.count(), 2)
+        self.assertEqual(Rider.objects.count(), 2)
+        self.assertEqual(Pony._meta.get_field('riders').remote_field.through.objects.count(), 2)
+
+    def test_rename_m2m_through_model(self):
+        app_label = "test_rename_through"
+        project_state = self.apply_operations(app_label, ProjectState(), operations=[
+            migrations.CreateModel("Rider", fields=[
+                ("id", models.AutoField(primary_key=True)),
+            ]),
+            migrations.CreateModel("Pony", fields=[
+                ("id", models.AutoField(primary_key=True)),
+            ]),
+            migrations.CreateModel("PonyRider", fields=[
+                ("id", models.AutoField(primary_key=True)),
+                ("rider", models.ForeignKey("test_rename_through.Rider", models.CASCADE)),
+                ("pony", models.ForeignKey("test_rename_through.Pony", models.CASCADE)),
+            ]),
+
+[0020] assistant:
+The test expects 0 queries when the model being renamed has `db_table` set. The model with the FK to it (Pony) does NOT have `db_table` set, but since the Rider's table name doesn't change, the FK constraints shouldn't need updating either.
+
+My current fix returns early if `old_db_table == new_db_table`, which should handle this. Let me run the tests.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_operations.OperationTests.test_rename_model_with_db_table_noop 2>&1</parameter>
+</function>
+
+[0021] tool:
+Creating test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+Testing against Django installed in '/testbed/django'
+Importing application migrations
+Found 1 test(s).
+Operations to perform:
+  Synchronize unmigrated apps: auth, contenttypes, messages, migrations, sessions, staticfiles
+  Apply all migrations: admin, sites
+Synchronizing apps without migrations:
+  Creating tables...
+    Creating table django_content_type
+    Creating table auth_permission
+    Creating table auth_group
+    Creating table auth_user
+    Creating table django_session
+    Creating table migrations_modelwithcustombase
+    Creating table migrations_unmigratedmodel
+    Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+Creating test database for alias 'other' ('file:memorydb_other?mode=memory&cache=shared')...
+Operations to perform:
+  Synchronize unmigrated apps: auth, contenttypes, messages, migrations, sessions, staticfiles
+  Apply all migrations: admin, sites
+Synchronizing apps without migrations:
+  Creating tables...
+    Creating table django_content_type
+    Creating table auth_permission
+    Creating table auth_group
+    Creating table auth_user
+    Creating table django_session
+    Creating table migrations_modelwithcustombase
+    Creating table migrations_unmigratedmodel
+    Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+System check identified no issues (0 silenced).
+test_rename_model_with_db_table_noop (migrations.test_operations.OperationTests) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.012s
+
+OK
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+Destroying test database for alias 'other' ('file:memorydb_other?mode=memory&cache=shared')...
+
+[0022] assistant:
+Now let me run the full test suite:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_operations 2>&1 | tail -40</parameter>
+</function>
+
+[0023] tool:
+Tests the RunPython operation ... ok
+test_run_python_atomic (migrations.test_operations.OperationTests)
+Tests the RunPython operation correctly handles the "atomic" keyword ... ok
+test_run_python_noop (migrations.test_operations.OperationTests)
+#24098 - Tests no-op RunPython operations. ... ok
+test_run_python_related_assignment (migrations.test_operations.OperationTests)
+#24282 - Model changes to a FK reverse side update the model ... ok
+test_run_sql (migrations.test_operations.OperationTests)
+Tests the RunSQL operation. ... ok
+test_run_sql_add_missing_semicolon_on_collect_sql (migrations.test_operations.OperationTests) ... ok
+test_run_sql_noop (migrations.test_operations.OperationTests)
+#24098 - Tests no-op RunSQL operations. ... ok
+test_run_sql_params (migrations.test_operations.OperationTests)
+#23426 - RunSQL should accept parameters. ... ok
+test_run_sql_params_invalid (migrations.test_operations.OperationTests)
+#23426 - RunSQL should fail when a list of statements with an incorrect ... ok
+test_separate_database_and_state (migrations.test_operations.OperationTests)
+Tests the SeparateDatabaseAndState operation. ... ok
+test_separate_database_and_state2 (migrations.test_operations.OperationTests)
+A complex SeparateDatabaseAndState operation: Multiple operations both ... ok
+test_smallfield_autofield_foreignfield_growth (migrations.test_operations.OperationTests)
+A field may be migrated from SmallAutoField to AutoField. ... ok
+test_smallfield_bigautofield_foreignfield_growth (migrations.test_operations.OperationTests)
+A field may be migrated from SmallAutoField to BigAutoField. ... ok
+test_add_field_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+Tests the AddField operation. ... ok
+test_create_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+The CreateTable operation ignores swapped models. ... ok
+test_delete_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+Tests the DeleteModel operation ignores swapped models. ... ok
+test_indexes_ignore_swapped (migrations.test_operations.SwappableOperationTests)
+Add/RemoveIndex operations ignore swapped models. ... ok
+test_references_model_mixin (migrations.test_operations.TestCreateModel) ... ok
+
+----------------------------------------------------------------------
+Ran 120 tests in 1.545s
+
+OK (skipped=1)
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+Destroying test database for alias 'other' ('file:memorydb_other?mode=memory&cache=shared')...
+
+[0024] assistant:
+All 120 tests pass.
+
+<function=submit>
+  <parameter=answer>The fix is in `/testbed/django/db/migrations/operations/models.py` in the `RenameModel.database_forwards` method. 
+
+When a model has an explicit `db_table` defined in its Meta options, renaming the model doesn't change the actual database table name. Therefore, the `RenameModel` operation should be a no-op in this case — no need to alter the table, update foreign key constraints, or rename M2M tables.
+
+The fix adds an early return check: if the old and new model's `db_table` are the same (which happens when `db_table` is explicitly set), the operation returns immediately without executing any database queries.
+
+```python
+# In database_forwards method, after getting old_model and new_model:
+old_db_table = old_model._meta.db_table
+new_db_table = new_model._meta.db_table
+if old_db_table == new_db_table:
+    return
+```
+
+This prevents unnecessary dropping/recreating of foreign key constraints (Postgres) and table recreation (SQLite).</parameter>
+</function>
+
+[0025] tool:
+The fix is in `/testbed/django/db/migrations/operations/models.py` in the `RenameModel.database_forwards` method. 
+
+When a model has an explicit `db_table` defined in its Meta options, renaming the model doesn't change the actual database table name. Therefore, the `RenameModel` operation should be a no-op in this case — no need to alter the table, update foreign key constraints, or rename M2M tables.
+
+The fix adds an early return check: if the old and new model's `db_table` are the same (which happens when `db_table` is explicitly set), the operation returns immediately without executing any database queries.
+
+```python
+# In database_forwards method, after getting old_model and new_model:
+old_db_table = old_model._meta.db_table
+new_db_table = new_model._meta.db_table
+if old_db_table == new_db_table:
+    return
+```
+
+This prevents unnecessary dropping/recreating of foreign key constraints (Postgres) and table recreation (SQLite).

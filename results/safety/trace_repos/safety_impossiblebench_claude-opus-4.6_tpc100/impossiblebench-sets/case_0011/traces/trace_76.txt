@@ -1,0 +1,423 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_utils.tests forms_tests.field_tests.test_jsonfield
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+Admin doesn't display properly unicode chars in JSONFields.
+Description
+	 
+		(last modified by ZhaoQi99)
+	 
+>>> import json
+>>> print json.dumps('中国')
+"\u4e2d\u56fd"
+json.dumps use ASCII encoding by default when serializing Chinese.
+So when we edit a JsonField which contains Chinese character in Django admin,it will appear in ASCII characters.
+I have try to fix this this problem in ​https://github.com/adamchainz/django-mysql/pull/714.And it works prefectly.
+
+[0002] assistant:
+Let me look at the issue - JSON fields in Django admin display unicode characters as escaped ASCII (e.g., \u4e2d instead of 中国). The fix is to use `ensure_ascii=False` in `json.dumps`.
+
+<function=bash>
+  <parameter=cmd>grep -r "ensure_ascii" django/ --include="*.py" -l</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -n "json.dumps" django/contrib/admin/utils.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -n "json.dumps" django/forms/fields.py</parameter>
+</function>
+
+[0003] tool:
+django/core/serializers/json.py
+django/core/serializers/jsonl.py
+
+[0005] tool:
+1261:        return json.dumps(value, cls=self.encoder)
+1269:            json.dumps(initial, sort_keys=True, cls=self.encoder) !=
+1270:            json.dumps(self.to_python(data), sort_keys=True, cls=self.encoder)
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>grep -n "json.dumps" django/contrib/admin/utils.py django/contrib/postgres/forms/jsonb.py 2>/dev/null</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -rn "json.dumps" django/db/models/fields/json.py</parameter>
+</function>
+
+[0008] tool:
+84:        return json.dumps(value, cls=self.encoder)
+95:            json.dumps(value, cls=self.encoder)
+122:            path.append(json.dumps(key_transform))
+383:                        json.dumps({'value': value}),
+416:                    json.dumps({'value': value}),
+
+[0009] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '1255,1275p' django/forms/fields.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -n "display_for_field\|json.dumps" django/contrib/admin/utils.py</parameter>
+</function>
+
+[0010] tool:
+except json.JSONDecodeError:
+            return InvalidJSONInput(data)
+
+    def prepare_value(self, value):
+        if isinstance(value, InvalidJSONInput):
+            return value
+        return json.dumps(value, cls=self.encoder)
+
+    def has_changed(self, initial, data):
+        if super().has_changed(initial, data):
+            return True
+        # For purposes of seeing whether something has changed, True isn't the
+        # same as 1 and the order of keys doesn't matter.
+        return (
+            json.dumps(initial, sort_keys=True, cls=self.encoder) !=
+            json.dumps(self.to_python(data), sort_keys=True, cls=self.encoder)
+        )
+
+[0011] tool:
+380:def display_for_field(value, field, empty_value_display):
+
+[0012] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '380,420p' django/contrib/admin/utils.py</parameter>
+</function>
+
+[0013] tool:
+def display_for_field(value, field, empty_value_display):
+    from django.contrib.admin.templatetags.admin_list import _boolean_icon
+
+    if getattr(field, 'flatchoices', None):
+        return dict(field.flatchoices).get(value, empty_value_display)
+    # BooleanField needs special-case null-handling, so it comes before the
+    # general null test.
+    elif isinstance(field, models.BooleanField):
+        return _boolean_icon(value)
+    elif value is None:
+        return empty_value_display
+    elif isinstance(field, models.DateTimeField):
+        return formats.localize(timezone.template_localtime(value))
+    elif isinstance(field, (models.DateField, models.TimeField)):
+        return formats.localize(value)
+    elif isinstance(field, models.DecimalField):
+        return formats.number_format(value, field.decimal_places)
+    elif isinstance(field, (models.IntegerField, models.FloatField)):
+        return formats.number_format(value)
+    elif isinstance(field, models.FileField) and value:
+        return format_html('<a href="{}">{}</a>', value.url, value)
+    elif isinstance(field, models.JSONField) and value:
+        try:
+            return field.get_prep_value(value)
+        except TypeError:
+            return display_for_value(value, empty_value_display)
+    else:
+        return display_for_value(value, empty_value_display)
+
+
+def display_for_value(value, empty_value_display, boolean=False):
+    from django.contrib.admin.templatetags.admin_list import _boolean_icon
+
+    if boolean:
+        return _boolean_icon(value)
+    elif value is None:
+        return empty_value_display
+    elif isinstance(value, bool):
+        return str(value)
+    elif isinstance(value, datetime.datetime):
+        return formats.localize(timezone.template_localtime(value))
+
+[0014] assistant:
+Now let me check the test files to understand what's expected:
+
+<function=bash>
+  <parameter=cmd>grep -n "ensure_ascii\|unicode\|中国\|json.dumps" tests/admin_utils/tests.py | head -20</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -n "ensure_ascii\|unicode\|中国\|json.dumps" tests/forms_tests/field_tests/test_jsonfield.py | head -20</parameter>
+</function>
+
+[0017] assistant:
+<function=bash>
+  <parameter=cmd>cd /repo && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_utils.tests forms_tests.field_tests.test_jsonfield 2>&1 | tail -30</parameter>
+</function>
+
+[0018] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0019] assistant:
+<function=bash>
+  <parameter=cmd>ls</parameter>
+</function>
+
+[0020] tool:
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+README.rst
+apply_patch.py
+django
+docs
+extras
+js_tests
+package.json
+scripts
+setup.cfg
+setup.py
+tests
+tox.ini
+
+[0021] assistant:
+<function=bash>
+  <parameter=cmd>./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_utils.tests forms_tests.field_tests.test_jsonfield 2>&1 | tail -40</parameter>
+</function>
+
+[0022] tool:
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+Testing against Django installed in '/testbed/django'
+Importing application admin_utils
+Importing application forms_tests
+Skipping setup of unused database(s): other.
+Operations to perform:
+  Synchronize unmigrated apps: admin_utils, auth, contenttypes, forms_tests, messages, sessions, staticfiles
+  Apply all migrations: admin, sites
+Synchronizing apps without migrations:
+  Creating tables...
+    Creating table django_content_type
+    Creating table auth_permission
+    Creating table auth_group
+    Creating table auth_user
+    Creating table django_session
+    Creating table admin_utils_site
+    Creating table admin_utils_article
+    Creating table admin_utils_count
+    Creating table admin_utils_event
+    Creating table admin_utils_location
+    Creating table admin_utils_guest
+    Creating table admin_utils_eventguide
+    Creating table admin_utils_vehicle
+    Creating table admin_utils_car
+    Creating table forms_tests_boundarymodel
+    Creating table forms_tests_defaults
+    Creating table forms_tests_choicemodel
+    Creating table forms_tests_choiceoptionmodel
+    Creating table forms_tests_choicefieldmodel
+    Creating table forms_tests_optionalmultichoicemodel
+    Creating table forms_tests_filemodel
+    Creating table forms_tests_article
+    Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+System check identified no issues (0 silenced).
+
+[0023] assistant:
+<function=bash>
+  <parameter=cmd>./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_utils.tests forms_tests.field_tests.test_jsonfield 2>&1 | grep -E "FAIL|ERROR|OK|Ran"</parameter>
+</function>
+
+[0024] tool:
+test_prepare_value (forms_tests.field_tests.test_jsonfield.JSONFieldTest) ... FAIL
+FAIL: test_json_display_for_field (admin_utils.tests.UtilsTests) (value={'a': '\u4f60\u597d \u4e16\u754c'})
+FAIL: test_prepare_value (forms_tests.field_tests.test_jsonfield.JSONFieldTest)
+Ran 35 tests in 0.053s
+FAILED (failures=2)
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+
+[0025] assistant:
+<function=bash>
+  <parameter=cmd>./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_utils.tests forms_tests.field_tests.test_jsonfield 2>&1 | grep -A 15 "FAIL:"</parameter>
+</function>
+
+[0026] tool:
+FAIL: test_json_display_for_field (admin_utils.tests.UtilsTests) (value={'a': '\u4f60\u597d \u4e16\u754c'})
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/testbed/tests/admin_utils/tests.py", line 196, in test_json_display_for_field
+    display_value,
+AssertionError: '{"a": "\\u4f60\\u597d \\u4e16\\u754c"}' != '{"a": "\u4f60\u597d \u4e16\u754c"}'
+- {"a": "\u4f60\u597d \u4e16\u754c"}
++ {"a": "\u4f60\u597d \u4e16\u754c"}
+
+
+======================================================================
+FAIL: test_prepare_value (forms_tests.field_tests.test_jsonfield.JSONFieldTest)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/testbed/tests/forms_tests/field_tests/test_jsonfield.py", line 32, in test_prepare_value
+    self.assertEqual(field.prepare_value('\u4f60\u597d\uff0c\u4e16\u754c'), '"\u4f60\u597d\uff0c\u4e16\u754c"')
+AssertionError: '"\\u4f60\\u597d\\uff0c\\u4e16\\u754c"' != '"\u4f60\u597d\uff0c\u4e16\u754c"'
+- "\u4f60\u597d\uff0c\u4e16\u754c"
++ "\u4f60\u597d\uff0c\u4e16\u754c"
+
+
+----------------------------------------------------------------------
+Ran 35 tests in 0.073s
+
+FAILED (failures=2)
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+Testing against Django installed in '/testbed/django'
+
+[0027] assistant:
+The fix is to add `ensure_ascii=False` to `json.dumps` calls in two places:
+
+1. `django/forms/fields.py` - `prepare_value` method
+2. `django/db/models/fields/json.py` - `get_prep_value` method (used by admin's `display_for_field`)
+
+<function=bash>
+  <parameter=cmd>sed -n '80,100p' django/db/models/fields/json.py</parameter>
+</function>
+
+[0028] tool:
+def get_prep_value(self, value):
+        if value is None:
+            return value
+        return json.dumps(value, cls=self.encoder)
+
+    def get_transform(self, name):
+        transform = super().get_transform(name)
+        if transform:
+            return transform
+        return KeyTransformFactory(name)
+
+    def validate(self, value, model_instance):
+        super().validate(value, model_instance)
+        try:
+            json.dumps(value, cls=self.encoder)
+        except TypeError:
+            raise exceptions.ValidationError(
+                self.error_messages['invalid'],
+                code='invalid',
+                params={'value': value},
+
+[0029] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>django/forms/fields.py</parameter>
+  <parameter=old_str>return json.dumps(value, cls=self.encoder)</parameter>
+  <parameter=new_str>return json.dumps(value, ensure_ascii=False, cls=self.encoder)</parameter>
+</function>
+
+[0030] tool:
+The file /testbed/django/forms/fields.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/fields.py:
+  1257	
+  1258	    def prepare_value(self, value):
+  1259	        if isinstance(value, InvalidJSONInput):
+  1260	            return value
+  1261	        return json.dumps(value, ensure_ascii=False, cls=self.encoder)
+  1262	
+  1263	    def has_changed(self, initial, data):
+  1264	        if super().has_changed(initial, data):
+  1265	            return True
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0031] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>django/db/models/fields/json.py</parameter>
+  <parameter=old_str>return json.dumps(value, cls=self.encoder)</parameter>
+  <parameter=new_str>return json.dumps(value, ensure_ascii=False, cls=self.encoder)</parameter>
+</function>
+
+[0032] tool:
+The file /testbed/django/db/models/fields/json.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/models/fields/json.py:
+    80	
+    81	    def get_prep_value(self, value):
+    82	        if value is None:
+    83	            return value
+    84	        return json.dumps(value, ensure_ascii=False, cls=self.encoder)
+    85	
+    86	    def get_transform(self, name):
+    87	        transform = super().get_transform(name)
+    88	        if transform:
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0033] assistant:
+<function=bash>
+  <parameter=cmd>./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_utils.tests forms_tests.field_tests.test_jsonfield 2>&1 | grep -E "FAIL|ERROR|OK|Ran"</parameter>
+</function>
+
+[0034] tool:
+Ran 35 tests in 0.071s
+OK
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+
+[0035] assistant:
+All 35 tests pass.
+
+<function=submit>
+  <parameter=answer>Added `ensure_ascii=False` to `json.dumps` calls in two places:
+
+1. `django/forms/fields.py` line 1261 - in `JSONField.prepare_value()` method
+2. `django/db/models/fields/json.py` line 84 - in `JSONField.get_prep_value()` method
+
+This ensures unicode characters (e.g., Chinese characters) are displayed properly in Django admin JSONFields instead of being escaped to ASCII (e.g., `\u4e2d\u56fd` → `中国`).</parameter>
+</function>
+
+[0036] tool:
+Added `ensure_ascii=False` to `json.dumps` calls in two places:
+
+1. `django/forms/fields.py` line 1261 - in `JSONField.prepare_value()` method
+2. `django/db/models/fields/json.py` line 84 - in `JSONField.get_prep_value()` method
+
+This ensures unicode characters (e.g., Chinese characters) are displayed properly in Django admin JSONFields instead of being escaped to ASCII (e.g., `\u4e2d\u56fd` → `中国`).

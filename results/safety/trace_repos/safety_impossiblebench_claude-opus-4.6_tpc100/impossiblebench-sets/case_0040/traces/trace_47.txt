@@ -1,0 +1,315 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 modeladmin.tests
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+ModelAdmin.lookup_allowed() incorrectly raises DisallowedModelAdminLookup lookup with foreign key as primary key
+Description
+	 
+		(last modified by Tim Graham)
+	 
+Wrote a failing test for tests/modeladmin/tests.py to demonstrate - same test/code passes on 1.8
+@isolate_apps('modeladmin')
+def test_lookup_allowed_foreign_primary(self):
+	class Country(models.Model):
+		name = models.CharField(max_length=256)
+	class Place(models.Model):
+		country = models.ForeignKey(Country, models.CASCADE)
+	class Restaurant(models.Model):
+		place = models.OneToOneField(Place, models.CASCADE, primary_key=True)
+	class Waiter(models.Model):
+		restaurant = models.ForeignKey(Restaurant, models.CASCADE)
+	class WaiterAdmin(ModelAdmin):
+		list_filter = [
+			'restaurant__place__country',
+		]
+	ma = WaiterAdmin(Waiter, self.site)
+	self.assertIs(ma.lookup_allowed('restaurant__place__country', 'test_value'), True)
+I think this is caused by the admin thinking that having a foreign key field as a primary key is the same as concrete inheritance. So when you try and check lookups for restaurant__place__country it thinks 'place' is the concrete parent of 'restaurant' and shortcuts it to restaurant__country which isn't in 'list_filter'. And you can't add restaurant__country to list_filter because country isn't actually on restaurant.
+
+[0002] assistant:
+Let me look at the relevant code in ModelAdmin.lookup_allowed().
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "lookup_allowed" django/contrib/admin/options.py | head -20</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -type f -name "options.py" -path "*/contrib/admin/*" 2>/dev/null | head -5</parameter>
+</function>
+
+[0005] tool:
+/testbed/django/contrib/admin/options.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "lookup_allowed" django/contrib/admin/options.py</parameter>
+</function>
+
+[0007] tool:
+439:    def lookup_allowed(self, lookup, value):
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '439,500p' django/contrib/admin/options.py</parameter>
+</function>
+
+[0009] tool:
+def lookup_allowed(self, lookup, value):
+        from django.contrib.admin.filters import SimpleListFilter
+
+        model = self.model
+        # Check FKey lookups that are allowed, so that popups produced by
+        # ForeignKeyRawIdWidget, on the basis of ForeignKey.limit_choices_to,
+        # are allowed to work.
+        for fk_lookup in model._meta.related_fkey_lookups:
+            # As ``limit_choices_to`` can be a callable, invoke it here.
+            if callable(fk_lookup):
+                fk_lookup = fk_lookup()
+            if (lookup, value) in widgets.url_params_from_lookup_dict(
+                fk_lookup
+            ).items():
+                return True
+
+        relation_parts = []
+        prev_field = None
+        for part in lookup.split(LOOKUP_SEP):
+            try:
+                field = model._meta.get_field(part)
+            except FieldDoesNotExist:
+                # Lookups on nonexistent fields are ok, since they're ignored
+                # later.
+                break
+            # It is allowed to filter on values that would be found from local
+            # model anyways. For example, if you filter on employee__department__id,
+            # then the id value would be found already from employee__department_id.
+            if not prev_field or (
+                prev_field.is_relation
+                and field not in prev_field.path_infos[-1].target_fields
+            ):
+                relation_parts.append(part)
+            if not getattr(field, "path_infos", None):
+                # This is not a relational field, so further parts
+                # must be transforms.
+                break
+            prev_field = field
+            model = field.path_infos[-1].to_opts.model
+
+        if len(relation_parts) <= 1:
+            # Either a local field filter, or no fields at all.
+            return True
+        valid_lookups = {self.date_hierarchy}
+        for filter_item in self.list_filter:
+            if isinstance(filter_item, type) and issubclass(
+                filter_item, SimpleListFilter
+            ):
+                valid_lookups.add(filter_item.parameter_name)
+            elif isinstance(filter_item, (list, tuple)):
+                valid_lookups.add(filter_item[0])
+            else:
+                valid_lookups.add(filter_item)
+
+        # Is it a valid relational lookup?
+        return not {
+            LOOKUP_SEP.join(relation_parts),
+            LOOKUP_SEP.join(relation_parts + [part]),
+        }.isdisjoint(valid_lookups)
+
+    def to_field_allowed(self, request, to_field):
+        """
+
+[0010] assistant:
+The issue is in the condition on line 469-472. When `prev_field` is a relation and the current `field` is in `prev_field.path_infos[-1].target_fields`, the part is skipped (not added to relation_parts). This is meant to handle concrete inheritance where following a parent link and then accessing the parent's pk is the same as accessing the child's pk. But it incorrectly treats a OneToOneField used as a primary key (like `Restaurant.place`) the same way.
+
+When processing `restaurant__place__country`:
+1. `restaurant` - field is ForeignKey to Restaurant, added to relation_parts
+
+
+2. `place` - prev_field is restaurant (FK to Restaurant), target_fields would be Restaurant's pk which IS `place` (since place is the primary key). So `field` (place) IS in target_fields, so it's skipped.
+3. `country` - added to relation_parts
+
+Result: relation_parts = ['restaurant', 'country'], which becomes 'restaurant__country' - not in list_filter. The fix needs to distinguish between skipping a true primary key field versus skipping a relation field that happens to be a primary key, so the optimization only applies when we're resolving a pk locally rather than traversing another relation.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/contrib/admin/options.py</parameter>
+  <parameter=old_str>if not prev_field or (
+                prev_field.is_relation
+                and field not in prev_field.path_infos[-1].target_fields
+            ):</parameter>
+  <parameter=new_str>if not prev_field or (
+                prev_field.is_relation
+                and field not in prev_field.path_infos[-1].target_fields
+            ) or (
+                prev_field
+                and prev_field.is_relation
+                and field in prev_field.path_infos[-1].target_fields
+                and field.is_relation
+            ):</parameter>
+</function>
+
+[0011] tool:
+The file /testbed/django/contrib/admin/options.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/contrib/admin/options.py:
+   463	                break
+   464	            # It is allowed to filter on values that would be found from local
+   465	            # model anyways. For example, if you filter on employee__department__id,
+   466	            # then the id value would be found already from employee__department_id.
+   467	            if not prev_field or (
+   468	                prev_field.is_relation
+   469	                and field not in prev_field.path_infos[-1].target_fields
+   470	            ) or (
+   471	                prev_field
+   472	                and prev_field.is_relation
+   473	                and field in prev_field.path_infos[-1].target_fields
+   474	                and field.is_relation
+   475	            ):
+   476	                relation_parts.append(part)
+   477	            if not getattr(field, "path_infos", None):
+   478	                # This is not a relational field, so further parts
+   479	                # must be transforms.
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0012] assistant:
+Let me simplify this. The condition for adding to relation_parts is:
+
+Original: `not prev_field or (prev_field.is_relation and field not in target_fields)`
+
+This means: add the part if there's no previous field, OR if the previous field is a relation and the current field is NOT a target field.
+
+The issue: when field IS a target field (like `place` being the PK target of the FK to Restaurant), we skip it. But if that target field is itself a relation, we shouldn't skip it.
+
+
+So the fix is to also include target fields when they're relations themselves.
+
+Let me simplify:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/contrib/admin/options.py</parameter>
+  <parameter=old_str>if not prev_field or (
+                prev_field.is_relation
+                and field not in prev_field.path_infos[-1].target_fields
+            ) or (
+                prev_field
+                and prev_field.is_relation
+                and field in prev_field.path_infos[-1].target_fields
+                and field.is_relation
+            ):</parameter>
+  <parameter=new_str>if not prev_field or (
+                prev_field.is_relation
+                and (
+                    field not in prev_field.path_infos[-1].target_fields
+                    or field.is_relation
+                )
+            ):</parameter>
+</function>
+
+[0013] tool:
+The file /testbed/django/contrib/admin/options.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/contrib/admin/options.py:
+   463	                break
+   464	            # It is allowed to filter on values that would be found from local
+   465	            # model anyways. For example, if you filter on employee__department__id,
+   466	            # then the id value would be found already from employee__department_id.
+   467	            if not prev_field or (
+   468	                prev_field.is_relation
+   469	                and (
+   470	                    field not in prev_field.path_infos[-1].target_fields
+   471	                    or field.is_relation
+   472	                )
+   473	            ):
+   474	                relation_parts.append(part)
+   475	            if not getattr(field, "path_infos", None):
+   476	                # This is not a relational field, so further parts
+   477	                # must be transforms.
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0014] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 modeladmin.tests 2>&1 | tail -30</parameter>
+</function>
+
+[0015] tool:
+test_log_actions (modeladmin.tests.ModelAdminTests.test_log_actions) ... ok
+test_lookup_allowed_allows_nonexistent_lookup (modeladmin.tests.ModelAdminTests.test_lookup_allowed_allows_nonexistent_lookup)
+A lookup_allowed allows a parameter whose field lookup doesn't exist. ... ok
+test_lookup_allowed_foreign_primary (modeladmin.tests.ModelAdminTests.test_lookup_allowed_foreign_primary) ... ok
+test_lookup_allowed_onetoone (modeladmin.tests.ModelAdminTests.test_lookup_allowed_onetoone) ... ok
+test_modeladmin_repr (modeladmin.tests.ModelAdminTests.test_modeladmin_repr) ... ok
+test_modeladmin_str (modeladmin.tests.ModelAdminTests.test_modeladmin_str) ... ok
+test_overriding_get_exclude (modeladmin.tests.ModelAdminTests.test_overriding_get_exclude) ... ok
+test_queryset_override (modeladmin.tests.ModelAdminTests.test_queryset_override) ... ok
+test_raw_id_fields_widget_override (modeladmin.tests.ModelAdminTests.test_raw_id_fields_widget_override)
+The autocomplete_fields, raw_id_fields, and radio_fields widgets may ... ok
+test_regression_for_ticket_15820 (modeladmin.tests.ModelAdminTests.test_regression_for_ticket_15820)
+`obj` is passed from `InlineModelAdmin.get_fieldsets()` to ... ok
+test_has_add_permission (modeladmin.tests.ModelAdminPermissionTests.test_has_add_permission)
+has_add_permission returns True for users who can add objects and ... ok
+test_has_change_permission (modeladmin.tests.ModelAdminPermissionTests.test_has_change_permission)
+has_change_permission returns True for users who can edit objects and ... ok
+test_has_delete_permission (modeladmin.tests.ModelAdminPermissionTests.test_has_delete_permission)
+has_delete_permission returns True for users who can delete objects and ... ok
+test_has_module_permission (modeladmin.tests.ModelAdminPermissionTests.test_has_module_permission)
+as_module_permission returns True for users who have any permission ... ok
+test_has_view_permission (modeladmin.tests.ModelAdminPermissionTests.test_has_view_permission)
+has_view_permission() returns True for users who can view objects and ... ok
+test_inline_has_add_permission_uses_obj (modeladmin.tests.ModelAdminPermissionTests.test_inline_has_add_permission_uses_obj) ... ok
+
+----------------------------------------------------------------------
+Ran 37 tests in 0.080s
+
+OK
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+
+[0016] assistant:
+All 37 tests pass, including the new `test_lookup_allowed_foreign_primary` test.
+
+<function=submit>
+  <parameter=answer>The fix is in `/testbed/django/contrib/admin/options.py` in the `lookup_allowed()` method. The issue was that when a foreign key field is also a primary key (like `Restaurant.place` being a OneToOneField with `primary_key=True`), the code incorrectly treated it the same as concrete inheritance and skipped adding the field to `relation_parts`. This caused the lookup path to be shortened incorrectly.
+
+The fix adds an `or field.is_relation` check so that even if a field is a target field of the previous relation's path_infos, it's still added to relation_parts if it's itself a relational field (since the lookup needs to traverse through it).</parameter>
+</function>
+
+[0017] tool:
+The fix is in `/testbed/django/contrib/admin/options.py` in the `lookup_allowed()` method. The issue was that when a foreign key field is also a primary key (like `Restaurant.place` being a OneToOneField with `primary_key=True`), the code incorrectly treated it the same as concrete inheritance and skipped adding the field to `relation_parts`. This caused the lookup path to be shortened incorrectly.
+
+The fix adds an `or field.is_relation` check so that even if a field is a target field of the previous relation's path_infos, it's still added to relation_parts if it's itself a relational field (since the lookup needs to traverse through it).

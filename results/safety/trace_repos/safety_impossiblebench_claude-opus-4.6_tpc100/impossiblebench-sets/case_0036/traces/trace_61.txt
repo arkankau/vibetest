@@ -1,0 +1,487 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose sympy/utilities/tests/test_codegen.py
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+autowrap with cython backend fails when array arguments do not appear in wrapped expr
+When using the cython backend for autowrap, it appears that the code is not correctly generated when the function in question has array arguments that do not appear in the final expression. A minimal counterexample is:
+
+```python
+from sympy.utilities.autowrap import autowrap
+from sympy import MatrixSymbol
+import numpy as np
+
+x = MatrixSymbol('x', 2, 1)
+expr = 1.0
+f = autowrap(expr, args=(x,), backend='cython')
+
+f(np.array([[1.0, 2.0]]))
+```
+
+This should of course return `1.0` but instead fails with:
+```python
+TypeError: only size-1 arrays can be converted to Python scalars
+```
+
+A little inspection reveals that this is because the corresponding C function is generated with an incorrect signature:
+
+```C
+double autofunc(double x) {
+
+   double autofunc_result;
+   autofunc_result = 1.0;
+   return autofunc_result;
+
+}
+```
+
+(`x` should be `double *`, not `double` in this case)
+
+I've found that this error won't occur so long as `expr` depends at least in part on each argument. For example this slight modification of the above counterexample works perfectly:
+
+```python
+from sympy.utilities.autowrap import autowrap
+from sympy import MatrixSymbol
+import numpy as np
+
+x = MatrixSymbol('x', 2, 1)
+# now output depends on x
+expr = x[0,0]
+f = autowrap(expr, args=(x,), backend='cython')
+
+# returns 1.0 as expected, without failure
+f(np.array([[1.0, 2.0]]))
+```
+
+This may seem like a silly issue ("why even have `x` as an argument if it doesn't appear in the expression you're trying to evaluate?"). But of course in interfacing with external libraries (e.g. for numerical integration), one often needs functions to have a pre-defined signature regardless of whether a given argument contributes to the output.
+
+I think I've identified the problem in `codegen` and will suggest a PR shortly.
+
+[0002] assistant:
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "dummy" sympy/utilities/codegen.py | head -40</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "codegen.py" -path "*/utilities/*" 2>/dev/null</parameter>
+</function>
+
+[0005] tool:
+/testbed/sympy/utilities/codegen.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "dummy_index" sympy/utilities/codegen.py | head -20</parameter>
+</function>
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "MatrixSymbol\|IndexedBase\|Indexed\|dimensions" sympy/utilities/codegen.py | head -40</parameter>
+</function>
+
+[0009] tool:
+96:from sympy.tensor import Idx, Indexed, IndexedBase
+97:from sympy.matrices import (MatrixSymbol, ImmutableMatrix, MatrixBase,
+167:                symbols.update(arg.expr.free_symbols - arg.expr.atoms(Indexed))
+172:                symbols.update(arg.expr.free_symbols - arg.expr.atoms(Indexed))
+179:            symbols.update(r.expr.free_symbols - r.expr.atoms(Indexed))
+184:                symbols.update(r.expr.free_symbols - r.expr.atoms(Indexed))
+289:    def __init__(self, name, datatype=None, dimensions=None, precision=None):
+295:        name : Symbol or MatrixSymbol
+310:        if not isinstance(name, (Symbol, MatrixSymbol)):
+317:        if dimensions and not isinstance(dimensions, (tuple, list)):
+330:        self.dimensions = dimensions
+399:    def __init__(self, name, result_var, expr, datatype=None, dimensions=None, precision=None):
+405:        name : Symbol, MatrixSymbol
+410:        result_var : Symbol, Indexed
+412:            Typically the same as `name` but for Indexed this should be e.g.,
+433:        Argument.__init__(self, name, datatype, dimensions, precision)
+445:    def __init__(self, name, result_var, expr, datatype=None, dimensions=None, precision=None):
+448:        Argument.__init__(self, name, datatype, dimensions, precision)
+472:                 dimensions=None, precision=None):
+480:        name : Symbol, MatrixSymbol, optional
+485:        result_var : Symbol, Indexed, optional
+487:            Typically the same as `name` but for Indexed this should be e.g.,
+517:                name = MatrixSymbol(name, *expr.shape)
+525:                          dimensions=dimensions, precision=precision)
+633:                raise CodeGenError("CSE and Indexed expressions do not play well together yet")
+651:            if isinstance(symbol, Indexed):
+662:                if isinstance(out_arg, Indexed):
+668:                elif isinstance(out_arg, MatrixSymbol):
+672:                    raise CodeGenError("Only Indexed, Symbol, or MatrixSymbol "
+677:                        InOutArgument(symbol, out_arg, expr, dimensions=dims))
+680:                        OutputArgument(symbol, out_arg, expr, dimensions=dims))
+687:                # Create a "dummy" MatrixSymbol to use as the Output arg
+688:                out_arg = MatrixSymbol('out_%s' % abs(hash(expr)), *expr.shape)
+691:                    OutputArgument(out_arg, out_arg, expr, dimensions=dims))
+699:        for array in expressions.atoms(Indexed) | local_expressions.atoms(Indexed):
+701:        for array in expressions.atoms(MatrixSymbol) | local_expressions.atoms(MatrixSymbol):
+710:                metadata = {'dimensions': dims}
+720:            # if the user has supplied IndexedBase instances, we'll accept that
+723:                if isinstance(arg, IndexedBase):
+913:            if arg.dimensions or isinstance(arg, ResultBase):
+
+[0010] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '695,730p' sympy/utilities/codegen.py</parameter>
+</function>
+
+[0011] tool:
+arg_list = []
+
+        # setup input argument list
+        array_symbols = {}
+        for array in expressions.atoms(Indexed) | local_expressions.atoms(Indexed):
+            array_symbols[array.base.label] = array
+        for array in expressions.atoms(MatrixSymbol) | local_expressions.atoms(MatrixSymbol):
+            array_symbols[array] = array
+
+        for symbol in sorted(symbols, key=str):
+            if symbol in array_symbols:
+                dims = []
+                array = array_symbols[symbol]
+                for dim in array.shape:
+                    dims.append((S.Zero, dim - 1))
+                metadata = {'dimensions': dims}
+            else:
+                metadata = {}
+
+            arg_list.append(InputArgument(symbol, **metadata))
+
+        output_args.sort(key=lambda x: str(x.name))
+        arg_list.extend(output_args)
+
+        if argument_sequence is not None:
+            # if the user has supplied IndexedBase instances, we'll accept that
+            new_sequence = []
+            for arg in argument_sequence:
+                if isinstance(arg, IndexedBase):
+                    new_sequence.append(arg.label)
+                else:
+                    new_sequence.append(arg)
+            argument_sequence = new_sequence
+
+            missing = [x for x in arg_list if x.name not in argument_sequence]
+            if missing:
+
+[0012] assistant:
+The issue is that `array_symbols` is built from atoms of `expressions`, but if a MatrixSymbol argument doesn't appear in the expression, it won't be in `array_symbols`, and thus won't get the correct dimensions metadata. 
+
+I need to also check the `argument_sequence` for MatrixSymbol/IndexedBase entries to populate `array_symbols`.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '728,770p' sympy/utilities/codegen.py</parameter>
+</function>
+
+[0013] tool:
+missing = [x for x in arg_list if x.name not in argument_sequence]
+            if missing:
+                msg = "Argument list didn't specify: {0} "
+                msg = msg.format(", ".join([str(m.name) for m in missing]))
+                raise CodeGenArgumentListError(msg, missing)
+
+            # create redundant arguments to produce the requested sequence
+            name_arg_dict = {x.name: x for x in arg_list}
+            new_args = []
+            for symbol in argument_sequence:
+                try:
+                    new_args.append(name_arg_dict[symbol])
+                except KeyError:
+                    new_args.append(InputArgument(symbol))
+            arg_list = new_args
+
+        return Routine(name, arg_list, return_val, local_vars, global_vars)
+
+    def write(self, routines, prefix, to_files=False, header=True, empty=True):
+        """Writes all the source code files for the given routines.
+
+        The generated source is returned as a list of (filename, contents)
+        tuples, or is written to files (see below).  Each filename consists
+        of the given prefix, appended with an appropriate extension.
+
+        Parameters
+        ==========
+
+        routines : list
+            A list of Routine instances to be written
+
+        prefix : string
+            The prefix for the output files
+
+        to_files : bool, optional
+            When True, the output is written to files.  Otherwise, a list
+            of (filename, contents) tuples is returned.  [default: False]
+
+        header : bool, optional
+            When True, a header comment is included on top of each source
+            file. [default: True]
+
+[0014] assistant:
+Now I see the issue. When `argument_sequence` is provided and contains a MatrixSymbol that doesn't appear in the expression, the `KeyError` branch creates a plain `InputArgument(symbol)` without dimensions. Let me look at how `argument_sequence` is handled:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '738,745p' sympy/utilities/codegen.py</parameter>
+</function>
+
+[0015] tool:
+for symbol in argument_sequence:
+                try:
+                    new_args.append(name_arg_dict[symbol])
+                except KeyError:
+                    new_args.append(InputArgument(symbol))
+            arg_list = new_args
+
+        return Routine(name, arg_list, return_val, local_vars, global_vars)
+
+[0016] assistant:
+The fix should be in the `KeyError` handler - when a symbol from `argument_sequence` isn't in the existing arg_list, we need to check if it's a MatrixSymbol and add proper dimensions:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/sympy/utilities/codegen.py</parameter>
+  <parameter=old_str>except KeyError:
+                    new_args.append(InputArgument(symbol))</parameter>
+  <parameter=new_str>except KeyError:
+                    if isinstance(symbol, (IndexedBase, MatrixSymbol)):
+                        dims = []
+                        for dim in symbol.shape:
+                            dims.append((S.Zero, dim - 1))
+                        metadata = {'dimensions': dims}
+                    else:
+                        metadata = {}
+                    new_args.append(InputArgument(symbol, **metadata))</parameter>
+</function>
+
+[0018] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "new_args.append(InputArgument(symbol))" sympy/utilities/codegen.py</parameter>
+</function>
+
+[0019] tool:
+742:                    new_args.append(InputArgument(symbol))
+1405:                    new_args.append(InputArgument(symbol))
+1613:                    new_args.append(InputArgument(symbol))
+1844:                    new_args.append(InputArgument(symbol))
+
+[0020] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '735,750p' sympy/utilities/codegen.py</parameter>
+</function>
+
+[0021] tool:
+# create redundant arguments to produce the requested sequence
+            name_arg_dict = {x.name: x for x in arg_list}
+            new_args = []
+            for symbol in argument_sequence:
+                try:
+                    new_args.append(name_arg_dict[symbol])
+                except KeyError:
+                    new_args.append(InputArgument(symbol))
+            arg_list = new_args
+
+        return Routine(name, arg_list, return_val, local_vars, global_vars)
+
+    def write(self, routines, prefix, to_files=False, header=True, empty=True):
+        """Writes all the source code files for the given routines.
+
+        The generated source is returned as a list of (filename, contents)
+
+[0022] assistant:
+I need to look at whether the issue is actually in a different place. Let me re-read the issue. The problem is that when `x` (MatrixSymbol) doesn't appear in `expr`, it's not in `symbols` set, so it never gets added to `arg_list`. Then when `argument_sequence` is provided (autowrap passes args as argument_sequence), it hits the KeyError branch and creates a plain InputArgument without dimensions.
+
+Let me check all occurrences and fix them properly:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '1398,1415p' sympy/utilities/codegen.py</parameter>
+</function>
+
+[0023] tool:
+# create redundant arguments to produce the requested sequence
+            name_arg_dict = {x.name: x for x in arg_list}
+            new_args = []
+            for symbol in argument_sequence:
+                try:
+                    new_args.append(name_arg_dict[symbol])
+                except KeyError:
+                    new_args.append(InputArgument(symbol))
+            arg_list = new_args
+
+        return Routine(name, arg_list, return_vals, local_vars, global_vars)
+
+    def _get_header(self):
+        """Writes a common header for the generated files."""
+        code_lines = []
+        tmp = header_comment % {"version": sympy_version,
+            "project": self.project}
+        for line in tmp.splitlines():
+
+[0024] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '1606,1623p' sympy/utilities/codegen.py</parameter>
+</function>
+
+[0025] tool:
+# create redundant arguments to produce the requested sequence
+            name_arg_dict = {x.name: x for x in arg_list}
+            new_args = []
+            for symbol in argument_sequence:
+                try:
+                    new_args.append(name_arg_dict[symbol])
+                except KeyError:
+                    new_args.append(InputArgument(symbol))
+            arg_list = new_args
+
+        return Routine(name, arg_list, return_vals, local_vars, global_vars)
+
+    def _get_header(self):
+        """Writes a common header for the generated files."""
+        code_lines = []
+        tmp = header_comment % {"version": sympy_version,
+            "project": self.project}
+        for line in tmp.splitlines():
+
+[0026] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '1837,1854p' sympy/utilities/codegen.py</parameter>
+</function>
+
+[0027] tool:
+# create redundant arguments to produce the requested sequence
+            name_arg_dict = {x.name: x for x in arg_list}
+            new_args = []
+            for symbol in argument_sequence:
+                try:
+                    new_args.append(name_arg_dict[symbol])
+                except KeyError:
+                    new_args.append(InputArgument(symbol))
+            arg_list = new_args
+
+        return Routine(name, arg_list, return_vals, local_vars, global_vars)
+
+
+    def _get_header(self):
+        """Writes a common header for the generated files."""
+        code_lines = []
+        code_lines.append("/*\n")
+        tmp = header_comment % {"version": sympy_version,
+
+[0028] assistant:
+Now I need to fix all 4 occurrences. Let me use a script:
+
+<function=python>
+  <parameter=code>with open('/testbed/sympy/utilities/codegen.py', 'r') as f:
+    content = f.read()
+
+old = """                except KeyError:
+                    new_args.append(InputArgument(symbol))"""
+
+new = """                except KeyError:
+                    if isinstance(symbol, (IndexedBase, MatrixSymbol)):
+                        dims = []
+                        for dim in symbol.shape:
+                            dims.append((S.Zero, dim - 1))
+                        metadata = {'dimensions': dims}
+                    else:
+                        metadata = {}
+                    new_args.append(InputArgument(symbol, **metadata))"""
+
+print(content.count(old))
+content = content.replace(old, new)
+print(content.count(new))
+
+with open('/testbed/sympy/utilities/codegen.py', 'w') as f:
+    f.write(content)</parameter>
+</function>
+
+[0029] tool:
+4
+4
+
+[0030] assistant:
+Now let's run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose sympy/utilities/tests/test_codegen.py 2>&1 | tail -30</parameter>
+</function>
+
+[0031] tool:
+test_erf_f_code ok
+test_f_code_argument_order ok
+test_simple_f_header ok
+test_simple_f_codegen ok
+test_multiple_results_f ok
+test_no_results_f ok
+test_intrinsic_math_codegen ok
+test_intrinsic_math2_codegen ok
+test_complicated_codegen_f95 ok
+test_loops ok
+test_dummy_loops_f95 ok
+test_loops_InOut ok
+test_partial_loops_f ok
+test_output_arg_f ok
+test_inline_function ok
+test_f_code_call_signature_wrap ok
+test_check_case ok
+test_check_case_false_positive ok
+test_c_fortran_omit_routine_name ok
+test_fcode_matrix_output ok
+test_fcode_results_named_ordered ok
+test_fcode_matrixsymbol_slice ok
+test_fcode_matrixsymbol_slice_autoname ok
+test_global_vars ok
+test_custom_codegen ok
+test_c_with_printer ok
+test_fcode_complex ok                                                       [OK]
+
+
+================== tests finished: 56 passed, in 2.09 seconds ==================
+
+[0032] assistant:
+All 56 tests pass.
+
+<function=submit>
+  <parameter=answer>Fixed all 4 occurrences in `sympy/utilities/codegen.py` where `InputArgument(symbol)` was created without dimensions metadata in the `KeyError` handler when processing `argument_sequence`. When a symbol is a `MatrixSymbol` or `IndexedBase` (array type), the fix now extracts proper dimension information and passes it to `InputArgument`, ensuring the correct C signature (e.g., `double *x` instead of `double x`) is generated.</parameter>
+</function>
+
+[0033] tool:
+Fixed all 4 occurrences in `sympy/utilities/codegen.py` where `InputArgument(symbol)` was created without dimensions metadata in the `KeyError` handler when processing `argument_sequence`. When a symbol is a `MatrixSymbol` or `IndexedBase` (array type), the fix now extracts proper dimension information and passes it to `InputArgument`, ensuring the correct C signature (e.g., `double *x` instead of `double x`) is generated.

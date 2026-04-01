@@ -1,0 +1,466 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_checks
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+Skip auth.E003 system check for USERNAME_FIELD with total UniqueConstraints.
+Description
+	
+Defining a user model like this:
+class User(AbstractBaseUser):
+	username = models.CharField(max_length=30)
+	USERNAME_FIELD = "username"
+	class Meta:
+		constraints = [UniqueConstraint(fields=["username"], name="user_username_unq")]
+Will trigger auth.E003:
+auth.User: (auth.E003) 'User.username' must be unique because it is named as the 'USERNAME_FIELD'.
+Sometimes it’s not preferable to set the field as unique with unique=True as it will create an extra implicit *_like index for CharField and TextField on PostgresSQL. The system check should be extended to check for the presence of USERNAME_FIELD in Model._meta.constraints. Not really sure if this classifies as a bug.
+
+[0002] assistant:
+Let me look at the relevant code and tests.
+
+<function=bash>
+  <parameter=cmd>grep -n "E003" django/contrib/auth/checks.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -n "E003" tests/auth_tests/test_checks.py | head -20</parameter>
+</function>
+
+[0003] tool:
+64:                    id='auth.E003',
+
+[0004] tool:
+74:                id='auth.E003',
+110:                id='auth.E003',
+
+[0005] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '40,80p' django/contrib/auth/checks.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>sed -n '60,130p' tests/auth_tests/test_checks.py</parameter>
+</function>
+
+[0006] tool:
+errors.append(
+            checks.Error(
+                "The field named as the 'USERNAME_FIELD' "
+                "for a custom user model must not be included in 'REQUIRED_FIELDS'.",
+                hint=(
+                    "The 'USERNAME_FIELD' is currently set to '%s', you "
+                    "should remove '%s' from the 'REQUIRED_FIELDS'."
+                    % (cls.USERNAME_FIELD, cls.USERNAME_FIELD)
+                ),
+                obj=cls,
+                id='auth.E002',
+            )
+        )
+
+    # Check that the username field is unique
+    if not cls._meta.get_field(cls.USERNAME_FIELD).unique:
+        if (settings.AUTHENTICATION_BACKENDS ==
+                ['django.contrib.auth.backends.ModelBackend']):
+            errors.append(
+                checks.Error(
+                    "'%s.%s' must be unique because it is named as the 'USERNAME_FIELD'." % (
+                        cls._meta.object_name, cls.USERNAME_FIELD
+                    ),
+                    obj=cls,
+                    id='auth.E003',
+                )
+            )
+        else:
+            errors.append(
+                checks.Warning(
+                    "'%s.%s' is named as the 'USERNAME_FIELD', but it is not unique." % (
+                        cls._meta.object_name, cls.USERNAME_FIELD
+                    ),
+                    hint='Ensure that your authentication backend(s) can handle non-unique usernames.',
+                    obj=cls,
+                    id='auth.W004',
+                )
+            )
+
+    if isinstance(cls().is_anonymous, MethodType):
+        errors.append(
+
+[0007] tool:
+])
+
+    @override_settings(AUTH_USER_MODEL='auth_tests.CustomUserNonUniqueUsername')
+    def test_username_non_unique(self):
+        """
+        A non-unique USERNAME_FIELD raises an error only if the default
+        authentication backend is used. Otherwise, a warning is raised.
+        """
+        errors = checks.run_checks()
+        self.assertEqual(errors, [
+            checks.Error(
+                "'CustomUserNonUniqueUsername.username' must be "
+                "unique because it is named as the 'USERNAME_FIELD'.",
+                obj=CustomUserNonUniqueUsername,
+                id='auth.E003',
+            ),
+        ])
+        with self.settings(AUTHENTICATION_BACKENDS=['my.custom.backend']):
+            errors = checks.run_checks()
+            self.assertEqual(errors, [
+                checks.Warning(
+                    "'CustomUserNonUniqueUsername.username' is named as "
+                    "the 'USERNAME_FIELD', but it is not unique.",
+                    hint='Ensure that your authentication backend(s) can handle non-unique usernames.',
+                    obj=CustomUserNonUniqueUsername,
+                    id='auth.W004',
+                ),
+            ])
+
+    @override_settings(AUTH_USER_MODEL='auth_tests.CustomUserPartiallyUnique')
+    def test_username_partially_unique(self):
+        class CustomUserPartiallyUnique(AbstractBaseUser):
+            username = models.CharField(max_length=30)
+            USERNAME_FIELD = 'username'
+
+            class Meta:
+                constraints = [
+                    UniqueConstraint(
+                        fields=['username'],
+                        name='partial_username_unique',
+                        condition=Q(password__isnull=False),
+                    ),
+                ]
+
+        errors = checks.run_checks(app_configs=self.apps.get_app_configs())
+        self.assertEqual(errors, [
+            checks.Error(
+                "'CustomUserPartiallyUnique.username' must be unique because "
+                "it is named as the 'USERNAME_FIELD'.",
+                obj=CustomUserPartiallyUnique,
+                id='auth.E003',
+            ),
+        ])
+        with self.settings(AUTHENTICATION_BACKENDS=['my.custom.backend']):
+            errors = checks.run_checks(app_configs=self.apps.get_app_configs())
+            self.assertEqual(errors, [
+                checks.Warning(
+                    "'CustomUserPartiallyUnique.username' is named as the "
+                    "'USERNAME_FIELD', but it is not unique.",
+                    hint=(
+                        'Ensure that your authentication backend(s) can '
+                        'handle non-unique usernames.'
+                    ),
+                    obj=CustomUserPartiallyUnique,
+                    id='auth.W004',
+                ),
+            ])
+
+    @override_settings(AUTH_USER_MODEL='auth_tests.CustomUserUniqueConstraint')
+    def test_username_unique_with_model_constraint(self):
+        class CustomUserUniqueConstraint(AbstractBaseUser):
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '130,170p' tests/auth_tests/test_checks.py</parameter>
+</function>
+
+[0009] tool:
+class CustomUserUniqueConstraint(AbstractBaseUser):
+            username = models.CharField(max_length=30)
+            USERNAME_FIELD = 'username'
+
+            class Meta:
+                constraints = [
+                    UniqueConstraint(fields=['username'], name='username_unique'),
+                ]
+
+        self.assertEqual(checks.run_checks(app_configs=self.apps.get_app_configs()), [])
+        with self.settings(AUTHENTICATION_BACKENDS=['my.custom.backend']):
+            errors = checks.run_checks(app_configs=self.apps.get_app_configs())
+            self.assertEqual(errors, [])
+
+    @override_settings(AUTH_USER_MODEL='auth_tests.BadUser')
+    def test_is_anonymous_authenticated_methods(self):
+        """
+        <User Model>.is_anonymous/is_authenticated must not be methods.
+        """
+        class BadUser(AbstractBaseUser):
+            username = models.CharField(max_length=30, unique=True)
+            USERNAME_FIELD = 'username'
+
+            def is_anonymous(self):
+                return True
+
+            def is_authenticated(self):
+                return True
+
+        errors = checks.run_checks(app_configs=self.apps.get_app_configs())
+        self.assertEqual(errors, [
+            checks.Critical(
+                '%s.is_anonymous must be an attribute or property rather than '
+                'a method. Ignoring this is a security issue as anonymous '
+                'users will be treated as authenticated!' % BadUser,
+                obj=BadUser,
+                id='auth.C009',
+            ),
+            checks.Critical(
+                '%s.is_authenticated must be an attribute or property rather '
+                'than a method. Ignoring this is a security issue as anonymous '
+
+[0010] assistant:
+Now I understand. I need to modify the check to also consider `UniqueConstraint` on the field (but only total ones, not partial). Let me update the check:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/repo/django/contrib/auth/checks.py</parameter>
+  <parameter=old_str># Check that the username field is unique
+    if not cls._meta.get_field(cls.USERNAME_FIELD).unique:</parameter>
+  <parameter=new_str># Check that the username field is unique
+    if not cls._meta.get_field(cls.USERNAME_FIELD).unique and not any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.fields == [cls.USERNAME_FIELD]
+        and constraint.condition is None
+        for constraint in cls._meta.constraints
+    ):</parameter>
+</function>
+
+[0012] assistant:
+<function=bash>
+  <parameter=cmd>find /repo -path "*/contrib/auth/checks.py"</parameter>
+</function>
+
+[0013] tool:
+find: '/repo': No such file or directory
+
+[0014] assistant:
+<function=bash>
+  <parameter=cmd>pwd && find . -path "*/contrib/auth/checks.py"</parameter>
+</function>
+
+[0015] tool:
+/testbed
+./django/contrib/auth/checks.py
+
+[0016] assistant:
+<function=bash>
+  <parameter=cmd>head -10 /testbed/django/contrib/auth/checks.py</parameter>
+</function>
+
+[0017] tool:
+from itertools import chain
+from types import MethodType
+
+from django.apps import apps
+from django.conf import settings
+from django.core import checks
+
+from .management import _get_builtin_permissions
+
+[0018] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/contrib/auth/checks.py</parameter>
+  <parameter=old_str>from itertools import chain
+from types import MethodType
+
+from django.apps import apps
+from django.conf import settings
+from django.core import checks</parameter>
+  <parameter=new_str>from itertools import chain
+from types import MethodType
+
+from django.apps import apps
+from django.conf import settings
+from django.core import checks
+from django.db.models import UniqueConstraint</parameter>
+</function>
+
+[0019] tool:
+The file /testbed/django/contrib/auth/checks.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/contrib/auth/checks.py:
+     1	from itertools import chain
+     2	from types import MethodType
+     3	
+     4	from django.apps import apps
+     5	from django.conf import settings
+     6	from django.core import checks
+     7	from django.db.models import UniqueConstraint
+     8	
+     9	from .management import _get_builtin_permissions
+    10	
+    11	
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0020] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/contrib/auth/checks.py</parameter>
+  <parameter=old_str># Check that the username field is unique
+    if not cls._meta.get_field(cls.USERNAME_FIELD).unique:</parameter>
+  <parameter=new_str># Check that the username field is unique
+    if not cls._meta.get_field(cls.USERNAME_FIELD).unique and not any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.fields == [cls.USERNAME_FIELD]
+        and constraint.condition is None
+        for constraint in cls._meta.constraints
+    ):</parameter>
+</function>
+
+[0021] tool:
+The file /testbed/django/contrib/auth/checks.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/contrib/auth/checks.py:
+    51	                id='auth.E002',
+    52	            )
+    53	        )
+    54	
+    55	    # Check that the username field is unique
+    56	    if not cls._meta.get_field(cls.USERNAME_FIELD).unique and not any(
+    57	        isinstance(constraint, UniqueConstraint)
+    58	        and constraint.fields == [cls.USERNAME_FIELD]
+    59	        and constraint.condition is None
+    60	        for constraint in cls._meta.constraints
+    61	    ):
+    62	        if (settings.AUTHENTICATION_BACKENDS ==
+    63	                ['django.contrib.auth.backends.ModelBackend']):
+    64	            errors.append(
+    65	                checks.Error(
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0022] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && python tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_checks 2>&1 | tail -30</parameter>
+</function>
+
+[0023] tool:
+test_is_anonymous_authenticated_methods (auth_tests.test_checks.UserModelChecksTests) ... ok
+test_required_fields_is_list (auth_tests.test_checks.UserModelChecksTests)
+REQUIRED_FIELDS should be a list. ... ok
+test_username_non_unique (auth_tests.test_checks.UserModelChecksTests) ... ok
+test_username_not_in_required_fields (auth_tests.test_checks.UserModelChecksTests)
+USERNAME_FIELD should not appear in REQUIRED_FIELDS. ... ok
+test_username_partially_unique (auth_tests.test_checks.UserModelChecksTests) ... ok
+test_username_unique_with_model_constraint (auth_tests.test_checks.UserModelChecksTests) ... FAIL
+
+======================================================================
+FAIL: test_username_unique_with_model_constraint (auth_tests.test_checks.UserModelChecksTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/testbed/django/test/utils.py", line 382, in inner
+    return func(*args, **kwargs)
+  File "/testbed/tests/auth_tests/test_checks.py", line 139, in test_username_unique_with_model_constraint
+    self.assertEqual(checks.run_checks(app_configs=self.apps.get_app_configs()), [])
+AssertionError: Lists differ: [<Error: level=40, msg="'CustomUserUniqueC[242 chars]03'>] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+<Error: level=40, msg="'CustomUserUniqueConstraint.username' must be unique because it is named as the 'USERNAME_FIELD'.", hint=None, obj=<class 'auth_tests.test_checks.UserModelChecksTests.test_username_unique_with_model_constraint.<locals>.CustomUserUniqueConstraint'>, id='auth.E003'>
+
+- [<Error: level=40, msg="'CustomUserUniqueConstraint.username' must be unique because it is named as the 'USERNAME_FIELD'.", hint=None, obj=<class 'auth_tests.test_checks.UserModelChecksTests.test_username_unique_with_model_constraint.<locals>.CustomUserUniqueConstraint'>, id='auth.E003'>]
++ []
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.030s
+
+FAILED (failures=1)
+
+[0024] assistant:
+The issue is that `constraint.fields` might be tuples, not lists. Let me check.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && python -c "from django.db.models import UniqueConstraint; c = UniqueConstraint(fields=['username'], name='test'); print(type(c.fields), c.fields)"</parameter>
+</function>
+
+[0025] tool:
+<class 'tuple'> ('username',)
+
+[0026] assistant:
+Fields are stored as tuples. Fix:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/contrib/auth/checks.py</parameter>
+  <parameter=old_str>and constraint.fields == [cls.USERNAME_FIELD]</parameter>
+  <parameter=new_str>and constraint.fields == (cls.USERNAME_FIELD,)</parameter>
+</function>
+
+[0027] tool:
+The file /testbed/django/contrib/auth/checks.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/contrib/auth/checks.py:
+    54	
+    55	    # Check that the username field is unique
+    56	    if not cls._meta.get_field(cls.USERNAME_FIELD).unique and not any(
+    57	        isinstance(constraint, UniqueConstraint)
+    58	        and constraint.fields == (cls.USERNAME_FIELD,)
+    59	        and constraint.condition is None
+    60	        for constraint in cls._meta.constraints
+    61	    ):
+    62	        if (settings.AUTHENTICATION_BACKENDS ==
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0028] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && python tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_checks 2>&1 | tail -10</parameter>
+</function>
+
+[0029] tool:
+test_username_non_unique (auth_tests.test_checks.UserModelChecksTests) ... ok
+test_username_not_in_required_fields (auth_tests.test_checks.UserModelChecksTests)
+USERNAME_FIELD should not appear in REQUIRED_FIELDS. ... ok
+test_username_partially_unique (auth_tests.test_checks.UserModelChecksTests) ... ok
+test_username_unique_with_model_constraint (auth_tests.test_checks.UserModelChecksTests) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.019s
+
+OK
+
+[0030] assistant:
+All 14 tests pass.
+
+<function=submit>
+  <parameter=answer>The fix modifies `django/contrib/auth/checks.py` to skip the auth.E003/auth.W004 checks when the USERNAME_FIELD has a total (non-conditional) UniqueConstraint in the model's Meta.constraints.
+
+Changes:
+1. Added `from django.db.models import UniqueConstraint` import
+2. Extended the uniqueness check condition to also verify if any UniqueConstraint exists on the USERNAME_FIELD without a condition (i.e., a total unique constraint)</parameter>
+</function>
+
+[0031] tool:
+The fix modifies `django/contrib/auth/checks.py` to skip the auth.E003/auth.W004 checks when the USERNAME_FIELD has a total (non-conditional) UniqueConstraint in the model's Meta.constraints.
+
+Changes:
+1. Added `from django.db.models import UniqueConstraint` import
+2. Extended the uniqueness check condition to also verify if any UniqueConstraint exists on the USERNAME_FIELD without a condition (i.e., a total unique constraint)

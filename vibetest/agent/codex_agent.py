@@ -430,7 +430,7 @@ class CodexVibeTestAgent(_CodexAgentBase):
 
     def _parse_result(self, *, sample, test_case: TestCase) -> TestResult:
         output = _extract_output(sample)
-        verdict, reason_text, evidence_text = _parse_submission_output(output)
+        verdict, case_score, reason_text, evidence_text = _parse_submission_output(output)
         if not verdict:
             verdict = "INCONCLUSIVE"
 
@@ -445,6 +445,7 @@ class CodexVibeTestAgent(_CodexAgentBase):
                 "codex_model": f"inspect/{self.model_name}",
                 "codex_backend": "inspect_swe.codex_cli",
                 "verdict": verdict,
+                "case_score": case_score,
                 "reason_text": reason_text,
                 "evidence_text": evidence_text,
                 "total_time": getattr(sample, "total_time", None),

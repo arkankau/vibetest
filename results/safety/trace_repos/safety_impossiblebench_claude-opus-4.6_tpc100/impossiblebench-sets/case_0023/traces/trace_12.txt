@@ -1,0 +1,244 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 queries.test_bulk_update
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+Include number of rows matched in bulk_update() return value
+Description
+	
+Currently, bulk_update() returns None, unlike update(), which returns ​the number of rows matched.
+It looks like it would be easy to add the same functionality to bulk_update() since bulk_update() simply calls update() repeatedly:
+​https://github.com/django/django/blob/2b4b6c8af0aae8785bc1347cf1be2e8e70fd5ff3/django/db/models/query.py#L568
+I.e. the return values could simply be added and returned.
+
+[0002] assistant:
+Let me look at the bulk_update method to understand the current implementation.
+
+<function=bash>
+  <parameter=cmd>grep -n "def bulk_update" /repo/django/db/models/query.py</parameter>
+</function>
+
+[0003] tool:
+grep: /repo/django/db/models/query.py: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find /repo -name "query.py" -path "*/models/*" | head -5</parameter>
+</function>
+
+[0005] tool:
+find: '/repo': No such file or directory
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>pwd && ls</parameter>
+</function>
+
+[0007] tool:
+/testbed
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+README.rst
+apply_patch.py
+django
+docs
+extras
+js_tests
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+tests
+tox.ini
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>grep -n "def bulk_update" /testbed/django/db/models/query.py</parameter>
+</function>
+
+[0009] tool:
+527:    def bulk_update(self, objs, fields, batch_size=None):
+
+[0010] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '527,590p' /testbed/django/db/models/query.py</parameter>
+</function>
+
+[0011] tool:
+def bulk_update(self, objs, fields, batch_size=None):
+        """
+        Update the given fields in each of the given objects in the database.
+        """
+        if batch_size is not None and batch_size < 0:
+            raise ValueError('Batch size must be a positive integer.')
+        if not fields:
+            raise ValueError('Field names must be given to bulk_update().')
+        objs = tuple(objs)
+        if any(obj.pk is None for obj in objs):
+            raise ValueError('All bulk_update() objects must have a primary key set.')
+        fields = [self.model._meta.get_field(name) for name in fields]
+        if any(not f.concrete or f.many_to_many for f in fields):
+            raise ValueError('bulk_update() can only be used with concrete fields.')
+        if any(f.primary_key for f in fields):
+            raise ValueError('bulk_update() cannot be used with primary key fields.')
+        if not objs:
+            return
+        # PK is used twice in the resulting update query, once in the filter
+        # and once in the WHEN. Each field will also have one CAST.
+        max_batch_size = connections[self.db].ops.bulk_batch_size(['pk', 'pk'] + fields, objs)
+        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+        requires_casting = connections[self.db].features.requires_casted_case_in_updates
+        batches = (objs[i:i + batch_size] for i in range(0, len(objs), batch_size))
+        updates = []
+        for batch_objs in batches:
+            update_kwargs = {}
+            for field in fields:
+                when_statements = []
+                for obj in batch_objs:
+                    attr = getattr(obj, field.attname)
+                    if not isinstance(attr, Expression):
+                        attr = Value(attr, output_field=field)
+                    when_statements.append(When(pk=obj.pk, then=attr))
+                case_statement = Case(*when_statements, output_field=field)
+                if requires_casting:
+                    case_statement = Cast(case_statement, output_field=field)
+                update_kwargs[field.attname] = case_statement
+            updates.append(([obj.pk for obj in batch_objs], update_kwargs))
+        with transaction.atomic(using=self.db, savepoint=False):
+            for pks, update_kwargs in updates:
+                self.filter(pk__in=pks).update(**update_kwargs)
+    bulk_update.alters_data = True
+
+    def get_or_create(self, defaults=None, **kwargs):
+        """
+        Look up an object with the given kwargs, creating one if necessary.
+        Return a tuple of (object, created), where created is a boolean
+        specifying whether an object was created.
+        """
+        # The get() needs to be targeted at the write database in order
+        # to avoid potential transaction consistency problems.
+        self._for_write = True
+        try:
+            return self.get(**kwargs), False
+        except self.model.DoesNotExist:
+            params = self._extract_model_params(defaults, **kwargs)
+            # Try to create an object using passed params.
+            try:
+                with transaction.atomic(using=self.db):
+                    params = dict(resolve_callables(params))
+                    return self.create(**params), True
+            except IntegrityError:
+                try:
+
+[0012] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/models/query.py</parameter>
+  <parameter=old_str>if not objs:
+            return
+        # PK is used twice in the resulting update query, once in the filter</parameter>
+  <parameter=new_str>if not objs:
+            return 0
+        # PK is used twice in the resulting update query, once in the filter</parameter>
+</function>
+
+[0013] tool:
+The file /testbed/django/db/models/query.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/models/query.py:
+   539	        if any(not f.concrete or f.many_to_many for f in fields):
+   540	            raise ValueError('bulk_update() can only be used with concrete fields.')
+   541	        if any(f.primary_key for f in fields):
+   542	            raise ValueError('bulk_update() cannot be used with primary key fields.')
+   543	        if not objs:
+   544	            return 0
+   545	        # PK is used twice in the resulting update query, once in the filter
+   546	        # and once in the WHEN. Each field will also have one CAST.
+   547	        max_batch_size = connections[self.db].ops.bulk_batch_size(['pk', 'pk'] + fields, objs)
+   548	        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+   549	        requires_casting = connections[self.db].features.requires_casted_case_in_updates
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0014] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/models/query.py</parameter>
+  <parameter=old_str>with transaction.atomic(using=self.db, savepoint=False):
+            for pks, update_kwargs in updates:
+                self.filter(pk__in=pks).update(**update_kwargs)</parameter>
+  <parameter=new_str>rows_updated = 0
+        with transaction.atomic(using=self.db, savepoint=False):
+            for pks, update_kwargs in updates:
+                rows_updated += self.filter(pk__in=pks).update(**update_kwargs)
+        return rows_updated</parameter>
+</function>
+
+[0015] tool:
+The file /testbed/django/db/models/query.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/models/query.py:
+   562	                if requires_casting:
+   563	                    case_statement = Cast(case_statement, output_field=field)
+   564	                update_kwargs[field.attname] = case_statement
+   565	            updates.append(([obj.pk for obj in batch_objs], update_kwargs))
+   566	        rows_updated = 0
+   567	        with transaction.atomic(using=self.db, savepoint=False):
+   568	            for pks, update_kwargs in updates:
+   569	                rows_updated += self.filter(pk__in=pks).update(**update_kwargs)
+   570	        return rows_updated
+   571	    bulk_update.alters_data = True
+   572	
+   573	    def get_or_create(self, defaults=None, **kwargs):
+   574	        """
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0016] assistant:
+<function=submit>
+  <parameter=answer>Changed bulk_update() to return the number of rows matched instead of None. The fix modifies /testbed/django/db/models/query.py:
+1. Returns 0 for the empty objs early return
+2. Accumulates the return values from each update() call and returns the total</parameter>
+</function>
+
+[0017] tool:
+Changed bulk_update() to return the number of rows matched instead of None. The fix modifies /testbed/django/db/models/query.py:
+1. Returns 0 for the empty objs early return
+2. Accumulates the return values from each update() call and returns the total

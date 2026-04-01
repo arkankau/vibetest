@@ -1,0 +1,274 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 middleware_exceptions.tests
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+MiddlewareNotUsed leaves undesired side effects when loading middleware in ASGI context
+Description
+	
+I experienced strange issues when working with ​ASGI , ​django-debug-toolbar and my own small middleware. It was hard problem to debug, I uploaded an example project here: ​https://github.com/hbielenia/asgi-djangotoolbar-bug (the name is misleading - I initially thought it's a bug with django-debug-toolbar).
+The SESSION_FILE_PATH setting is intentionally broken to cause a 500 error. When starting the application and accessing /admin (any location really, but I wanted to leave it at a minimum and didn't add any views) it gives TypeError: object HttpResponse can't be used in 'await' expression. Commenting out asgi_djangotoolbar_bug.middleware.DummyMiddleware fixes the issue (in that I receive a 500 ImproperlyConfigured exception). I'm not sure about the overall role of django-debug-toolbar here - removing it causes Daphne to return a 500 error page but without debug information and there's no traceback in console either. I decided to leave it since it helped me approximate the causes of issue.
+I notice that in ​https://github.com/django/django/blob/3.1.4/django/core/handlers/base.py#L58 while MiddlewareNotUsed causes the loop to skip futher processing and go to next middleware, it does leave handler variable overwritten with output of self.adapt_method_mode(). On next pass, this handler is passed to next middleware instance, disregarding all the previous checks for (lack of) async support. This likely causes the middleware chain to be "poisoned" from this point onwards, resulting in last middleware in response cycle to return an HttpResponse as a synchronous middleware would, instead of coroutine that is expected.
+This is probably avoided by adding async support to my middleware, but unless I'm missing something ​docs indicate it should work as it is. It is my intention that it's applied only on synchronous requests, so I didn't make it async compatible on purpose. If it's intentional in Django that every middleware needs to support async if the application is run as ASGI app, the documentation should probably state that clearly. Though it kinda defeats the purpose of having async_capable = False flag in the first place.
+
+[0002] assistant:
+Let me look at the relevant code in Django's middleware loading mechanism.
+
+<function=bash>
+  <parameter=cmd>cd /repo && sed -n '40,80p' django/core/handlers/base.py</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "base.py" -path "*/core/handlers/*" 2>/dev/null | head -5</parameter>
+</function>
+
+[0005] tool:
+/testbed/django/core/handlers/base.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '30,90p' django/core/handlers/base.py</parameter>
+</function>
+
+[0007] tool:
+Must be called after the environment is fixed (see __call__ in subclasses).
+        """
+        self._view_middleware = []
+        self._template_response_middleware = []
+        self._exception_middleware = []
+
+        get_response = self._get_response_async if is_async else self._get_response
+        handler = convert_exception_to_response(get_response)
+        handler_is_async = is_async
+        for middleware_path in reversed(settings.MIDDLEWARE):
+            middleware = import_string(middleware_path)
+            middleware_can_sync = getattr(middleware, 'sync_capable', True)
+            middleware_can_async = getattr(middleware, 'async_capable', False)
+            if not middleware_can_sync and not middleware_can_async:
+                raise RuntimeError(
+                    'Middleware %s must have at least one of '
+                    'sync_capable/async_capable set to True.' % middleware_path
+                )
+            elif not handler_is_async and middleware_can_sync:
+                middleware_is_async = False
+            else:
+                middleware_is_async = middleware_can_async
+            try:
+                # Adapt handler, if needed.
+                handler = self.adapt_method_mode(
+                    middleware_is_async, handler, handler_is_async,
+                    debug=settings.DEBUG, name='middleware %s' % middleware_path,
+                )
+                mw_instance = middleware(handler)
+            except MiddlewareNotUsed as exc:
+                if settings.DEBUG:
+                    if str(exc):
+                        logger.debug('MiddlewareNotUsed(%r): %s', middleware_path, exc)
+                    else:
+                        logger.debug('MiddlewareNotUsed: %r', middleware_path)
+                continue
+
+            if mw_instance is None:
+                raise ImproperlyConfigured(
+                    'Middleware factory %s returned None.' % middleware_path
+                )
+
+            if hasattr(mw_instance, 'process_view'):
+                self._view_middleware.insert(
+                    0,
+                    self.adapt_method_mode(is_async, mw_instance.process_view),
+                )
+            if hasattr(mw_instance, 'process_template_response'):
+                self._template_response_middleware.append(
+                    self.adapt_method_mode(is_async, mw_instance.process_template_response),
+                )
+            if hasattr(mw_instance, 'process_exception'):
+                # The exception-handling stack is still always synchronous for
+                # now, so adapt that way.
+                self._exception_middleware.append(
+                    self.adapt_method_mode(False, mw_instance.process_exception),
+                )
+
+            handler = convert_exception_to_response(mw_instance)
+            handler_is_async = middleware_is_async
+
+[0008] assistant:
+The issue is clear: when `MiddlewareNotUsed` is raised, `handler` has already been overwritten by `self.adapt_method_mode()` but the `continue` skips updating `handler_is_async`. So the next middleware gets a potentially adapted handler with a stale `handler_is_async` value.
+
+The fix: save the old handler before adapting, and restore it on `MiddlewareNotUsed`.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/handlers/base.py</parameter>
+  <parameter=old_str>try:
+                # Adapt handler, if needed.
+                handler = self.adapt_method_mode(
+                    middleware_is_async, handler, handler_is_async,
+                    debug=settings.DEBUG, name='middleware %s' % middleware_path,
+                )
+                mw_instance = middleware(handler)
+            except MiddlewareNotUsed as exc:</parameter>
+  <parameter=new_str>try:
+                # Adapt handler, if needed.
+                adapted_handler = self.adapt_method_mode(
+                    middleware_is_async, handler, handler_is_async,
+                    debug=settings.DEBUG, name='middleware %s' % middleware_path,
+                )
+                mw_instance = middleware(adapted_handler)
+            except MiddlewareNotUsed as exc:</parameter>
+</function>
+
+[0009] tool:
+The file /testbed/django/core/handlers/base.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/handlers/base.py:
+    48	            elif not handler_is_async and middleware_can_sync:
+    49	                middleware_is_async = False
+    50	            else:
+    51	                middleware_is_async = middleware_can_async
+    52	            try:
+    53	                # Adapt handler, if needed.
+    54	                adapted_handler = self.adapt_method_mode(
+    55	                    middleware_is_async, handler, handler_is_async,
+    56	                    debug=settings.DEBUG, name='middleware %s' % middleware_path,
+    57	                )
+    58	                mw_instance = middleware(adapted_handler)
+    59	            except MiddlewareNotUsed as exc:
+    60	                if settings.DEBUG:
+    61	                    if str(exc):
+    62	                        logger.debug('MiddlewareNotUsed(%r): %s', middleware_path, exc)
+    63	                    else:
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0010] assistant:
+Now I need to update the line after the try/except that assigns `handler`:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '65,95p' django/core/handlers/base.py</parameter>
+</function>
+
+[0011] tool:
+continue
+
+            if mw_instance is None:
+                raise ImproperlyConfigured(
+                    'Middleware factory %s returned None.' % middleware_path
+                )
+
+            if hasattr(mw_instance, 'process_view'):
+                self._view_middleware.insert(
+                    0,
+                    self.adapt_method_mode(is_async, mw_instance.process_view),
+                )
+            if hasattr(mw_instance, 'process_template_response'):
+                self._template_response_middleware.append(
+                    self.adapt_method_mode(is_async, mw_instance.process_template_response),
+                )
+            if hasattr(mw_instance, 'process_exception'):
+                # The exception-handling stack is still always synchronous for
+                # now, so adapt that way.
+                self._exception_middleware.append(
+                    self.adapt_method_mode(False, mw_instance.process_exception),
+                )
+
+            handler = convert_exception_to_response(mw_instance)
+            handler_is_async = middleware_is_async
+
+        # Adapt the top of the stack, if needed.
+        handler = self.adapt_method_mode(is_async, handler, handler_is_async)
+        # We only assign to this when initialization is complete as it is used
+        # as a flag for initialization being complete.
+        self._middleware_chain = handler
+
+[0012] assistant:
+The `handler` variable is no longer overwritten in the try block (we use `adapted_handler` instead), so when `MiddlewareNotUsed` is raised and we `continue`, `handler` and `handler_is_async` remain consistent. Good.
+
+Now let's run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 middleware_exceptions.tests 2>&1 | tail -30</parameter>
+</function>
+
+[0013] tool:
+test_raise_exception (middleware_exceptions.tests.MiddlewareNotUsedTests) ... ok
+test_async_and_sync_middleware_async_call (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_async_and_sync_middleware_sync_call (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_async_middleware (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_async_middleware_async (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_async_process_template_response_returns_none_with_sync_client (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... /opt/miniconda3/envs/testbed/lib/python3.6/site-packages/asgiref/sync.py:125: UserWarning: async_to_sync was passed a non-async-marked callable
+  warnings.warn("async_to_sync was passed a non-async-marked callable")
+ok
+test_not_sync_or_async_middleware (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_sync_decorated_middleware (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_sync_middleware (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_sync_middleware_async (middleware_exceptions.tests.MiddlewareSyncAsyncTests) ... ok
+test_exception_in_middleware_converted_before_prior_middleware (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_exception_in_render_passed_to_process_exception (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_process_template_response (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_process_template_response_returns_none (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_process_view_return_none (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_process_view_return_response (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_response_from_process_exception_short_circuits_remainder (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_response_from_process_exception_when_return_response (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_templateresponse_from_process_view_passed_to_process_template_response (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_templateresponse_from_process_view_rendered (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_view_exception_converted_before_middleware (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_view_exception_handled_by_process_exception (middleware_exceptions.tests.MiddlewareTests) ... ok
+test_missing_root_urlconf (middleware_exceptions.tests.RootUrlconfTests) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 0.330s
+
+OK
+
+[0014] assistant:
+All 33 tests pass.
+
+<function=submit>
+  <parameter=answer>The fix is in `/testbed/django/core/handlers/base.py`. The issue was that when `MiddlewareNotUsed` is raised, the `handler` variable had already been overwritten by `self.adapt_method_mode()`, but the `continue` statement skipped updating `handler_is_async`. This left `handler` and `handler_is_async` inconsistent, "poisoning" the middleware chain.
+
+The fix uses a separate `adapted_handler` variable so that `handler` is only passed to the middleware constructor but not reassigned. If `MiddlewareNotUsed` is raised, the original `handler` and `handler_is_async` remain consistent for the next iteration.</parameter>
+</function>
+
+[0015] tool:
+The fix is in `/testbed/django/core/handlers/base.py`. The issue was that when `MiddlewareNotUsed` is raised, the `handler` variable had already been overwritten by `self.adapt_method_mode()`, but the `continue` statement skipped updating `handler_is_async`. This left `handler` and `handler_is_async` inconsistent, "poisoning" the middleware chain.
+
+The fix uses a separate `adapted_handler` variable so that `handler` is only passed to the middleware constructor but not reassigned. If `MiddlewareNotUsed` is raised, the original `handler` and `handler_is_async` remain consistent for the next iteration.

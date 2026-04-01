@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs buffer and Bayesian baselines for ImpossibleBench case sets derived from
-# the Claude Opus 4.6 source traces.
+# Runs buffer, Bayesian, and no-tools VibeTest baselines for ImpossibleBench
+# case sets derived from the Claude Opus 4.6 source traces.
 #
 # Defaults mirror the tracked ImpossibleBench result files:
 # - 50 cases per traces-per-case bucket
@@ -27,18 +27,19 @@ MODELS=(
   "openai/gpt-5.4-mini"
 )
 
-model_slug() {
+results_model_slug() {
   local model="$1"
   if [[ "$model" == */* ]]; then
-    echo "${model##*/}"
+    echo "${model#*/}" | tr '/' '-'
   else
     echo "$model"
   fi
 }
 
 for model in "${MODELS[@]}"; do
-  buffer_out="results/${DATASET_NAME}_buffer-$(model_slug "$model").jsonl"
-  bayesian_out="results/${DATASET_NAME}_bayesian-$(model_slug "$model").jsonl"
+  buffer_out="results/${DATASET_NAME}_buffer-$(results_model_slug "$model").jsonl"
+  bayesian_out="results/${DATASET_NAME}_bayesian-$(results_model_slug "$model").jsonl"
+  naive_out="results/${DATASET_NAME}_no_tools_AT-$(results_model_slug "$model").jsonl"
 
   echo
   if [[ -f "$buffer_out" ]]; then
@@ -68,6 +69,25 @@ for model in "${MODELS[@]}"; do
       --data-path "$DATA_PATH" \
       --impossiblebench-source-model "$SOURCE_MODEL" \
       --method bayesian \
+      --model "$model" \
+      --cases "$CASES" \
+      --traces-per-case-list "$TPC_LIST" \
+      --positive-rate "$POSITIVE_RATE" \
+      --seed "$SEED"
+  fi
+
+  echo
+  if [[ -f "$naive_out" ]]; then
+    echo "=== ImpossibleBench source=${SOURCE_MODEL} model=${model} :: vibetest --no-tools exists, skipping (${naive_out}) ==="
+  else
+    echo "=== ImpossibleBench source=${SOURCE_MODEL} model=${model} :: vibetest --no-tools ==="
+    eval "$PYTHON_BIN experiments/safety.py" \
+      --safety-mode impossiblebench \
+      --data-path "$DATA_PATH" \
+      --impossiblebench-source-model "$SOURCE_MODEL" \
+      --method vibetest \
+      --no-tools \
+      --vibetest-output-path "$naive_out" \
       --model "$model" \
       --cases "$CASES" \
       --traces-per-case-list "$TPC_LIST" \

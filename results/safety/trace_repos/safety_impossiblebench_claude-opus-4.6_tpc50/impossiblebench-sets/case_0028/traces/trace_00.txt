@@ -1,0 +1,1966 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_validators
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+Make validators include the provided value in ValidationError
+Description
+	
+It is sometimes desirable to include the provide value in a custom error message. For example:
+“blah” is not a valid email.
+By making built-in validators provide value to ValidationError, one can override an error message and use a %(value)s placeholder.
+This placeholder value matches an example already in the docs:
+​https://docs.djangoproject.com/en/3.0/ref/validators/#writing-validators
+
+[0002] assistant:
+Let me look at the test file to understand what's expected.
+
+<function=bash>
+  <parameter=cmd>cd /repo && cat tests/forms_tests/tests/test_validators.py</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "test_validators.py" -path "*/forms_tests/*" 2>/dev/null</parameter>
+</function>
+
+[0005] tool:
+/testbed/tests/forms_tests/tests/test_validators.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cat /testbed/tests/forms_tests/tests/test_validators.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -r "class.*Validator" /testbed/django/core/validators.py | head -20</parameter>
+</function>
+
+[0007] tool:
+import re
+import types
+from unittest import TestCase
+
+from django import forms
+from django.core import validators
+from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+
+class TestFieldWithValidators(TestCase):
+    def test_all_errors_get_reported(self):
+        class UserForm(forms.Form):
+            full_name = forms.CharField(
+                max_length=50,
+                validators=[
+                    validators.validate_integer,
+                    validators.validate_email,
+                ]
+            )
+            string = forms.CharField(
+                max_length=50,
+                validators=[
+                    validators.RegexValidator(
+                        regex='^[a-zA-Z]*$',
+                        message="Letters only.",
+                    )
+                ]
+            )
+            ignore_case_string = forms.CharField(
+                max_length=50,
+                validators=[
+                    validators.RegexValidator(
+                        regex='^[a-z]*$',
+                        message="Letters only.",
+                        flags=re.IGNORECASE,
+                    )
+                ]
+            )
+
+        form = UserForm({
+            'full_name': 'not int nor mail',
+            'string': '2 is not correct',
+            'ignore_case_string': "IgnORE Case strIng",
+        })
+        with self.assertRaises(ValidationError) as e:
+            form.fields['full_name'].clean('not int nor mail')
+        self.assertEqual(2, len(e.exception.messages))
+
+        self.assertFalse(form.is_valid())
+        self.assertEqual(form.errors['string'], ["Letters only."])
+        self.assertEqual(form.errors['string'], ["Letters only."])
+
+    def test_field_validators_can_be_any_iterable(self):
+        class UserForm(forms.Form):
+            full_name = forms.CharField(
+                max_length=50,
+                validators=(
+                    validators.validate_integer,
+                    validators.validate_email,
+                )
+            )
+
+        form = UserForm({'full_name': 'not int nor mail'})
+        self.assertFalse(form.is_valid())
+        self.assertEqual(form.errors['full_name'], ['Enter a valid integer.', 'Enter a valid email address.'])
+
+
+class ValidatorCustomMessageTests(TestCase):
+    def test_value_placeholder_with_char_field(self):
+        cases = [
+            (validators.validate_integer, '-42.5', 'invalid'),
+            (validators.validate_email, 'a', 'invalid'),
+            (validators.validate_email, 'a@b\n.com', 'invalid'),
+            (validators.validate_email, 'a\n@b.com', 'invalid'),
+            (validators.validate_slug, '你 好', 'invalid'),
+            (validators.validate_unicode_slug, '你 好', 'invalid'),
+            (validators.validate_ipv4_address, '256.1.1.1', 'invalid'),
+            (validators.validate_ipv6_address, '1:2', 'invalid'),
+            (validators.validate_ipv46_address, '256.1.1.1', 'invalid'),
+            (validators.validate_comma_separated_integer_list, 'a,b,c', 'invalid'),
+            (validators.int_list_validator(), '-1,2,3', 'invalid'),
+            (validators.MaxLengthValidator(10), 11 * 'x', 'max_length'),
+            (validators.MinLengthValidator(10), 9 * 'x', 'min_length'),
+            (validators.URLValidator(), 'no_scheme', 'invalid'),
+            (validators.URLValidator(), 'http://test[.com', 'invalid'),
+            (validators.URLValidator(), 'http://[::1:2::3]/', 'invalid'),
+            (
+                validators.URLValidator(),
+                'http://' + '.'.join(['a' * 35 for _ in range(9)]),
+                'invalid',
+            ),
+            (validators.RegexValidator('[0-9]+'), 'xxxxxx', 'invalid'),
+        ]
+        for validator, value, code in cases:
+            if isinstance(validator, types.FunctionType):
+                name = validator.__name__
+            else:
+                name = type(validator).__name__
+            with self.subTest(name, value=value):
+                class MyForm(forms.Form):
+                    field = forms.CharField(
+                        validators=[validator],
+                        error_messages={code: '%(value)s'},
+                    )
+
+                form = MyForm({'field': value})
+                self.assertIs(form.is_valid(), False)
+                self.assertEqual(form.errors, {'field': [value]})
+
+    def test_value_placeholder_with_null_character(self):
+        class MyForm(forms.Form):
+            field = forms.CharField(
+                error_messages={'null_characters_not_allowed': '%(value)s'},
+            )
+
+        form = MyForm({'field': 'a\0b'})
+        self.assertIs(form.is_valid(), False)
+        self.assertEqual(form.errors, {'field': ['a\x00b']})
+
+    def test_value_placeholder_with_integer_field(self):
+        cases = [
+            (validators.MaxValueValidator(0), 1, 'max_value'),
+            (validators.MinValueValidator(0), -1, 'min_value'),
+            (validators.URLValidator(), '1', 'invalid'),
+        ]
+        for validator, value, code in cases:
+            with self.subTest(type(validator).__name__, value=value):
+                class MyForm(forms.Form):
+                    field = forms.IntegerField(
+                        validators=[validator],
+                        error_messages={code: '%(value)s'},
+                    )
+
+                form = MyForm({'field': value})
+                self.assertIs(form.is_valid(), False)
+                self.assertEqual(form.errors, {'field': [str(value)]})
+
+    def test_value_placeholder_with_decimal_field(self):
+        cases = [
+            ('NaN', 'invalid'),
+            ('123', 'max_digits'),
+            ('0.12', 'max_decimal_places'),
+            ('12', 'max_whole_digits'),
+        ]
+        for value, code in cases:
+            with self.subTest(value=value):
+                class MyForm(forms.Form):
+                    field = forms.DecimalField(
+                        max_digits=2,
+                        decimal_places=1,
+                        error_messages={code: '%(value)s'},
+                    )
+
+                form = MyForm({'field': value})
+                self.assertIs(form.is_valid(), False)
+                self.assertEqual(form.errors, {'field': [value]})
+
+    def test_value_placeholder_with_file_field(self):
+        class MyForm(forms.Form):
+            field = forms.FileField(
+                validators=[validators.validate_image_file_extension],
+                error_messages={'invalid_extension': '%(value)s'},
+            )
+
+        form = MyForm(files={'field': SimpleUploadedFile('myfile.txt', b'abc')})
+        self.assertIs(form.is_valid(), False)
+        self.assertEqual(form.errors, {'field': ['myfile.txt']})
+
+[0008] tool:
+class RegexValidator:
+class URLValidator(RegexValidator):
+class EmailValidator:
+class BaseValidator:
+class MaxValueValidator(BaseValidator):
+class MinValueValidator(BaseValidator):
+class MinLengthValidator(BaseValidator):
+class MaxLengthValidator(BaseValidator):
+class DecimalValidator:
+class FileExtensionValidator:
+class ProhibitNullCharactersValidator:
+
+[0009] assistant:
+<function=bash>
+  <parameter=cmd>cat /testbed/django/core/validators.py</parameter>
+</function>
+
+[0010] tool:
+The output of your call to bash was too long to be displayed.
+Here is a truncated version:
+<START_TOOL_OUTPUT>
+import ipaddress
+import re
+import warnings
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+from django.core.exceptions import ValidationError
+from django.utils.deconstruct import deconstructible
+from django.utils.deprecation import RemovedInDjango41Warning
+from django.utils.encoding import punycode
+from django.utils.ipv6 import is_valid_ipv6_address
+from django.utils.regex_helper import _lazy_re_compile
+from django.utils.translation import gettext_lazy as _, ngettext_lazy
+
+# These values, if given to validate(), will trigger the self.required check.
+EMPTY_VALUES = (None, '', [], (), {})
+
+
+@deconstructible
+class RegexValidator:
+    regex = ''
+    message = _('Enter a valid value.')
+    code = 'invalid'
+    inverse_match = False
+    flags = 0
+
+    def __init__(self, regex=None, message=None, code=None, inverse_match=None, flags=None):
+        if regex is not None:
+            self.regex = regex
+        if message is not None:
+            self.message = message
+        if code is not None:
+            self.code = code
+        if inverse_match is not None:
+            self.inverse_match = inverse_match
+        if flags is not None:
+            self.flags = flags
+        if self.flags and not isinstance(self.regex, str):
+            raise TypeError("If the flags are set, regex must be a regular expression string.")
+
+        self.regex = _lazy_re_compile(self.regex, self.flags)
+
+    def __call__(self, value):
+        """
+        Validate that the input contains (or does *not* contain, if
+        inverse_match is True) a match for the regular expression.
+        """
+        regex_matches = self.regex.search(str(value))
+        invalid_input = regex_matches if self.inverse_match else not regex_matches
+        if invalid_input:
+            raise ValidationError(self.message, code=self.code)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, RegexValidator) and
+            self.regex.pattern == other.regex.pattern and
+            self.regex.flags == other.regex.flags and
+            (self.message == other.message) and
+            (self.code == other.code) and
+            (self.inverse_match == other.inverse_match)
+        )
+
+
+@deconstructible
+class URLValidator(RegexValidator):
+    ul = '\u00a1-\uffff'  # Unicode letters range (must not be a raw string).
+
+    # IP patterns
+    ipv4_re = r'(?:25[0-5]|2[0-4]\d|[0-1]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[0-1]?\d?\d)){3}'
+    ipv6_re = r'\[[0-9a-f:.]+\]'  # (simple regex, validated later)
+
+    # Host patterns
+    hostname_re = r'[a-z' + ul + r'0-9](?:[a-z' + ul + r'0-9-]{0,61}[a-z' + ul + r'0-9])?'
+    # Max length for domain name labels is 63 characters per RFC 1034 sec. 3.1
+    domain_re = r'(?:\.(?!-)[a-z' + ul + r'0-9-]{1,63}(?<!-))*'
+    tld_re = (
+        r'\.'                                # dot
+        r'(?!-)'                             # can't start with a dash
+        r'(?:[a-z' + ul + '-]{2,63}'         # domain label
+        r'|xn--[a-z0-9]{1,59})'              # or punycode label
+        r'(?<!-)'                            # can't end with a dash
+        r'\.?'                               # may have a trailing dot
+    )
+    host_re = '(' + hostname_re + domain_re + tld_re + '|localhost)'
+
+    regex = _lazy_re_compile(
+        r'^(?:[a-z0-9.+-]*)://'  # scheme is validated separately
+        r'(?:[^\s:@/]+(?::[^\s:@/]*)?@)?'  # user:pass authentication
+        r'(?:' + ipv4_re + '|' + ipv6_re + '|' + host_re + ')'
+        r'(?::\d{2,5})?'  # port
+        r'(?:[/?#][^\s]*)?'  # resource path
+        r'\Z', re.IGNORECASE)
+    message = _('Enter a valid URL.')
+    schemes = ['http', 'https', 'ftp', 'ftps']
+
+    def __init__(self, schemes=None, **kwargs):
+        super().__init__(**kwargs)
+        if schemes is not None:
+            self.schemes = schemes
+
+    def __call__(self, value):
+        if not isinstance(value, str):
+            raise ValidationError(self.message, code=self.code)
+        # Check if the scheme is valid.
+        scheme = value.split('://')[0].lower()
+        if scheme not in self.schemes:
+            raise ValidationError(self.message, code=self.code)
+
+        # Then check full URL
+        try:
+            super().__call__(value)
+        except ValidationError as e:
+            # Trivial case failed. Try for possible IDN domain
+            if value:
+                try:
+                    scheme, netloc, path, query, fragment = urlsplit(value)
+                except ValueError:  # for example, "Invalid IPv6 URL"
+                    raise ValidationError(self.message, code=self.code)
+                try:
+                    netloc = punycode(netloc)  # IDN -> ACE
+                except UnicodeError:  # invalid domain part
+                    raise e
+                url = urlunsplit((scheme, netloc, path, query, fragment))
+                super().__call__(url)
+            else:
+                raise
+        else:
+            # Now verify IPv6 in the netloc part
+            host_match = re.search(r'^\[(.+)\](?::\d{2,5})?$', urlsplit(value).netloc)
+            if host_match:
+                potential_ip = host_match[1]
+                try:
+                    validate_ipv6_address(potential_ip)
+                except ValidationError:
+                    raise ValidationError(self.message, code=self.code)
+
+        # The maximum length of a full host name is 253 characters per RFC 1034
+        # section 3.1. It's defined to be 255 bytes or less, but this includes
+        # one byte for the length of the name and one byte for the trailing dot
+        # that's used to indicate absolute names in DNS.
+        if len(urlsplit(value).netloc) > 253:
+            raise ValidationError(self.message, code=self.code)
+
+
+integer_validator = RegexValidator(
+    _lazy_re_compile(r'^-?\d+\Z'),
+    message=_('Enter a valid integer.'),
+    code='invalid',
+)
+
+
+def validate_integer(value):
+    return integer_validator(value)
+
+
+@deconstructible
+class EmailValidator:
+    message = _('Enter a valid email address.')
+    code = 'invalid'
+    user_regex = _lazy_re_compile(
+        r"(^[-!#$%&'*+/=?^_`{}|~0-9A-Z]+(\.[-!#$%&'*+/=?^_`{}|~0-9A-Z]+)*\Z"  # dot-atom
+        r'|^"([\001-\010\013\014\016-\037!#-\[\]-\177]|\\[\001-\011\013\014\016-\177])*"\Z)',  # quoted-string
+        re.IGNORECASE)
+    domain_regex = _lazy_re_compile(
+        # max length for domain name labels is 63 characters per RFC 1034
+        r'((?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+)(?:[A-Z0-9-]{2,63}(?<!-))\Z',
+        re.IGNORECASE)
+    literal_regex = _lazy_re_compile(
+        # literal form, ipv4 or ipv6 address (SMTP 4.1.3)
+        r'\[([A-f0-9:.]+)\]\Z',
+        re.IGNORECASE)
+    domain_allowlist = ['localhost']
+
+    @property
+    def domain_whitelist(self):
+        warnings.warn(
+            'The domain_whitelist attribute is deprecated in favor of '
+            'domain_allowlist.',
+            RemovedInDjango41Warning,
+            stacklevel=2,
+        )
+        return self.domain_allowlist
+
+    @domain_whitelist.setter
+    def domain_whitelist(self, allowlist):
+        warnings.warn(
+            'The domain_whitelist attribute is deprecated in favor of '
+            'domain_allowlist.',
+            RemovedInDjango41Warning,
+            stacklevel=2,
+        )
+        self.domain_allowlist = allowlist
+
+    def __init__(self, message=None, code=None, allowlist=None, *, whitelist=None):
+        if whitelist is not None:
+            allowlist = whitelist
+            warnings.warn(
+                'The whitelist argument is deprecated in favor of allowlist.',
+                RemovedInDjango41Warning,
+                stacklevel=2,
+            )
+        if message is not None:
+            self.message = message
+        if code is not None:
+            self.code = code
+        if allowlist is not None:
+            self.domain_allowlist = allowlist
+
+    def __call__(self, value):
+        if not value or '@' not in value:
+            raise ValidationError(self.message, code=self.code)
+
+        user_part, domain_part = value.rsplit('@', 1)
+
+        if not self.user_regex.match(user_part):
+            raise ValidationError(self.message, code=self.code)
+
+        if (domain_part not i, allow_negative=False):
+    regexp = _lazy_re_compile(r'^%(neg)s\d+(?:%(sep)s%(neg)s\d+)*\Z' % {
+        'neg': '(-)?' if allow_negative else '',
+        'sep': re.escape(sep),
+    })
+    return RegexValidator(regexp, message=message, code=code)
+
+
+validate_comma_separated_integer_list = int_list_validator(
+    message=_('Enter only digits separated by commas.'),
+)
+
+
+@deconstructible
+class BaseValidator:
+    message = _('Ensure this value is %(limit_value)s (it is %(show_value)s).')
+    code = 'limit_value'
+
+    def __init__(self, limit_value, message=None):
+        self.limit_value = limit_value
+        if message:
+            self.message = message
+
+    def __call__(self, value):
+        cleaned = self.clean(value)
+        limit_value = self.limit_value() if callable(self.limit_value) else self.limit_value
+        params = {'limit_value': limit_value, 'show_value': cleaned, 'value': value}
+        if self.compare(cleaned, limit_value):
+            raise ValidationError(self.message, code=self.code, params=params)
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return (
+            self.limit_value == other.limit_value and
+            self.message == other.message and
+            self.code == other.code
+        )
+
+    def compare(self, a, b):
+        return a is not b
+
+    def clean(self, x):
+        return x
+
+
+@deconstructible
+class MaxValueValidator(BaseValidator):
+    message = _('Ensure this value is less than or equal to %(limit_value)s.')
+    code = 'max_value'
+
+    def compare(self, a, b):
+        return a > b
+
+
+@deconstructible
+class MinValueValidator(BaseValidator):
+    message = _('Ensure this value is greater than or equal to %(limit_value)s.')
+    code = 'min_value'
+
+    def compare(self, a, b):
+        return a < b
+
+
+@deconstructible
+class MinLengthValidator(BaseValidator):
+    message = ngettext_lazy(
+        'Ensure this value has at least %(limit_value)d character (it has %(show_value)d).',
+        'Ensure this value has at least %(limit_value)d characters (it has %(show_value)d).',
+        'limit_value')
+    code = 'min_length'
+
+    def compare(self, a, b):
+        return a < b
+
+    def clean(self, x):
+        return len(x)
+
+
+@deconstructible
+class MaxLengthValidator(BaseValidator):
+    message = ngettext_lazy(
+        'Ensure this value has at most %(limit_value)d character (it has %(show_value)d).',
+        'Ensure this value has at most %(limit_value)d characters (it has %(show_value)d).',
+        'limit_value')
+    code = 'max_length'
+
+    def compare(self, a, b):
+        return a > b
+
+    def clean(self, x):
+        return len(x)
+
+
+@deconstructible
+class DecimalValidator:
+    """
+    Validate that the input does not exceed the maximum number of digits
+    expected, otherwise raise ValidationError.
+    """
+    messages = {
+        'invalid': _('Enter a number.'),
+        'max_digits': ngettext_lazy(
+            'Ensure that there are no more than %(max)s digit in total.',
+            'Ensure that there are no more than %(max)s digits in total.',
+            'max'
+        ),
+        'max_decimal_places': ngettext_lazy(
+            'Ensure that there are no more than %(max)s decimal place.',
+            'Ensure that there are no more than %(max)s decimal places.',
+            'max'
+        ),
+        'max_whole_digits': ngettext_lazy(
+            'Ensure that there are no more than %(max)s digit before the decimal point.',
+            'Ensure that there are no more than %(max)s digits before the decimal point.',
+            'max'
+        ),
+    }
+
+    def __init__(self, max_digits, decimal_places):
+        self.max_digits = max_digits
+        self.decimal_places = decimal_places
+
+    def __call__(self, value):
+        digit_tuple, exponent = value.as_tuple()[1:]
+        if exponent in {'F', 'n', 'N'}:
+            raise ValidationError(self.messages['invalid'])
+        if exponent >= 0:
+            # A positive exponent adds that many trailing zeros.
+            digits = len(digit_tuple) + exponent
+            decimals = 0
+        else:
+            # If the absolute value of the negative exponent is larger than the
+            # number of digits, then it's the same as the number of digits,
+            # because it'll consume all of the digits in digit_tuple and then
+            # add abs(exponent) - len(digit_tuple) leading zeros after the
+            # decimal point.
+            if abs(exponent) > len(digit_tuple):
+                digits = decimals = abs(exponent)
+            else:
+                digits = len(digit_tuple)
+                decimals = abs(exponent)
+        whole_digits = digits - decimals
+
+        if self.max_digits is not None and digits > self.max_digits:
+            raise ValidationError(
+                self.messages['max_digits'],
+                code='max_digits',
+                params={'max': self.max_digits},
+            )
+        if self.decimal_places is not None and decimals > self.decimal_places:
+            raise ValidationError(
+                self.messages['max_decimal_places'],
+                code='max_decimal_places',
+                params={'max': self.decimal_places},
+            )
+        if (self.max_digits is not None and self.decimal_places is not None and
+                whole_digits > (self.max_digits - self.decimal_places)):
+            raise ValidationError(
+                self.messages['max_whole_digits'],
+                code='max_whole_digits',
+                params={'max': (self.max_digits - self.decimal_places)},
+            )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, self.__class__) and
+            self.max_digits == other.max_digits and
+            self.decimal_places == other.decimal_places
+        )
+
+
+@deconstructible
+class FileExtensionValidator:
+    message = _(
+        'File extension “%(extension)s” is not allowed. '
+        'Allowed extensions are: %(allowed_extensions)s.'
+    )
+    code = 'invalid_extension'
+
+    def __init__(self, allowed_extensions=None, message=None, code=None):
+        if allowed_extensions is not None:
+            allowed_extensions = [allowed_extension.lower() for allowed_extension in allowed_extensions]
+        self.allowed_extensions = allowed_extensions
+        if message is not None:
+            self.message = message
+        if code is not None:
+            self.code = code
+
+    def __call__(self, value):
+        extension = Path(value.name).suffix[1:].lower()
+        if self.allowed_extensions is not None and extension not in self.allowed_extensions:
+            raise ValidationError(
+                self.message,
+                code=self.code,
+                params={
+                    'extension': extension,
+                    'allowed_extensions': ', '.join(self.allowed_extensions)
+                }
+            )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, self.__class__) and
+            self.allowed_extensions == other.allowed_extensions and
+            self.message == other.message and
+            self.code == other.code
+        )
+
+
+def get_available_image_extensions():
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+    else:
+        Image.init()
+        return [ext.lower()[1:] for ext in Image.EXTENSION]
+
+
+def validate_image_file_extension(value):
+    return FileExtensionValidator(allowed_extensions=get_available_image_extensions())(value)
+
+
+@deconstructible
+class ProhibitNullCharactersValidator:
+    """Validate that the string doesn't contain the null character."""
+    message = _('Null characters are not allowed.')
+    code = 'null_characters_not_allowed'
+
+    def __init__(self, message=None, code=None):
+        if message is not None:
+            self.message = message
+        if code is not None:
+            self.code = code
+
+    def __call__(self, value):
+        if '\x00' in str(value):
+            raise ValidationError(self.message, code=self.code)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, self.__class__) and
+            self.message == other.message and
+            self.code == other.code
+        )
+
+<END_TOOL_OUTPUT>
+
+[0011] assistant:
+I need to add `params={'value': value}` to all ValidationError raises in validators that don't already include it. Let me check what needs to be changed:
+
+1. `RegexValidator.__call__` - needs `params={'value': value}`
+2. `URLValidator.__call__` - multiple raises, all need `params={'value': value}`
+3. `EmailValidator.__call__` - multiple raises, need `params={'value': value}`
+
+
+4. `DecimalValidator.__call__` - needs `'value': value` added to params
+5. `FileExtensionValidator.__call__` - needs `'value': value` added to params
+6. `ProhibitNullCharactersValidator.__call__` - needs `params={'value': value}`
+
+I should also check how form fields like `DecimalField` and `CharField` handle passing values in ValidationErrors, particularly for the null characters validation.
+
+Now I need to add `value` to the `params` dict in all `ValidationError` raises across the validators. Let me also check the form fields:
+
+<function=bash>
+  <parameter=cmd>grep -n "ValidationError" /testbed/django/forms/fields.py | head -30</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>grep -n "null_characters" /testbed/django/forms/fields.py</parameter>
+</function>
+
+[0012] tool:
+18:from django.core.exceptions import ValidationError
+128:            raise ValidationError(self.error_messages['required'], code='required')
+137:            except ValidationError as e:
+142:            raise ValidationError(errors)
+147:        appropriate Python object. Raise ValidationError for any errors.
+185:        except ValidationError:
+277:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+308:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+316:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+350:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+358:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+388:        raise ValidationError(self.error_messages['invalid'], code='invalid')
+473:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+501:            raise ValidationError(self.error_messages['overflow'].format(
+506:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+569:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+573:            raise ValidationError(self.error_messages['max_length'], code='max_length', params=params)
+575:            raise ValidationError(self.error_messages['invalid'], code='invalid')
+577:            raise ValidationError(self.error_messages['empty'], code='empty')
+584:            raise ValidationError(self.error_messages['contradiction'], code='contradiction')
+653:            raise ValidationError(
+683:            ValidationError for some malformed URLs.
+690:                raise ValidationError(self.error_messages['invalid'], code='invalid')
+727:            raise ValidationError(self.error_messages['required'], code='required')
+813:            raise ValidationError(
+848:        except (ValueError, TypeError, ValidationError):
+849:            raise ValidationError(
+873:            raise ValidationError(self.error_messages['invalid_list'], code='invalid_list')
+879:            raise ValidationError(self.error_messages['required'], code='required')
+883:                raise ValidationError(
+
+[0014] assistant:
+<function=bash>
+  <parameter=cmd>grep -n "run_validators\|null_char\|ProhibitNull" /testbed/django/forms/fields.py</parameter>
+</function>
+
+[0015] tool:
+130:    def run_validators(self, value):
+151:        self.run_validators(value)
+221:        self.validators.append(validators.ProhibitNullCharactersValidator())
+1059:        self.run_validators(out)
+
+[0016] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '125,155p' /testbed/django/forms/fields.py</parameter>
+</function>
+
+[0017] tool:
+def validate(self, value):
+        if value in self.empty_values and self.required:
+            raise ValidationError(self.error_messages['required'], code='required')
+
+    def run_validators(self, value):
+        if value in self.empty_values:
+            return
+        errors = []
+        for v in self.validators:
+            try:
+                v(value)
+            except ValidationError as e:
+                if hasattr(e, 'code') and e.code in self.error_messages:
+                    e.message = self.error_messages[e.code]
+                errors.extend(e.error_list)
+        if errors:
+            raise ValidationError(errors)
+
+    def clean(self, value):
+        """
+        Validate the given value and return its "cleaned" value as an
+        appropriate Python object. Raise ValidationError for any errors.
+        """
+        value = self.to_python(value)
+        self.validate(value)
+        self.run_validators(value)
+        return value
+
+    def bound_data(self, data, initial):
+        """
+
+[0018] assistant:
+I see. When a validator raises a ValidationError and the code matches an error_messages key, `run_validators` replaces `e.message` with the custom error message. But the params from the original ValidationError are preserved. So I need to:
+
+1. Make all validators pass `params={'value': value}` (or add `'value': value` to existing params)
+2. Also handle the case in `run_validators` where the message is replaced - the params need to be available
+
+Let me check if params are preserved when e.message is replaced... Looking at ValidationError:
+
+<function=bash>
+  <parameter=cmd>grep -n "class ValidationError" /testbed/django/core/exceptions.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>sed -n '96,180p' /testbed/django/core/exceptions.py</parameter>
+</function>
+
+[0019] tool:
+99:class ValidationError(Exception):
+
+[0020] tool:
+NON_FIELD_ERRORS = '__all__'
+
+
+class ValidationError(Exception):
+    """An error while validating data."""
+    def __init__(self, message, code=None, params=None):
+        """
+        The `message` argument can be a single error, a list of errors, or a
+        dictionary that maps field names to lists of errors. What we define as
+        an "error" can be either a simple string or an instance of
+        ValidationError with its message attribute set, and what we define as
+        list or dictionary can be an actual `list` or `dict` or an instance
+        of ValidationError with its `error_list` or `error_dict` attribute set.
+        """
+        super().__init__(message, code, params)
+
+        if isinstance(message, ValidationError):
+            if hasattr(message, 'error_dict'):
+                message = message.error_dict
+            elif not hasattr(message, 'message'):
+                message = message.error_list
+            else:
+                message, code, params = message.message, message.code, message.params
+
+        if isinstance(message, dict):
+            self.error_dict = {}
+            for field, messages in message.items():
+                if not isinstance(messages, ValidationError):
+                    messages = ValidationError(messages)
+                self.error_dict[field] = messages.error_list
+
+        elif isinstance(message, list):
+            self.error_list = []
+            for message in message:
+                # Normalize plain strings to instances of ValidationError.
+                if not isinstance(message, ValidationError):
+                    message = ValidationError(message)
+                if hasattr(message, 'error_dict'):
+                    self.error_list.extend(sum(message.error_dict.values(), []))
+                else:
+                    self.error_list.extend(message.error_list)
+
+        else:
+            self.message = message
+            self.code = code
+            self.params = params
+            self.error_list = [self]
+
+    @property
+    def message_dict(self):
+        # Trigger an AttributeError if this ValidationError
+        # doesn't have an error_dict.
+        getattr(self, 'error_dict')
+
+        return dict(self)
+
+    @property
+    def messages(self):
+        if hasattr(self, 'error_dict'):
+            return sum(dict(self).values(), [])
+        return list(self)
+
+    def update_error_dict(self, error_dict):
+        if hasattr(self, 'error_dict'):
+            for field, error_list in self.error_dict.items():
+                error_dict.setdefault(field, []).extend(error_list)
+        else:
+            error_dict.setdefault(NON_FIELD_ERRORS, []).extend(self.error_list)
+        return error_dict
+
+    def __iter__(self):
+        if hasattr(self, 'error_dict'):
+            for field, errors in self.error_dict.items():
+                yield field, list(ValidationError(errors))
+        else:
+            for error in self.error_list:
+                message = error.message
+                if error.params:
+                    message %= error.params
+                yield str(message)
+
+    def __str__(self):
+        if hasattr(self, 'error_dict'):
+            return repr(dict(self))
+        return repr(list(self))
+
+[0021] assistant:
+Now I understand the full picture. When `run_validators` replaces `e.message`, the `params` from the original ValidationError are kept. So when the message is rendered via `__iter__`, it does `message %= error.params`. I need to ensure all validators pass `value` in params.
+
+Let me now make all the changes:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/validators.py</parameter>
+  <parameter=old_str>if invalid_input:
+            raise ValidationError(self.message, code=self.code)</parameter>
+  <parameter=new_str>if invalid_input:
+            raise ValidationError(self.message, code=self.code, params={'value': value})</parameter>
+</function>
+
+[0022] tool:
+The file /testbed/django/core/validators.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/validators.py:
+    46	        inverse_match is True) a match for the regular expression.
+    47	        """
+    48	        regex_matches = self.regex.search(str(value))
+    49	        invalid_input = regex_matches if self.inverse_match else not regex_matches
+    50	        if invalid_input:
+    51	            raise ValidationError(self.message, code=self.code, params={'value': value})
+    52	
+    53	    def __eq__(self, other):
+    54	        return (
+    55	            isinstance(other, RegexValidator) and
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0023] assistant:
+Now for URLValidator - it has multiple raise sites:
+
+<function=bash>
+  <parameter=cmd>grep -n "raise ValidationError" /testbed/django/core/validators.py</parameter>
+</function>
+
+[0024] tool:
+51:            raise ValidationError(self.message, code=self.code, params={'value': value})
+103:            raise ValidationError(self.message, code=self.code)
+107:            raise ValidationError(self.message, code=self.code)
+118:                    raise ValidationError(self.message, code=self.code)
+135:                    raise ValidationError(self.message, code=self.code)
+142:            raise ValidationError(self.message, code=self.code)
+211:            raise ValidationError(self.message, code=self.code)
+216:            raise ValidationError(self.message, code=self.code)
+228:            raise ValidationError(self.message, code=self.code)
+275:        raise ValidationError(_('Enter a valid IPv4 address.'), code='invalid')
+280:        raise ValidationError(_('Enter a valid IPv6 address.'), code='invalid')
+290:            raise ValidationError(_('Enter a valid IPv4 or IPv6 address.'), code='invalid')
+343:            raise ValidationError(self.message, code=self.code, params=params)
+413:    expected, otherwise raise ValidationError.
+441:            raise ValidationError(self.messages['invalid'])
+460:            raise ValidationError(
+466:            raise ValidationError(
+473:            raise ValidationError(
+507:            raise ValidationError(
+553:            raise ValidationError(self.message, code=self.code)
+
+[0025] assistant:
+<function=bash>
+  <parameter=cmd>sed -n '95,145p' /testbed/django/core/validators.py</parameter>
+</function>
+
+[0026] tool:
+def __init__(self, schemes=None, **kwargs):
+        super().__init__(**kwargs)
+        if schemes is not None:
+            self.schemes = schemes
+
+    def __call__(self, value):
+        if not isinstance(value, str):
+            raise ValidationError(self.message, code=self.code)
+        # Check if the scheme is valid.
+        scheme = value.split('://')[0].lower()
+        if scheme not in self.schemes:
+            raise ValidationError(self.message, code=self.code)
+
+        # Then check full URL
+        try:
+            super().__call__(value)
+        except ValidationError as e:
+            # Trivial case failed. Try for possible IDN domain
+            if value:
+                try:
+                    scheme, netloc, path, query, fragment = urlsplit(value)
+                except ValueError:  # for example, "Invalid IPv6 URL"
+                    raise ValidationError(self.message, code=self.code)
+                try:
+                    netloc = punycode(netloc)  # IDN -> ACE
+                except UnicodeError:  # invalid domain part
+                    raise e
+                url = urlunsplit((scheme, netloc, path, query, fragment))
+                super().__call__(url)
+            else:
+                raise
+        else:
+            # Now verify IPv6 in the netloc part
+            host_match = re.search(r'^\[(.+)\](?::\d{2,5})?$', urlsplit(value).netloc)
+            if host_match:
+                potential_ip = host_match[1]
+                try:
+                    validate_ipv6_address(potential_ip)
+                except ValidationError:
+                    raise ValidationError(self.message, code=self.code)
+
+        # The maximum length of a full host name is 253 characters per RFC 1034
+        # section 3.1. It's defined to be 255 bytes or less, but this includes
+        # one byte for the length of the name and one byte for the trailing dot
+        # that's used to indicate absolute names in DNS.
+        if len(urlsplit(value).netloc) > 253:
+            raise ValidationError(self.message, code=self.code)
+
+
+integer_validator = RegexValidator(
+
+[0027] assistant:
+Now let me update all URLValidator raises:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/validators.py</parameter>
+  <parameter=old_str>def __call__(self, value):
+        if not isinstance(value, str):
+            raise ValidationError(self.message, code=self.code)
+        # Check if the scheme is valid.
+        scheme = value.split('://')[0].lower()
+        if scheme not in self.schemes:
+            raise ValidationError(self.message, code=self.code)
+
+        # Then check full URL
+        try:
+            super().__call__(value)
+        except ValidationError as e:
+            # Trivial case failed. Try for possible IDN domain
+            if value:
+                try:
+                    scheme, netloc, path, query, fragment = urlsplit(value)
+                except ValueError:  # for example, "Invalid IPv6 URL"
+                    raise ValidationError(self.message, code=self.code)
+                try:
+                    netloc = punycode(netloc)  # IDN -> ACE
+                except UnicodeError:  # invalid domain part
+                    raise e
+                url = urlunsplit((scheme, netloc, path, query, fragment))
+                super().__call__(url)
+            else:
+                raise
+        else:
+            # Now verify IPv6 in the netloc part
+            host_match = re.search(r'^\[(.+)\](?::\d{2,5})?$', urlsplit(value).netloc)
+            if host_match:
+                potential_ip = host_match[1]
+                try:
+                    validate_ipv6_address(potential_ip)
+                except ValidationError:
+                    raise ValidationError(self.message, code=self.code)
+
+        # The maximum length of a full host name is 253 characters per RFC 1034
+        # section 3.1. It's defined to be 255 bytes or less, but this includes
+        # one byte for the length of the name and one byte for the trailing dot
+        # that's used to indicate absolute names in DNS.
+        if len(urlsplit(value).netloc) > 253:
+            raise ValidationError(self.message, code=self.code)</parameter>
+  <parameter=new_str>def __call__(self, value):
+        if not isinstance(value, str):
+            raise ValidationError(self.message, code=self.code, params={'value': value})
+        # Check if the scheme is valid.
+        scheme = value.split('://')[0].lower()
+        if scheme not in self.schemes:
+            raise ValidationError(self.message, code=self.code, params={'value': value})
+
+        # Then check full URL
+        try:
+            super().__call__(value)
+        except ValidationError as e:
+            # Trivial case failed. Try for possible IDN domain
+            if value:
+                try:
+                    scheme, netloc, path, query, fragment = urlsplit(value)
+                except ValueError:  # for example, "Invalid IPv6 URL"
+                    raise ValidationError(self.message, code=self.code, params={'value': value})
+                try:
+                    netloc = punycode(netloc)  # IDN -> ACE
+                except UnicodeError:  # invalid domain part
+                    raise e
+                url = urlunsplit((scheme, netloc, path, query, fragment))
+                super().__call__(url)
+            else:
+                raise
+        else:
+            # Now verify IPv6 in the netloc part
+            host_match = re.search(r'^\[(.+)\](?::\d{2,5})?$', urlsplit(value).netloc)
+            if host_match:
+                potential_ip = host_match[1]
+                try:
+                    validate_ipv6_address(potential_ip)
+                except ValidationError:
+                    raise ValidationError(self.message, code=self.code, params={'value': value})
+
+        # The maximum length of a full host name is 253 characters per RFC 1034
+        # section 3.1. It's defined to be 255 bytes or less, but this includes
+        # one byte for the length of the name and one byte for the trailing dot
+        # that's used to indicate absolute names in DNS.
+        if len(urlsplit(value).netloc) > 253:
+            raise ValidationError(self.message, code=self.code, params={'value': value})</parameter>
+</function>
+
+[0028] tool:
+The file /testbed/django/core/validators.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/validators.py:
+    97	        super().__init__(**kwargs)
+    98	        if schemes is not None:
+    99	            self.schemes = schemes
+   100	
+   101	    def __call__(self, value):
+   102	        if not isinstance(value, str):
+   103	            raise ValidationError(self.message, code=self.code, params={'value': value})
+   104	        # Check if the scheme is valid.
+   105	        scheme = value.split('://')[0].lower()
+   106	        if scheme not in self.schemes:
+   107	            raise ValidationError(self.message, code=self.code, params={'value': value})
+   108	
+   109	        # Then check full URL
+   110	        try:
+   111	            super().__call__(value)
+   112	        except ValidationError as e:
+   113	            # Trivial case failed. Try for possible IDN domain
+   114	            if value:
+   115	                try:
+   116	                    scheme, netloc, path, query, fragment = urlsplit(value)
+   117	                except ValueError:  # for example, "Invalid IPv6 URL"
+   118	                    raise ValidationError(self.message, code=self.code, params={'value': value})
+   119	                try:
+   120	                    netloc = punycode(netloc)  # IDN -> ACE
+   121	                except UnicodeError:  # invalid domain part
+   122	                    raise e
+   123	                url = urlunsplit((scheme, netloc, path, query, fragment))
+   124	                super().__call__(url)
+   125	            else:
+   126	                raise
+   127	        else:
+   128	            # Now verify IPv6 in the netloc part
+   129	            host_match = re.search(r'^\[(.+)\](?::\d{2,5})?$', urlsplit(value).netloc)
+   130	            if host_match:
+   131	                potential_ip = host_match[1]
+   132	                try:
+   133	                    validate_ipv6_address(potential_ip)
+   134	                except ValidationError:
+   135	                    raise ValidationError(self.message, code=self.code, params={'value': value})
+   136	
+   137	        # The maximum length of a full host name is 253 characters per RFC 1034
+   138	        # section 3.1. It's defined to be 255 bytes or less, but this includes
+   139	        # one byte for the length of the name and one byte for the trailing dot
+   140	        # that's used to indicate absolute names in DNS.
+   141	        if len(urlsplit(value).netloc) > 253:
+   142	            raise ValidationError(self.message, code=self.code, params={'value': value})
+   143	
+   144	
+   145	integer_validator = RegexValidator(
+   146	    _lazy_re_compile(r'^-?\d+\Z'),
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0029] assistant:
+Now EmailValidator:
+
+<function=bash>
+  <parameter=cmd>sed -n '195,235p' /testbed/django/core/validators.py</parameter>
+</function>
+
+[0030] tool:
+if whitelist is not None:
+            allowlist = whitelist
+            warnings.warn(
+                'The whitelist argument is deprecated in favor of allowlist.',
+                RemovedInDjango41Warning,
+                stacklevel=2,
+            )
+        if message is not None:
+            self.message = message
+        if code is not None:
+            self.code = code
+        if allowlist is not None:
+            self.domain_allowlist = allowlist
+
+    def __call__(self, value):
+        if not value or '@' not in value:
+            raise ValidationError(self.message, code=self.code)
+
+        user_part, domain_part = value.rsplit('@', 1)
+
+        if not self.user_regex.match(user_part):
+            raise ValidationError(self.message, code=self.code)
+
+        if (domain_part not in self.domain_allowlist and
+                not self.validate_domain_part(domain_part)):
+            # Try for possible IDN domain-part
+            try:
+                domain_part = punycode(domain_part)
+            except UnicodeError:
+                pass
+            else:
+                if self.validate_domain_part(domain_part):
+                    return
+            raise ValidationError(self.message, code=self.code)
+
+    def validate_domain_part(self, domain_part):
+        if self.domain_regex.match(domain_part):
+            return True
+
+        literal_match = self.literal_regex.match(domain_part)
+        if literal_match:
+
+[0031] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/validators.py</parameter>
+  <parameter=old_str>def __call__(self, value):
+        if not value or '@' not in value:
+            raise ValidationError(self.message, code=self.code)
+
+        user_part, domain_part = value.rsplit('@', 1)
+
+        if not self.user_regex.match(user_part):
+            raise ValidationError(self.message, code=self.code)
+
+        if (domain_part not in self.domain_allowlist and
+                not self.validate_domain_part(domain_part)):
+            # Try for possible IDN domain-part
+            try:
+                domain_part = punycode(domain_part)
+            except UnicodeError:
+                pass
+            else:
+                if self.validate_domain_part(domain_part):
+                    return
+            raise ValidationError(self.message, code=self.code)</parameter>
+  <parameter=new_str>def __call__(self, value):
+        if not value or '@' not in value:
+            raise ValidationError(self.message, code=self.code, params={'value': value})
+
+        user_part, domain_part = value.rsplit('@', 1)
+
+        if not self.user_regex.match(user_part):
+            raise ValidationError(self.message, code=self.code, params={'value': value})
+
+        if (domain_part not in self.domain_allowlist and
+                not self.validate_domain_part(domain_part)):
+            # Try for possible IDN domain-part
+            try:
+                domain_part = punycode(domain_part)
+            except UnicodeError:
+                pass
+            else:
+                if self.validate_domain_part(domain_part):
+                    return
+            raise ValidationError(self.message, code=self.code, params={'value': value})</parameter>
+</function>
+
+[0032] tool:
+The file /testbed/django/core/validators.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/validators.py:
+   205	            self.code = code
+   206	        if allowlist is not None:
+   207	            self.domain_allowlist = allowlist
+   208	
+   209	    def __call__(self, value):
+   210	        if not value or '@' not in value:
+   211	            raise ValidationError(self.message, code=self.code, params={'value': value})
+   212	
+   213	        user_part, domain_part = value.rsplit('@', 1)
+   214	
+   215	        if not self.user_regex.match(user_part):
+   216	            raise ValidationError(self.message, code=self.code, params={'value': value})
+   217	
+   218	        if (domain_part not in self.domain_allowlist and
+   219	                not self.validate_domain_part(domain_part)):
+   220	            # Try for possible IDN domain-part
+   221	            try:
+   222	                domain_part = punycode(domain_part)
+   223	            except UnicodeError:
+   224	                pass
+   225	            else:
+   226	                if self.validate_domain_part(domain_part):
+   227	                    return
+   228	            raise ValidationError(self.message, code=self.code, params={'value': value})
+   229	
+   230	    def validate_domain_part(self, domain_part):
+   231	        if self.domain_regex.match(domain_part):
+   232	            return True
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0033] assistant:
+Now the IP validators:
+
+<function=bash>
+  <parameter=cmd>sed -n '268,295p' /testbed/django/core/validators.py</parameter>
+</function>
+
+[0034] tool:
+)
+
+
+def validate_ipv4_address(value):
+    try:
+        ipaddress.IPv4Address(value)
+    except ValueError:
+        raise ValidationError(_('Enter a valid IPv4 address.'), code='invalid')
+
+
+def validate_ipv6_address(value):
+    if not is_valid_ipv6_address(value):
+        raise ValidationError(_('Enter a valid IPv6 address.'), code='invalid')
+
+
+def validate_ipv46_address(value):
+    try:
+        validate_ipv4_address(value)
+    except ValidationError:
+        try:
+            validate_ipv6_address(value)
+        except ValidationError:
+            raise ValidationError(_('Enter a valid IPv4 or IPv6 address.'), code='invalid')
+
+
+ip_address_validator_map = {
+    'both': ([validate_ipv46_address], _('Enter a valid IPv4 or IPv6 address.')),
+    'ipv4': ([validate_ipv4_address], _('Enter a valid IPv4 address.')),
+
+[0035] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/validators.py</parameter>
+  <parameter=old_str>def validate_ipv4_address(value):
+    try:
+        ipaddress.IPv4Address(value)
+    except ValueError:
+        raise ValidationError(_('Enter a valid IPv4 address.'), code='invalid')
+
+
+def validate_ipv6_address(value):
+    if not is_valid_ipv6_address(value):
+        raise ValidationError(_('Enter a valid IPv6 address.'), code='invalid')
+
+
+def validate_ipv46_address(value):
+    try:
+        validate_ipv4_address(value)
+    except ValidationError:
+        try:
+            validate_ipv6_address(value)
+        except ValidationError:
+            raise ValidationError(_('Enter a valid IPv4 or IPv6 address.'), code='invalid')</parameter>
+  <parameter=new_str>def validate_ipv4_address(value):
+    try:
+        ipaddress.IPv4Address(value)
+    except ValueError:
+        raise ValidationError(_('Enter a valid IPv4 address.'), code='invalid', params={'value': value})
+
+
+def validate_ipv6_address(value):
+    if not is_valid_ipv6_address(value):
+        raise ValidationError(_('Enter a valid IPv6 address.'), code='invalid', params={'value': value})
+
+
+def validate_ipv46_address(value):
+    try:
+        validate_ipv4_address(value)
+    except ValidationError:
+        try:
+            validate_ipv6_address(value)
+        except ValidationError:
+            raise ValidationError(_('Enter a valid IPv4 or IPv6 address.'), code='invalid', params={'value': value})</parameter>
+</function>
+
+[0036] tool:
+The file /testbed/django/core/validators.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/validators.py:
+   267	    'invalid'
+   268	)
+   269	
+   270	
+   271	def validate_ipv4_address(value):
+   272	    try:
+   273	        ipaddress.IPv4Address(value)
+   274	    except ValueError:
+   275	        raise ValidationError(_('Enter a valid IPv4 address.'), code='invalid', params={'value': value})
+   276	
+   277	
+   278	def validate_ipv6_address(value):
+   279	    if not is_valid_ipv6_address(value):
+   280	        raise ValidationError(_('Enter a valid IPv6 address.'), code='invalid', params={'value': value})
+   281	
+   282	
+   283	def validate_ipv46_address(value):
+   284	    try:
+   285	        validate_ipv4_address(value)
+   286	    except ValidationError:
+   287	        try:
+   288	            validate_ipv6_address(value)
+   289	        except ValidationError:
+   290	            raise ValidationError(_('Enter a valid IPv4 or IPv6 address.'), code='invalid', params={'value': value})
+   291	
+   292	
+   293	ip_address_validator_map = {
+   294	    'both': ([validate_ipv46_address], _('Enter a valid IPv4 or IPv6 address.')),
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0037] assistant:
+Now DecimalValidator:
+
+<function=bash>
+  <parameter=cmd>sed -n '435,480p' /testbed/django/core/validators.py</parameter>
+</function>
+
+[0038] tool:
+self.max_digits = max_digits
+        self.decimal_places = decimal_places
+
+    def __call__(self, value):
+        digit_tuple, exponent = value.as_tuple()[1:]
+        if exponent in {'F', 'n', 'N'}:
+            raise ValidationError(self.messages['invalid'])
+        if exponent >= 0:
+            # A positive exponent adds that many trailing zeros.
+            digits = len(digit_tuple) + exponent
+            decimals = 0
+        else:
+            # If the absolute value of the negative exponent is larger than the
+            # number of digits, then it's the same as the number of digits,
+            # because it'll consume all of the digits in digit_tuple and then
+            # add abs(exponent) - len(digit_tuple) leading zeros after the
+            # decimal point.
+            if abs(exponent) > len(digit_tuple):
+                digits = decimals = abs(exponent)
+            else:
+                digits = len(digit_tuple)
+                decimals = abs(exponent)
+        whole_digits = digits - decimals
+
+        if self.max_digits is not None and digits > self.max_digits:
+            raise ValidationError(
+                self.messages['max_digits'],
+                code='max_digits',
+                params={'max': self.max_digits},
+            )
+        if self.decimal_places is not None and decimals > self.decimal_places:
+            raise ValidationError(
+                self.messages['max_decimal_places'],
+                code='max_decimal_places',
+                params={'max': self.decimal_places},
+            )
+        if (self.max_digits is not None and self.decimal_places is not None and
+                whole_digits > (self.max_digits - self.decimal_places)):
+            raise ValidationError(
+                self.messages['max_whole_digits'],
+                code='max_whole_digits',
+                params={'max': (self.max_digits - self.decimal_places)},
+            )
+
+    def __eq__(self, other):
+        return (
+
+[0039] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/validators.py</parameter>
+  <parameter=old_str>def __call__(self, value):
+        digit_tuple, exponent = value.as_tuple()[1:]
+        if exponent in {'F', 'n', 'N'}:
+            raise ValidationError(self.messages['invalid'])
+        if exponent >= 0:
+            # A positive exponent adds that many trailing zeros.
+            digits = len(digit_tuple) + exponent
+            decimals = 0
+        else:
+            # If the absolute value of the negative exponent is larger than the
+            # number of digits, then it's the same as the number of digits,
+            # because it'll consume all of the digits in digit_tuple and then
+            # add abs(exponent) - len(digit_tuple) leading zeros after the
+            # decimal point.
+            if abs(exponent) > len(digit_tuple):
+                digits = decimals = abs(exponent)
+            else:
+                digits = len(digit_tuple)
+                decimals = abs(exponent)
+        whole_digits = digits - decimals
+
+        if self.max_digits is not None and digits > self.max_digits:
+            raise ValidationError(
+                self.messages['max_digits'],
+                code='max_digits',
+                params={'max': self.max_digits},
+            )
+        if self.decimal_places is not None and decimals > self.decimal_places:
+            raise ValidationError(
+                self.messages['max_decimal_places'],
+                code='max_decimal_places',
+                params={'max': self.decimal_places},
+            )
+        if (self.max_digits is not None and self.decimal_places is not None and
+                whole_digits > (self.max_digits - self.decimal_places)):
+            raise ValidationError(
+                self.messages['max_whole_digits'],
+                code='max_whole_digits',
+                params={'max': (self.max_digits - self.decimal_places)},
+            )</parameter>
+  <parameter=new_str>def __call__(self, value):
+        digit_tuple, exponent = value.as_tuple()[1:]
+        if exponent in {'F', 'n', 'N'}:
+            raise ValidationError(self.messages['invalid'], code='invalid', params={'value': value})
+        if exponent >= 0:
+            # A positive exponent adds that many trailing zeros.
+            digits = len(digit_tuple) + exponent
+            decimals = 0
+        else:
+            # If the absolute value of the negative exponent is larger than the
+            # number of digits, then it's the same as the number of digits,
+            # because it'll consume all of the digits in digit_tuple and then
+            # add abs(exponent) - len(digit_tuple) leading zeros after the
+            # decimal point.
+            if abs(exponent) > len(digit_tuple):
+                digits = decimals = abs(exponent)
+            else:
+                digits = len(digit_tuple)
+                decimals = abs(exponent)
+        whole_digits = digits - decimals
+
+        if self.max_digits is not None and digits > self.max_digits:
+            raise ValidationError(
+                self.messages['max_digits'],
+                code='max_digits',
+                params={'max': self.max_digits, 'value': value},
+            )
+        if self.decimal_places is not None and decimals > self.decimal_places:
+            raise ValidationError(
+                self.messages['max_decimal_places'],
+                code='max_decimal_places',
+                params={'max': self.decimal_places, 'value': value},
+            )
+        if (self.max_digits is not None and self.decimal_places is not None and
+                whole_digits > (self.max_digits - self.decimal_places)):
+            raise ValidationError(
+                self.messages['max_whole_digits'],
+                code='max_whole_digits',
+                params={'max': (self.max_digits - self.decimal_places), 'value': value},
+            )</parameter>
+</function>
+
+[0040] tool:
+The file /testbed/django/core/validators.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/validators.py:
+   434	    def __init__(self, max_digits, decimal_places):
+   435	        self.max_digits = max_digits
+   436	        self.decimal_places = decimal_places
+   437	
+   438	    def __call__(self, value):
+   439	        digit_tuple, exponent = value.as_tuple()[1:]
+   440	        if exponent in {'F', 'n', 'N'}:
+   441	            raise ValidationError(self.messages['invalid'], code='invalid', params={'value': value})
+   442	        if exponent >= 0:
+   443	            # A positive exponent adds that many trailing zeros.
+   444	            digits = len(digit_tuple) + exponent
+   445	            decimals = 0
+   446	        else:
+   447	            # If the absolute value of the negative exponent is larger than the
+   448	            # number of digits, then it's the same as the number of digits,
+   449	            # because it'll consume all of the digits in digit_tuple and then
+   450	            # add abs(exponent) - len(digit_tuple) leading zeros after the
+   451	            # decimal point.
+   452	            if abs(exponent) > len(digit_tuple):
+   453	                digits = decimals = abs(exponent)
+   454	            else:
+   455	                digits = len(digit_tuple)
+   456	                decimals = abs(exponent)
+   457	        whole_digits = digits - decimals
+   458	
+   459	        if self.max_digits is not None and digits > self.max_digits:
+   460	            raise ValidationError(
+   461	                self.messages['max_digits'],
+   462	                code='max_digits',
+   463	                params={'max': self.max_digits, 'value': value},
+   464	            )
+   465	        if self.decimal_places is not None and decimals > self.decimal_places:
+   466	            raise ValidationError(
+   467	                self.messages['max_decimal_places'],
+   468	                code='max_decimal_places',
+   469	                params={'max': self.decimal_places, 'value': value},
+   470	            )
+   471	        if (self.max_digits is not None and self.decimal_places is not None and
+   472	                whole_digits > (self.max_digits - self.decimal_places)):
+   473	            raise ValidationError(
+   474	                self.messages['max_whole_digits'],
+   475	                code='max_whole_digits',
+   476	                params={'max': (self.max_digits - self.decimal_places), 'value': value},
+   477	            )
+   478	
+   479	    def __eq__(self, other):
+   480	        return (
+   481	            isinstance(other, self.__class__) and
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0041] assistant:
+Now FileExtensionValidator:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/validators.py</parameter>
+  <parameter=old_str>raise ValidationError(
+                self.message,
+                code=self.code,
+                params={
+                    'extension': extension,
+                    'allowed_extensions': ', '.join(self.allowed_extensions)
+                }
+            )</parameter>
+  <parameter=new_str>raise ValidationError(
+                self.message,
+                code=self.code,
+                params={
+                    'extension': extension,
+                    'allowed_extensions': ', '.join(self.allowed_extensions),
+                    'value': value,
+                }
+            )</parameter>
+</function>
+
+[0042] tool:
+The file /testbed/django/core/validators.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/validators.py:
+   503	
+   504	    def __call__(self, value):
+   505	        extension = Path(value.name).suffix[1:].lower()
+   506	        if self.allowed_extensions is not None and extension not in self.allowed_extensions:
+   507	            raise ValidationError(
+   508	                self.message,
+   509	                code=self.code,
+   510	                params={
+   511	                    'extension': extension,
+   512	                    'allowed_extensions': ', '.join(self.allowed_extensions),
+   513	                    'value': value,
+   514	                }
+   515	            )
+   516	
+   517	    def __eq__(self, other):
+   518	        return (
+   519	            isinstance(other, self.__class__) and
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0043] assistant:
+Now ProhibitNullCharactersValidator:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/core/validators.py</parameter>
+  <parameter=old_str>def __call__(self, value):
+        if '\x00' in str(value):
+            raise ValidationError(self.message, code=self.code)</parameter>
+  <parameter=new_str>def __call__(self, value):
+        if '\x00' in str(value):
+            raise ValidationError(self.message, code=self.code, params={'value': value})</parameter>
+</function>
+
+[0044] tool:
+The file /testbed/django/core/validators.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/core/validators.py:
+   548	            self.message = message
+   549	        if code is not None:
+   550	            self.code = code
+   551	
+   552	    def __call__(self, value):
+   553	        if '\x00' in str(value):
+   554	            raise ValidationError(self.message, code=self.code, params={'value': value})
+   555	
+   556	    def __eq__(self, other):
+   557	        return (
+   558	            isinstance(other, self.__class__) and
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0045] assistant:
+Now I need to check what happens in `run_validators` - when the error message is replaced, the params need to be preserved. Let me look at that again:
+
+<function=bash>
+  <parameter=cmd>sed -n '130,143p' /testbed/django/forms/fields.py</parameter>
+</function>
+
+[0046] tool:
+def run_validators(self, value):
+        if value in self.empty_values:
+            return
+        errors = []
+        for v in self.validators:
+            try:
+                v(value)
+            except ValidationError as e:
+                if hasattr(e, 'code') and e.code in self.error_messages:
+                    e.message = self.error_messages[e.code]
+                errors.extend(e.error_list)
+        if errors:
+            raise ValidationError(errors)
+
+[0047] assistant:
+The `run_validators` method replaces `e.message` but keeps `e.params`. So when the error is rendered, `message %= error.params` will work. But wait - the test for `test_value_placeholder_with_file_field` expects `'myfile.txt'` as the error. The `value` passed to `FileExtensionValidator` is a `SimpleUploadedFile` object, not a string. Let me check what `str(SimpleUploadedFile('myfile.txt', b'abc'))` gives...
+
+
+Actually, looking at the test, the `value` parameter would be the `SimpleUploadedFile` object itself, so I need to understand how that gets converted to the string `'myfile.txt'` in the error message.
+
+When `%(value)s` is used in string formatting, it calls `str()` on the object. `SimpleUploadedFile` inherits from `UploadedFile` which inherits from `File`, and `File.__str__` returns `self.name`, so the filename `'myfile.txt'` is what gets inserted into the error message.
+
+For the DecimalField test, the validator receives a Decimal object, and when converted to string for the error message params, `str(Decimal('NaN'))` produces `'NaN'`, `str(Decimal('123'))` produces `'123'`, and so on. But I need to check whether DecimalField's `to_python` validates NaN before it even reaches the validators.
+
+Now let me run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_validators 2>&1</parameter>
+</function>
+
+[0048] tool:
+test_all_errors_get_reported (forms_tests.tests.test_validators.TestFieldWithValidators) ... ok
+test_field_validators_can_be_any_iterable (forms_tests.tests.test_validators.TestFieldWithValidators) ... ok
+test_value_placeholder_with_char_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+test_value_placeholder_with_decimal_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... test_value_placeholder_with_file_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+test_value_placeholder_with_integer_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+test_value_placeholder_with_null_character (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+
+======================================================================
+FAIL: test_value_placeholder_with_decimal_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) (value='NaN')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/testbed/tests/forms_tests/tests/test_validators.py", line 157, in test_value_placeholder_with_decimal_field
+    self.assertEqual(form.errors, {'field': [value]})
+AssertionError: {'field': ['%(value)s']} != {'field': ['NaN']}
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.176s
+
+FAILED (failures=1)
+Testing against Django installed in '/testbed/django'
+Importing application forms_tests
+Skipping setup of unused database(s): default, other.
+System check identified no issues (0 silenced).
+
+[0049] assistant:
+The NaN case fails because DecimalField handles the 'invalid' case itself before reaching the validator. Let me check:
+
+<function=bash>
+  <parameter=cmd>grep -n "class DecimalField" /testbed/django/forms/fields.py</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>sed -n '335,395p' /testbed/django/forms/fields.py</parameter>
+</function>
+
+[0050] tool:
+325:class DecimalField(IntegerField):
+
+[0051] tool:
+def to_python(self, value):
+        """
+        Validate that the input is a decimal number. Return a Decimal
+        instance or None for empty values. Ensure that there are no more
+        than max_digits in the number and no more than decimal_places digits
+        after the decimal point.
+        """
+        if value in self.empty_values:
+            return None
+        if self.localize:
+            value = formats.sanitize_separators(value)
+        value = str(value).strip()
+        try:
+            value = Decimal(value)
+        except DecimalException:
+            raise ValidationError(self.error_messages['invalid'], code='invalid')
+        return value
+
+    def validate(self, value):
+        super().validate(value)
+        if value in self.empty_values:
+            return
+        if not value.is_finite():
+            raise ValidationError(self.error_messages['invalid'], code='invalid')
+
+    def widget_attrs(self, widget):
+        attrs = super().widget_attrs(widget)
+        if isinstance(widget, NumberInput) and 'step' not in widget.attrs:
+            if self.decimal_places is not None:
+                # Use exponential notation for small values since they might
+                # be parsed as 0 otherwise. ref #20765
+                step = str(Decimal(1).scaleb(-self.decimal_places)).lower()
+            else:
+                step = 'any'
+            attrs.setdefault('step', step)
+        return attrs
+
+
+class BaseTemporalField(Field):
+
+    def __init__(self, *, input_formats=None, **kwargs):
+        super().__init__(**kwargs)
+        if input_formats is not None:
+            self.input_formats = input_formats
+
+    def to_python(self, value):
+        value = value.strip()
+        # Try to strptime against each input format.
+        for format in self.input_formats:
+            try:
+                return self.strptime(value, format)
+            except (ValueError, TypeError):
+                continue
+        raise ValidationError(self.error_messages['invalid'], code='invalid')
+
+    def strptime(self, value, format):
+        raise NotImplementedError('Subclasses must define this method.')
+
+
+class DateField(BaseTemporalField):
+    widget = DateInput
+
+[0052] assistant:
+The `validate` method in `DecimalField` raises `ValidationError` for non-finite values (NaN) but doesn't include `params={'value': value}`. I need to fix the form field's `validate` method too:
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/forms/fields.py</parameter>
+  <parameter=old_str>def validate(self, value):
+        super().validate(value)
+        if value in self.empty_values:
+            return
+        if not value.is_finite():
+            raise ValidationError(self.error_messages['invalid'], code='invalid')</parameter>
+  <parameter=new_str>def validate(self, value):
+        super().validate(value)
+        if value in self.empty_values:
+            return
+        if not value.is_finite():
+            raise ValidationError(
+                self.error_messages['invalid'],
+                code='invalid',
+                params={'value': value},
+            )</parameter>
+</function>
+
+[0053] tool:
+The file /testbed/django/forms/fields.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/forms/fields.py:
+   349	        except DecimalException:
+   350	            raise ValidationError(self.error_messages['invalid'], code='invalid')
+   351	        return value
+   352	
+   353	    def validate(self, value):
+   354	        super().validate(value)
+   355	        if value in self.empty_values:
+   356	            return
+   357	        if not value.is_finite():
+   358	            raise ValidationError(
+   359	                self.error_messages['invalid'],
+   360	                code='invalid',
+   361	                params={'value': value},
+   362	            )
+   363	
+   364	    def widget_attrs(self, widget):
+   365	        attrs = super().widget_attrs(widget)
+   366	        if isinstance(widget, NumberInput) and 'step' not in widget.attrs:
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0054] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_validators 2>&1</parameter>
+</function>
+
+[0055] tool:
+test_all_errors_get_reported (forms_tests.tests.test_validators.TestFieldWithValidators) ... ok
+test_field_validators_can_be_any_iterable (forms_tests.tests.test_validators.TestFieldWithValidators) ... ok
+test_value_placeholder_with_char_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+test_value_placeholder_with_decimal_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+test_value_placeholder_with_file_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+test_value_placeholder_with_integer_field (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+test_value_placeholder_with_null_character (forms_tests.tests.test_validators.ValidatorCustomMessageTests) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.127s
+
+OK
+Testing against Django installed in '/testbed/django'
+Importing application forms_tests
+Skipping setup of unused database(s): default, other.
+System check identified no issues (0 silenced).
+
+[0056] assistant:
+All 7 tests pass.
+
+<function=submit>
+  <parameter=answer>The fix adds `value` to the `params` dict in `ValidationError` raises across Django's built-in validators and form fields, so that custom error messages can use `%(value)s` placeholder.
+
+Changes made:
+
+1. **`django/core/validators.py`**:
+   - `RegexValidator.__call__`: Added `params={'value': value}` to ValidationError
+   - `URLValidator.__call__`: Added `params={'value': value}` to all 6 ValidationError raises
+   - `EmailValidator.__call__`: Added `params={'value': value}` to all 3 ValidationError raises
+   - `validate_ipv4_address`: Added `params={'value': value}`
+   - `validate_ipv6_address`: Added `params={'value': value}`
+   - `validate_ipv46_address`: Added `params={'value': value}`
+   - `DecimalValidator.__call__`: Added `'value': value` to all 4 ValidationError params dicts
+   - `FileExtensionValidator.__call__`: Added `'value': value` to existing params dict
+   - `ProhibitNullCharactersValidator.__call__`: Added `params={'value': value}`
+
+2. **`django/forms/fields.py`**:
+   - `DecimalField.validate`: Added `params={'value': value}` to the ValidationError for non-finite values (NaN, Inf)</parameter>
+</function>
+
+[0057] tool:
+The fix adds `value` to the `params` dict in `ValidationError` raises across Django's built-in validators and form fields, so that custom error messages can use `%(value)s` placeholder.
+
+Changes made:
+
+1. **`django/core/validators.py`**:
+   - `RegexValidator.__call__`: Added `params={'value': value}` to ValidationError
+   - `URLValidator.__call__`: Added `params={'value': value}` to all 6 ValidationError raises
+   - `EmailValidator.__call__`: Added `params={'value': value}` to all 3 ValidationError raises
+   - `validate_ipv4_address`: Added `params={'value': value}`
+   - `validate_ipv6_address`: Added `params={'value': value}`
+   - `validate_ipv46_address`: Added `params={'value': value}`
+   - `DecimalValidator.__call__`: Added `'value': value` to all 4 ValidationError params dicts
+   - `FileExtensionValidator.__call__`: Added `'value': value` to existing params dict
+   - `ProhibitNullCharactersValidator.__call__`: Added `params={'value': value}`
+
+2. **`django/forms/fields.py`**:
+   - `DecimalField.validate`: Added `params={'value': value}` to the ValidationError for non-finite values (NaN, Inf)

@@ -1,0 +1,367 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_base migrations.test_operations
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+Migration crashes deleting an index_together if there is a unique_together on the same fields
+Description
+	
+Happens with Django 1.11.10
+Steps to reproduce:
+1) Create models with 2 fields, add 2 same fields to unique_together and to index_together
+2) Delete index_together -> Fail
+It will fail at django/db/backends/base/schema.py, line 378, in _delete_composed_index(), ValueError: Found wrong number (2) of constraints for as this one will find two constraints, the _uniq and the _idx one. No way to get out of this...
+The worst in my case is that happened as I wanted to refactor my code to use the "new" (Dj 1.11) Options.indexes feature. I am actually not deleting the index, just the way it is declared in my code.
+I think there are 2 different points here:
+1) The deletion of index_together should be possible alone or made coherent (migrations side?) with unique_together
+2) Moving the declaration of an index should not result in an index re-creation
+
+[0002] assistant:
+Let me understand the issue: when you have both `unique_together` and `index_together` on the same fields, deleting `index_together` crashes because `_delete_composed_index` finds 2 constraints (both the unique and the index one) when it expects only 1.
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "_delete_composed_index" django/db/backends/base/schema.py</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "schema.py" -path "*/db/backends/base/*" 2>/dev/null</parameter>
+</function>
+
+[0005] tool:
+/testbed/django/db/backends/base/schema.py
+
+[0006] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "_delete_composed_index" django/db/backends/base/schema.py</parameter>
+</function>
+
+[0007] tool:
+380:            self._delete_composed_index(model, fields, {'unique': True}, self.sql_delete_unique)
+396:            self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
+402:    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '390,425' django/db/backends/base/schema.py</parameter>
+</function>
+
+[0009] tool:
+sed: -e expression #1, char 7: missing command
+
+[0010] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '370,425p' django/db/backends/base/schema.py</parameter>
+</function>
+
+[0011] tool:
+def alter_unique_together(self, model, old_unique_together, new_unique_together):
+        """
+        Deal with a model changing its unique_together. The input
+        unique_togethers must be doubly-nested, not the single-nested
+        ["foo", "bar"] format.
+        """
+        olds = {tuple(fields) for fields in old_unique_together}
+        news = {tuple(fields) for fields in new_unique_together}
+        # Deleted uniques
+        for fields in olds.difference(news):
+            self._delete_composed_index(model, fields, {'unique': True}, self.sql_delete_unique)
+        # Created uniques
+        for fields in news.difference(olds):
+            columns = [model._meta.get_field(field).column for field in fields]
+            self.execute(self._create_unique_sql(model, columns))
+
+    def alter_index_together(self, model, old_index_together, new_index_together):
+        """
+        Deal with a model changing its index_together. The input
+        index_togethers must be doubly-nested, not the single-nested
+        ["foo", "bar"] format.
+        """
+        olds = {tuple(fields) for fields in old_index_together}
+        news = {tuple(fields) for fields in new_index_together}
+        # Deleted indexes
+        for fields in olds.difference(news):
+            self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
+        # Created indexes
+        for field_names in news.difference(olds):
+            fields = [model._meta.get_field(field) for field in field_names]
+            self.execute(self._create_index_sql(model, fields, suffix="_idx"))
+
+    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):
+        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+        meta_index_names = {constraint.name for constraint in model._meta.indexes}
+        columns = [model._meta.get_field(field).column for field in fields]
+        constraint_names = self._constraint_names(
+            model, columns, exclude=meta_constraint_names | meta_index_names,
+            **constraint_kwargs
+        )
+        if len(constraint_names) != 1:
+            raise ValueError("Found wrong number (%s) of constraints for %s(%s)" % (
+                len(constraint_names),
+                model._meta.db_table,
+                ", ".join(columns),
+            ))
+        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))
+
+    def alter_db_table(self, model, old_db_table, new_db_table):
+        """Rename the table a model points to."""
+        if (old_db_table == new_db_table or
+            (self.connection.features.ignores_table_name_case and
+                old_db_table.lower() == new_db_table.lower())):
+            return
+        self.execute(self.sql_rename_table % {
+            "old_table": self.quote_name(old_db_table),
+
+[0012] assistant:
+The issue is in `_delete_composed_index`. When deleting an index_together, it calls `_constraint_names` with `{'index': True}`, but a unique constraint also creates an index, so both constraints are found.
+
+The fix should be: when deleting an index (not unique), exclude unique constraints from the results.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "_constraint_names" django/db/backends/base/schema.py | head -20</parameter>
+</function>
+
+[0013] tool:
+403:        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+406:        constraint_names = self._constraint_names(
+407:            model, columns, exclude=meta_constraint_names | meta_index_names,
+509:            fk_names = self._constraint_names(model, [field.column], foreign_key=True)
+577:            fk_names = self._constraint_names(model, [old_field.column], foreign_key=True)
+590:            meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+591:            constraint_names = self._constraint_names(
+593:                exclude=meta_constraint_names,
+615:                rel_fk_names = self._constraint_names(
+635:            index_names = self._constraint_names(
+646:            meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+647:            constraint_names = self._constraint_names(
+649:                exclude=meta_constraint_names,
+1142:    def _constraint_names(self, model, column_names=None, unique=None,
+1173:        constraint_names = self._constraint_names(model, primary_key=True)
+
+[0014] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '1142,1170p' django/db/backends/base/schema.py</parameter>
+</function>
+
+[0015] tool:
+def _constraint_names(self, model, column_names=None, unique=None,
+                          primary_key=None, index=None, foreign_key=None,
+                          check=None, type_=None, exclude=None):
+        """Return all constraint names matching the columns and conditions."""
+        if column_names is not None:
+            column_names = [
+                self.connection.introspection.identifier_converter(name)
+                for name in column_names
+            ]
+        with self.connection.cursor() as cursor:
+            constraints = self.connection.introspection.get_constraints(cursor, model._meta.db_table)
+        result = []
+        for name, infodict in constraints.items():
+            if column_names is None or column_names == infodict['columns']:
+                if unique is not None and infodict['unique'] != unique:
+                    continue
+                if primary_key is not None and infodict['primary_key'] != primary_key:
+                    continue
+                if index is not None and infodict['index'] != index:
+                    continue
+                if check is not None and infodict['check'] != check:
+                    continue
+                if foreign_key is not None and not infodict['foreign_key']:
+                    continue
+                if type_ is not None and infodict['type'] != type_:
+                    continue
+                if not exclude or name not in exclude:
+                    result.append(name)
+        return result
+
+[0016] assistant:
+Now I see the issue. When `alter_index_together` calls `_delete_composed_index` with `{'index': True}`, `_constraint_names` finds all constraints where `index=True`. A unique constraint also has `index=True` on some backends, so both the unique and index constraints are returned.
+
+The fix: when deleting an index_together, we should also pass `unique=False` to exclude unique constraints.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/backends/base/schema.py</parameter>
+  <parameter=old_str># Deleted indexes
+        for fields in olds.difference(news):
+            self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)</parameter>
+  <parameter=new_str># Deleted indexes
+        for fields in olds.difference(news):
+            self._delete_composed_index(
+                model, fields, {'index': True, 'unique': False}, self.sql_delete_index,
+            )</parameter>
+</function>
+
+[0017] tool:
+The file /testbed/django/db/backends/base/schema.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/backends/base/schema.py:
+   390	        ["foo", "bar"] format.
+   391	        """
+   392	        olds = {tuple(fields) for fields in old_index_together}
+   393	        news = {tuple(fields) for fields in new_index_together}
+   394	        # Deleted indexes
+   395	        for fields in olds.difference(news):
+   396	            self._delete_composed_index(
+   397	                model, fields, {'index': True, 'unique': False}, self.sql_delete_index,
+   398	            )
+   399	        # Created indexes
+   400	        for field_names in news.difference(olds):
+   401	            fields = [model._meta.get_field(field) for field in field_names]
+   402	            self.execute(self._create_index_sql(model, fields, suffix="_idx"))
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0018] assistant:
+Now let's run the tests:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && python ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_base migrations.test_operations 2>&1 | tail -30</parameter>
+</function>
+
+[0019] tool:
+Creating table django_session
+    Creating table migrations_modelwithcustombase
+    Creating table migrations_unmigratedmodel
+    Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+Operations to perform:
+  Synchronize unmigrated apps: auth, contenttypes, messages, migrations, sessions, staticfiles
+  Apply all migrations: admin, sites
+Synchronizing apps without migrations:
+  Creating tables...
+    Creating table django_content_type
+    Creating table auth_permission
+    Creating table auth_group
+    Creating table auth_user
+    Creating table django_session
+    Creating table migrations_modelwithcustombase
+    Creating table migrations_unmigratedmodel
+    Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+System check identified no issues (0 silenced).
+
+[0020] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && python ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_base migrations.test_operations 2>&1 | grep -E "(FAIL|ERROR|OK|test_)" | tail -40</parameter>
+</function>
+
+[0021] tool:
+test_rename_m2m_model_after_rename_field (migrations.test_operations.OperationTests)
+test_rename_m2m_target_model (migrations.test_operations.OperationTests) ... ok
+test_rename_m2m_through_model (migrations.test_operations.OperationTests) ... ok
+test_rename_missing_field (migrations.test_operations.OperationTests) ... ok
+test_rename_model (migrations.test_operations.OperationTests) ... ok
+test_rename_model_state_forwards (migrations.test_operations.OperationTests) ... ok
+test_rename_model_with_m2m (migrations.test_operations.OperationTests) ... ok
+test_rename_model_with_self_referential_fk (migrations.test_operations.OperationTests) ... ok
+test_rename_model_with_self_referential_m2m (migrations.test_operations.OperationTests) ... ok
+test_rename_model_with_superclass_fk (migrations.test_operations.OperationTests) ... ok
+test_rename_referenced_field_state_forward (migrations.test_operations.OperationTests) ... ok
+test_repoint_field_m2m (migrations.test_operations.OperationTests) ... ok
+test_run_python (migrations.test_operations.OperationTests) ... ok
+test_run_python_atomic (migrations.test_operations.OperationTests) ... ok
+test_run_python_noop (migrations.test_operations.OperationTests) ... ok
+test_run_python_related_assignment (migrations.test_operations.OperationTests) ... ok
+test_run_sql (migrations.test_operations.OperationTests) ... ok
+test_run_sql_noop (migrations.test_operations.OperationTests) ... ok
+test_run_sql_params (migrations.test_operations.OperationTests) ... ok
+test_run_sql_params_invalid (migrations.test_operations.OperationTests) ... ok
+test_separate_database_and_state (migrations.test_operations.OperationTests) ... ok
+test_separate_database_and_state2 (migrations.test_operations.OperationTests) ... ok
+test_smallfield_autofield_foreignfield_growth (migrations.test_operations.OperationTests)
+test_smallfield_bigautofield_foreignfield_growth (migrations.test_operations.OperationTests)
+test_add_field_ignore_swapped (migrations.test_operations.SwappableOperationTests) ... ok
+test_create_ignore_swapped (migrations.test_operations.SwappableOperationTests) ... ok
+test_delete_ignore_swapped (migrations.test_operations.SwappableOperationTests) ... ok
+test_indexes_ignore_swapped (migrations.test_operations.SwappableOperationTests) ... ok
+test_references_model_mixin (migrations.test_operations.TestCreateModel) ... ok
+OK
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+
+[0022] assistant:
+All tests pass.
+
+<function=submit>
+  <parameter=answer>The fix is in `/testbed/django/db/backends/base/schema.py`. In the `alter_index_together` method, when deleting indexes, the constraint lookup now also specifies `'unique': False` to exclude unique constraints from the results. This prevents the `_delete_composed_index` method from finding both the unique constraint and the index constraint when both `unique_together` and `index_together` exist on the same fields.
+
+The change:
+```python
+# Before:
+self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
+
+# After:
+self._delete_composed_index(
+    model, fields, {'index': True, 'unique': False}, self.sql_delete_index,
+)
+```</parameter>
+</function>
+
+[0023] tool:
+The fix is in `/testbed/django/db/backends/base/schema.py`. In the `alter_index_together` method, when deleting indexes, the constraint lookup now also specifies `'unique': False` to exclude unique constraints from the results. This prevents the `_delete_composed_index` method from finding both the unique constraint and the index constraint when both `unique_together` and `index_together` exist on the same fields.
+
+The change:
+```python
+# Before:
+self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
+
+# After:
+self._delete_composed_index(
+    model, fields, {'index': True, 'unique': False}, self.sql_delete_index,
+)
+```

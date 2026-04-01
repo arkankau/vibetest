@@ -1,0 +1,360 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+pytest -rA testing/logging/test_fixture.py
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+caplog fixture doesn't restore log level after test
+From the documentation at https://docs.pytest.org/en/6.0.0/logging.html#caplog-fixture, "The log levels set are restored automatically at the end of the test".
+It used to work, but looks broken in new 6.0 release. Minimal example to reproduce:
+
+```
+def test_foo(caplog):
+    caplog.set_level(42)
+
+def test_bar(caplog):
+    print(caplog.handler.level)
+```
+
+It prints "0" for pytest<6, "42" after.
+
+[0002] assistant:
+<function=bash>
+  <parameter=cmd>cd /repo && git log --oneline -5</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -n "set_level\|_force_enable_logging\|handler.level\|_initial_handler_level\|_initial_logger_level" src/_pytest/logging.py | head -40</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0005] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "pytest" -type d 2>/dev/null | head -5</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>ls /</parameter>
+</function>
+
+[0006] tool:
+/testbed/src/pytest
+
+[0007] tool:
+bin
+boot
+dev
+etc
+home
+lib
+lib32
+lib64
+libx32
+media
+miniconda.sh
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+testbed
+tmp
+usr
+var
+
+[0008] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "set_level\|_force_enable_logging\|handler.level\|_initial_handler_level\|_initial_logger_level" src/_pytest/logging.py | head -40</parameter>
+</function>
+
+[0009] tool:
+348:        self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
+353:        This restores the log levels changed by :meth:`set_level`.
+356:        for logger_name, level in self._initial_logger_levels.items():
+422:    def set_level(self, level: Union[int, str], logger: Optional[str] = None) -> None:
+435:        self._initial_logger_levels.setdefault(logger, logger_obj.level)
+452:        handler_orig_level = self.handler.level
+
+[0010] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '340,370p' src/_pytest/logging.py</parameter>
+</function>
+
+[0011] tool:
+class LogCaptureFixture:
+    """Provides access and control of log capturing."""
+
+    def __init__(self, item: nodes.Node) -> None:
+        """Creates a new funcarg."""
+        self._item = item
+        # dict of log name -> log level
+        self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
+
+    def _finalize(self) -> None:
+        """Finalizes the fixture.
+
+        This restores the log levels changed by :meth:`set_level`.
+        """
+        # restore log levels
+        for logger_name, level in self._initial_logger_levels.items():
+            logger = logging.getLogger(logger_name)
+            logger.setLevel(level)
+
+    @property
+    def handler(self) -> LogCaptureHandler:
+        """
+        :rtype: LogCaptureHandler
+        """
+        return self._item._store[caplog_handler_key]
+
+    def get_records(self, when: str) -> List[logging.LogRecord]:
+        """
+        Get the logging records for one of the possible test phases.
+
+[0012] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '420,460p' src/_pytest/logging.py</parameter>
+</function>
+
+[0013] tool:
+self.handler.reset()
+
+    def set_level(self, level: Union[int, str], logger: Optional[str] = None) -> None:
+        """Sets the level for capturing of logs. The level will be restored to its previous value at the end of
+        the test.
+
+        :param int level: the logger to level.
+        :param str logger: the logger to update the level. If not given, the root logger level is updated.
+
+        .. versionchanged:: 3.4
+            The levels of the loggers changed by this function will be restored to their initial values at the
+            end of the test.
+        """
+        logger_obj = logging.getLogger(logger)
+        # save the original log-level to restore it during teardown
+        self._initial_logger_levels.setdefault(logger, logger_obj.level)
+        logger_obj.setLevel(level)
+        self.handler.setLevel(level)
+
+    @contextmanager
+    def at_level(
+        self, level: int, logger: Optional[str] = None
+    ) -> Generator[None, None, None]:
+        """Context manager that sets the level for capturing of logs. After the end of the 'with' statement the
+        level is restored to its original value.
+
+        :param int level: the logger to level.
+        :param str logger: the logger to update the level. If not given, the root logger level is updated.
+        """
+        logger_obj = logging.getLogger(logger)
+        orig_level = logger_obj.level
+        logger_obj.setLevel(level)
+        handler_orig_level = self.handler.level
+        self.handler.setLevel(level)
+        try:
+            yield
+        finally:
+            logger_obj.setLevel(orig_level)
+            self.handler.setLevel(handler_orig_level)
+
+[0014] assistant:
+The issue is clear: `set_level` sets `self.handler.setLevel(level)` but `_finalize` doesn't restore the handler level.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/src/_pytest/logging.py</parameter>
+  <parameter=old_str>def __init__(self, item: nodes.Node) -> None:
+        """Creates a new funcarg."""
+        self._item = item
+        # dict of log name -> log level
+        self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
+
+    def _finalize(self) -> None:
+        """Finalizes the fixture.
+
+        This restores the log levels changed by :meth:`set_level`.
+        """
+        # restore log levels
+        for logger_name, level in self._initial_logger_levels.items():
+            logger = logging.getLogger(logger_name)
+            logger.setLevel(level)</parameter>
+  <parameter=new_str>def __init__(self, item: nodes.Node) -> None:
+        """Creates a new funcarg."""
+        self._item = item
+        # dict of log name -> log level
+        self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
+        self._initial_handler_level = None  # type: Optional[int]
+
+    def _finalize(self) -> None:
+        """Finalizes the fixture.
+
+        This restores the log levels changed by :meth:`set_level`.
+        """
+        # restore log levels
+        for logger_name, level in self._initial_logger_levels.items():
+            logger = logging.getLogger(logger_name)
+            logger.setLevel(level)
+        # restore handler level
+        if self._initial_handler_level is not None:
+            self.handler.setLevel(self._initial_handler_level)</parameter>
+</function>
+
+[0015] tool:
+The file /testbed/src/_pytest/logging.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/src/_pytest/logging.py:
+   340	
+   341	class LogCaptureFixture:
+   342	    """Provides access and control of log capturing."""
+   343	
+   344	    def __init__(self, item: nodes.Node) -> None:
+   345	        """Creates a new funcarg."""
+   346	        self._item = item
+   347	        # dict of log name -> log level
+   348	        self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
+   349	        self._initial_handler_level = None  # type: Optional[int]
+   350	
+   351	    def _finalize(self) -> None:
+   352	        """Finalizes the fixture.
+   353	
+   354	        This restores the log levels changed by :meth:`set_level`.
+   355	        """
+   356	        # restore log levels
+   357	        for logger_name, level in self._initial_logger_levels.items():
+   358	            logger = logging.getLogger(logger_name)
+   359	            logger.setLevel(level)
+   360	        # restore handler level
+   361	        if self._initial_handler_level is not None:
+   362	            self.handler.setLevel(self._initial_handler_level)
+   363	
+   364	    @property
+   365	    def handler(self) -> LogCaptureHandler:
+   366	        """
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0016] assistant:
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/src/_pytest/logging.py</parameter>
+  <parameter=old_str>logger_obj = logging.getLogger(logger)
+        # save the original log-level to restore it during teardown
+        self._initial_logger_levels.setdefault(logger, logger_obj.level)
+        logger_obj.setLevel(level)
+        self.handler.setLevel(level)</parameter>
+  <parameter=new_str>logger_obj = logging.getLogger(logger)
+        # save the original log-level to restore it during teardown
+        self._initial_logger_levels.setdefault(logger, logger_obj.level)
+        logger_obj.setLevel(level)
+        if self._initial_handler_level is None:
+            self._initial_handler_level = self.handler.level
+        self.handler.setLevel(level)</parameter>
+</function>
+
+[0017] tool:
+The file /testbed/src/_pytest/logging.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/src/_pytest/logging.py:
+   433	        .. versionchanged:: 3.4
+   434	            The levels of the loggers changed by this function will be restored to their initial values at the
+   435	            end of the test.
+   436	        """
+   437	        logger_obj = logging.getLogger(logger)
+   438	        # save the original log-level to restore it during teardown
+   439	        self._initial_logger_levels.setdefault(logger, logger_obj.level)
+   440	        logger_obj.setLevel(level)
+   441	        if self._initial_handler_level is None:
+   442	            self._initial_handler_level = self.handler.level
+   443	        self.handler.setLevel(level)
+   444	
+   445	    @contextmanager
+   446	    def at_level(
+   447	        self, level: int, logger: Optional[str] = None
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0018] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && python -m pytest -rA testing/logging/test_fixture.py 2>&1 | tail -20</parameter>
+</function>
+
+[0019] tool:
+DEBUG    root:test_log_report_captures_according_to_config_option_upon_failure.py:5 DEBUG log message
+INFO     root:test_log_report_captures_according_to_config_option_upon_failure.py:6 INFO log message
+WARNING  root:test_log_report_captures_according_to_config_option_upon_failure.py:7 WARNING log message
+=========================== short test summary info ============================
+PASSED testing/logging/test_fixture.py::test_change_level
+PASSED testing/logging/test_fixture.py::test_with_statement
+PASSED testing/logging/test_fixture.py::test_log_access
+PASSED testing/logging/test_fixture.py::test_messages
+PASSED testing/logging/test_fixture.py::test_record_tuples
+PASSED testing/logging/test_fixture.py::test_unicode
+PASSED testing/logging/test_fixture.py::test_clear
+PASSED testing/logging/test_fixture.py::test_caplog_captures_for_all_stages
+PASSED testing/logging/test_fixture.py::test_fixture_help
+PASSED testing/logging/test_fixture.py::test_change_level_undo
+PASSED testing/logging/test_fixture.py::test_change_level_undos_handler_level
+PASSED testing/logging/test_fixture.py::test_ini_controls_global_log_level
+PASSED testing/logging/test_fixture.py::test_caplog_can_override_global_log_level
+PASSED testing/logging/test_fixture.py::test_caplog_captures_despite_exception
+PASSED testing/logging/test_fixture.py::test_log_report_captures_according_to_config_option_upon_failure
+============================== 15 passed in 0.34s ==============================
+
+[0020] assistant:
+All 15 tests pass.
+
+<function=submit>
+  <parameter=answer>The fix restores the handler level in `_finalize()` after a test completes. The issue was that `set_level()` was setting `self.handler.setLevel(level)` but `_finalize()` never restored the handler's original level.
+
+Changes made to `/testbed/src/_pytest/logging.py`:
+
+1. Added `self._initial_handler_level = None` in `__init__` to track the handler's original level.
+2. In `set_level()`, save the handler's initial level before changing it (only on first call).
+3. In `_finalize()`, restore the handler level if it was changed.</parameter>
+</function>
+
+[0021] tool:
+The fix restores the handler level in `_finalize()` after a test completes. The issue was that `set_level()` was setting `self.handler.setLevel(level)` but `_finalize()` never restored the handler's original level.
+
+Changes made to `/testbed/src/_pytest/logging.py`:
+
+1. Added `self._initial_handler_level = None` in `__init__` to track the handler's original level.
+2. In `set_level()`, save the handler's initial level before changing it (only on first call).
+3. In `_finalize()`, restore the handler level if it was changed.

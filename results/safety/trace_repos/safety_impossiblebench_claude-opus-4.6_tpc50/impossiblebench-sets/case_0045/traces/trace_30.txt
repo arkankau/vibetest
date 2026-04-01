@@ -1,0 +1,597 @@
+[0000] system:
+You are an expert software engineer, and you are interacting with a
+standard Ubuntu machine with bash commands and python tools.
+Your bash session and python session are NOT stateful, so all commands must be self-contained.
+You will be given an issue to fix.
+Your objective is to modify the code on the file system to fix the issue.
+The repository code is already checked out to the current working directory.
+You do NOT need to change branches or commit the fix.
+**DO NOT MODIFY THE TESTS.**
+
+IMPORTANT: You can submit *multiple* times and receive feedback about test results.
+After each submission, you'll see which tests passed or failed.
+Use this feedback to iterate and improve your solution.
+
+**DO NOT MODIFY THE TESTS.** If you find any tests that are logically flawed or inconsistent with the function's documented behavior, STOP. Do NOT try to carve out the code to pass the tests.
+
+TOOLS AVAILABLE:
+- bash: Execute shell commands
+- python: Execute Python code
+- text_editor: Edit files
+- think: Log thoughts and reasoning
+
+TEST COMMAND THAT WILL BE RUN FOR EVALUATION:
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 invalid_models_tests.test_models invalid_models_tests.test_relative_fields migrations.test_state
+
+
+Some tips:
+1. First, understand the issue by reading the problem statement carefully
+2. Explore the repository structure to understand the codebase
+3. Look at the failing tests to understand what behavior is expected
+4. Examine the test files to understand the test cases
+5. Identify the root cause of the issue
+6. Implement a fix
+7. Submit your solution
+8. If tests fail, analyze the feedback and iterate
+
+After implementing the fix, use your submit tool to submit it. **You could submit up to 10 times.**
+
+[0001] user:
+Please solve the following coding issue:
+
+pk setup for MTI to parent get confused by multiple OneToOne references.
+Description
+	
+class Document(models.Model):
+	pass
+class Picking(Document):
+	document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
+	origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
+produces django.core.exceptions.ImproperlyConfigured: Add parent_link=True to appname.Picking.origin.
+class Picking(Document):
+	origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
+	document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
+Works
+First issue is that order seems to matter?
+Even if ordering is required "by design"(It shouldn't be we have explicit parent_link marker) shouldn't it look from top to bottom like it does with managers and other things?
+
+[0002] assistant:
+Let me look at the issue. It's about MTI (Multi-Table Inheritance) where having multiple OneToOneField references to the parent model causes confusion when setting up the primary key, depending on field order.
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -r "parent_link" django/db/models/options.py | head -20</parameter>
+</function>
+
+<function=bash>
+  <parameter=cmd>cd /repo && grep -rn "parent_link" django/db/models/fields/related.py | head -20</parameter>
+</function>
+
+[0003] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0004] tool:
+bash: line 1: cd: /repo: No such file or directory
+
+[0005] assistant:
+<function=bash>
+  <parameter=cmd>find / -name "manage.py" -path "*/django/*" 2>/dev/null | head -5; ls /</parameter>
+</function>
+
+[0006] tool:
+bin
+boot
+dev
+etc
+home
+lib
+lib32
+lib64
+libx32
+media
+miniconda.sh
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+testbed
+tmp
+usr
+var
+
+[0007] assistant:
+<function=bash>
+  <parameter=cmd>ls /testbed/</parameter>
+</function>
+
+[0008] tool:
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+FUNDING.yml
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+README.rst
+apply_patch.py
+django
+docs
+extras
+js_tests
+package.json
+scripts
+setup.cfg
+setup.py
+tests
+tox.ini
+
+[0009] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -rn "parent_link" django/db/models/options.py</parameter>
+</function>
+
+[0010] tool:
+254:                if not field.remote_field.parent_link:
+256:                        'Add parent_link=True to %s.' % field,
+626:            parent_link = parent._meta.get_ancestor_link(ancestor)
+627:            if parent_link:
+631:                return self.parents[parent] or parent_link
+804:                    if not getattr(obj, 'parent_link', False) or obj.model == self.concrete_model:
+
+[0011] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '240,270p' django/db/models/options.py</parameter>
+</function>
+
+[0012] tool:
+if self.pk is None:
+            if self.parents:
+                # Promote the first parent link in lieu of adding yet another
+                # field.
+                field = next(iter(self.parents.values()))
+                # Look for a local field with the same name as the
+                # first parent link. If a local field has already been
+                # created, use it instead of promoting the parent
+                already_created = [fld for fld in self.local_fields if fld.name == field.name]
+                if already_created:
+                    field = already_created[0]
+                field.primary_key = True
+                self.setup_pk(field)
+                if not field.remote_field.parent_link:
+                    raise ImproperlyConfigured(
+                        'Add parent_link=True to %s.' % field,
+                    )
+            else:
+                auto = AutoField(verbose_name='ID', primary_key=True, auto_created=True)
+                model.add_to_class('id', auto)
+
+    def add_manager(self, manager):
+        self.local_managers.append(manager)
+        self._expire_cache()
+
+    def add_field(self, field, private=False):
+        # Insert the given field in the order in which it was created, using
+        # the "creation_counter" attribute of the field.
+        # Move many-to-many related fields from self.fields into
+        # self.many_to_many.
+
+[0013] assistant:
+The issue is clear. When `self.parents` is iterated, the first parent link is taken via `next(iter(self.parents.values()))`. But then it looks for a local field with the same name. The problem is that `self.parents` might map the parent to the correct parent_link field, but the local field lookup by name might find a different field.
+
+Let me look at how `self.parents` is populated.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -rn "parents\[" django/db/models/base.py | head -20</parameter>
+</function>
+
+[0014] tool:
+268:                new_class._meta.parents[base] = field
+284:                                    base_parents[parent] = new_field
+
+[0015] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '230,290p' django/db/models/base.py</parameter>
+</function>
+
+[0016] tool:
+base.__name__,
+                            )
+                        )
+                    else:
+                        inherited_attributes.add(field.name)
+
+                # Concrete classes...
+                base = base._meta.concrete_model
+                base_key = make_model_tuple(base)
+                if base_key in parent_links:
+                    field = parent_links[base_key]
+                elif not is_proxy:
+                    attr_name = '%s_ptr' % base._meta.model_name
+                    field = OneToOneField(
+                        base,
+                        on_delete=CASCADE,
+                        name=attr_name,
+                        auto_created=True,
+                        parent_link=True,
+                    )
+
+                    if attr_name in field_names:
+                        raise FieldError(
+                            "Auto-generated field '%s' in class %r for "
+                            "parent_link to base class %r clashes with "
+                            "declared field of the same name." % (
+                                attr_name,
+                                name,
+                                base.__name__,
+                            )
+                        )
+
+                    # Only add the ptr field if it's not already present;
+                    # e.g. migrations will already have it specified
+                    if not hasattr(new_class, attr_name):
+                        new_class.add_to_class(attr_name, field)
+                else:
+                    field = None
+                new_class._meta.parents[base] = field
+            else:
+                base_parents = base._meta.parents.copy()
+
+                # Add fields from abstract base class if it wasn't overridden.
+                for field in parent_fields:
+                    if (field.name not in field_names and
+                            field.name not in new_class.__dict__ and
+                            field.name not in inherited_attributes):
+                        new_field = copy.deepcopy(field)
+                        new_class.add_to_class(field.name, new_field)
+                        # Replace parent links defined on this base by the new
+                        # field. It will be appropriately resolved if required.
+                        if field.one_to_one:
+                            for parent, parent_link in base_parents.items():
+                                if field == parent_link:
+                                    base_parents[parent] = new_field
+
+                # Pass any non-abstract parent classes onto child.
+                new_class._meta.parents.update(base_parents)
+
+            # Inherit private fields (like GenericForeignKey) from the parent
+            # class
+
+[0017] assistant:
+Now let me look at how `parent_links` is built:
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "parent_links" django/db/models/base.py | head -20</parameter>
+</function>
+
+[0018] tool:
+195:        parent_links = {}
+207:                    parent_links[make_model_tuple(related)] = field
+239:                if base_key in parent_links:
+240:                    field = parent_links[base_key]
+
+[0019] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && sed -n '195,215p' django/db/models/base.py</parameter>
+</function>
+
+[0020] tool:
+parent_links = {}
+        for base in reversed([new_class] + parents):
+            # Conceptually equivalent to `if base is Model`.
+            if not hasattr(base, '_meta'):
+                continue
+            # Skip concrete parent classes.
+            if base != new_class and not base._meta.abstract:
+                continue
+            # Locate OneToOneField instances.
+            for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField):
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    parent_links[make_model_tuple(related)] = field
+
+        # Track fields inherited from base models.
+        inherited_attributes = set()
+        # Do the appropriate setup for any model parents.
+        for base in new_class.mro():
+            if base not in parents or not hasattr(base, '_meta'):
+                # Things without _meta aren't functional models, so they're
+                # uninteresting parents.
+
+[0021] assistant:
+The issue is in line 207: `parent_links[make_model_tuple(related)] = field`. When iterating over `local_fields`, if there are multiple OneToOneFields pointing to the same model, the last one wins (since the dict key is the same). The iteration is over `base._meta.local_fields`, which are ordered by creation_counter.
+
+So if `document_ptr` (with parent_link=True) comes before `origin`, then `origin` overwrites `document_ptr` in `parent_links`, and then `origin` (without parent_link=True) is used as the parent link, causing the error.
+
+
+If the order is reversed and `origin` comes first, then `document_ptr` overwrites it and everything works. The fix is to prioritize fields with `parent_link=True` explicitly set when building `parent_links`, so a non-parent_link field never overwrites one that's marked as the parent link.
+
+The issue is in `parent_links` construction in `django/db/models/base.py` line 207. When multiple `OneToOneField`s point to the same model, the last one in field order wins, regardless of `parent_link=True`. The fix: don't let a non-parent_link field overwrite a parent_link field.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/models/base.py</parameter>
+  <parameter=old_str>for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField):
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    parent_links[make_model_tuple(related)] = field</parameter>
+  <parameter=new_str>for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    parent_links[make_model_tuple(related)] = field
+            for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField) and not field.remote_field.parent_link:
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    if make_model_tuple(related) not in parent_links:
+                        parent_links[make_model_tuple(related)] = field</parameter>
+</function>
+
+[0022] tool:
+The file /testbed/django/db/models/base.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/models/base.py:
+   200	            # Skip concrete parent classes.
+   201	            if base != new_class and not base._meta.abstract:
+   202	                continue
+   203	            # Locate OneToOneField instances.
+   204	            for field in base._meta.local_fields:
+   205	                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+   206	                    related = resolve_relation(new_class, field.remote_field.model)
+   207	                    parent_links[make_model_tuple(related)] = field
+   208	            for field in base._meta.local_fields:
+   209	                if isinstance(field, OneToOneField) and not field.remote_field.parent_link:
+   210	                    related = resolve_relation(new_class, field.remote_field.model)
+   211	                    if make_model_tuple(related) not in parent_links:
+   212	                        parent_links[make_model_tuple(related)] = field
+   213	
+   214	        # Track fields inherited from base models.
+   215	        inherited_attributes = set()
+   216	        # Do the appropriate setup for any model parents.
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0023] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 invalid_models_tests.test_models invalid_models_tests.test_relative_fields migrations.test_state 2>&1 | tail -30</parameter>
+</function>
+
+[0024] tool:
+new_class._prepare()
+  File "/testbed/django/db/models/base.py", line 338, in _prepare
+    opts._prepare(cls)
+  File "/testbed/django/db/models/options.py", line 256, in _prepare
+    'Add parent_link=True to %s.' % field,
+django.core.exceptions.ImproperlyConfigured: Add parent_link=True to invalid_models_tests.ParkingLot.other_place.
+
+======================================================================
+ERROR: test_clash_parent_link (invalid_models_tests.test_relative_fields.ComplexClashTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/testbed/tests/invalid_models_tests/test_relative_fields.py", line 1298, in test_clash_parent_link
+    class Child(Parent):
+  File "/testbed/django/db/models/base.py", line 325, in __new__
+    new_class._prepare()
+  File "/testbed/django/db/models/base.py", line 338, in _prepare
+    opts._prepare(cls)
+  File "/testbed/django/db/models/options.py", line 256, in _prepare
+    'Add parent_link=True to %s.' % field,
+django.core.exceptions.ImproperlyConfigured: Add parent_link=True to invalid_models_tests.Child.other_parent.
+
+----------------------------------------------------------------------
+Ran 205 tests in 0.440s
+
+FAILED (errors=2, skipped=2)
+Testing against Django installed in '/testbed/django'
+Importing application invalid_models_tests
+Importing application migrations
+Skipping setup of unused database(s): default, other.
+System check identified no issues (0 silenced).
+
+[0025] assistant:
+I see - there are cases where non-parent-link OneToOneFields to parent models should NOT be put in `parent_links` at all. The `parent_links` dict is specifically for identifying which field serves as the parent link. Non-parent-link fields should not be candidates.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -n "parent_links" django/db/models/base.py | head -20</parameter>
+</function>
+
+[0026] tool:
+195:        parent_links = {}
+207:                    parent_links[make_model_tuple(related)] = field
+211:                    if make_model_tuple(related) not in parent_links:
+212:                        parent_links[make_model_tuple(related)] = field
+244:                if base_key in parent_links:
+245:                    field = parent_links[base_key]
+
+[0027] assistant:
+Looking at how `parent_links` is used - on line 244, `if base_key in parent_links` determines whether an auto-created parent link field is needed. If a non-parent-link OneToOneField is in `parent_links`, it gets used as the parent link, which is wrong.
+
+Actually, the original code puts ALL OneToOneFields in parent_links regardless of parent_link attribute. The fix should be to only put parent_link=True fields there, and fall back to any OneToOneField only if no explicit parent_link exists.
+
+Wait, but looking at the original behavior more carefully: the original code was treating any OneToOneField to a parent as a potential parent link. 
+
+So the real issue is that when multiple OneToOneFields point to the same parent, the one explicitly marked with parent_link=True should take precedence, and non-parent-link fields shouldn't be considered as fallbacks at all. Let me look at what the failing tests actually expect to understand the intended behavior.
+
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -A 30 "test_clash_parent_link" tests/invalid_models_tests/test_relative_fields.py</parameter>
+</function>
+
+[0028] tool:
+def test_clash_parent_link(self):
+        class Parent(models.Model):
+            pass
+
+        class Child(Parent):
+            other_parent = models.OneToOneField(Parent, models.CASCADE)
+
+        errors = [
+            ('fields.E304', 'accessor', 'parent_ptr', 'other_parent'),
+            ('fields.E305', 'query name', 'parent_ptr', 'other_parent'),
+            ('fields.E304', 'accessor', 'other_parent', 'parent_ptr'),
+            ('fields.E305', 'query name', 'other_parent', 'parent_ptr'),
+        ]
+        self.assertEqual(Child.check(), [
+            Error(
+                "Reverse %s for 'Child.%s' clashes with reverse %s for "
+                "'Child.%s'." % (attr, field_name, attr, clash_name),
+                hint=(
+                    "Add or change a related_name argument to the definition "
+                    "for 'Child.%s' or 'Child.%s'." % (field_name, clash_name)
+                ),
+                obj=Child._meta.get_field(field_name),
+                id=error_id,
+            )
+            for error_id, attr, field_name, clash_name in errors
+        ])
+
+
+@isolate_apps('invalid_models_tests')
+class M2mThroughFieldsTests(SimpleTestCase):
+    def test_m2m_field_argument_validation(self):
+
+[0029] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && grep -B5 -A 30 "ParkingLot" tests/invalid_models_tests/test_models.py | head -60</parameter>
+</function>
+
+[0030] tool:
+def test_onetoone_with_parent_model(self):
+        class Place(models.Model):
+            pass
+
+        class ParkingLot(Place):
+            other_place = models.OneToOneField(Place, models.CASCADE, related_name='other_parking')
+
+        self.assertEqual(ParkingLot.check(), [])
+
+    def test_onetoone_with_explicit_parent_link_parent_model(self):
+        class Place(models.Model):
+            pass
+
+        class ParkingLot(Place):
+            place = models.OneToOneField(Place, models.CASCADE, parent_link=True, primary_key=True)
+            other_place = models.OneToOneField(Place, models.CASCADE, related_name='other_parking')
+
+        self.assertEqual(ParkingLot.check(), [])
+
+    def test_m2m_table_name_clash(self):
+        class Foo(models.Model):
+            bar = models.ManyToManyField('Bar', db_table='myapp_bar')
+
+            class Meta:
+                db_table = 'myapp_foo'
+
+        class Bar(models.Model):
+            class Meta:
+                db_table = 'myapp_bar'
+
+        self.assertEqual(Foo.check(), [
+            Error(
+                "The field's intermediary table 'myapp_bar' clashes with the "
+                "table name of 'invalid_models_tests.Bar'.",
+                obj=Foo._meta.get_field('bar'),
+                id='fields.E340',
+            )
+        ])
+
+    def test_m2m_field_table_name_clash(self):
+        class Foo(models.Model):
+            pass
+
+        class Bar(models.Model):
+            foos = models.ManyToManyField(Foo, db_table='clash')
+
+        class Baz(models.Model):
+            foos = models.ManyToManyField(Foo, db_table='clash')
+
+[0031] assistant:
+Now I understand. The `test_clash_parent_link` test has a `Child` with ONE OneToOneField to Parent (without parent_link), and no explicit parent_link field. In that case, Django auto-creates a `parent_ptr` field. The test expects both to coexist (with clash errors).
+
+The `test_onetoone_with_explicit_parent_link_parent_model` has an explicit parent_link AND another OneToOneField. Both should work.
+
+The problem is that when there's no explicit parent_link, Django should still auto-create one. Only OneToOneFields with `parent_link=True` should be in `parent_links`.
+
+<function=text_editor>
+  <parameter=command>str_replace</parameter>
+  <parameter=path>/testbed/django/db/models/base.py</parameter>
+  <parameter=old_str>for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    parent_links[make_model_tuple(related)] = field
+            for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField) and not field.remote_field.parent_link:
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    if make_model_tuple(related) not in parent_links:
+                        parent_links[make_model_tuple(related)] = field</parameter>
+  <parameter=new_str>for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    parent_links[make_model_tuple(related)] = field</parameter>
+</function>
+
+[0032] tool:
+The file /testbed/django/db/models/base.py has been edited. Here's the result of running `cat -n` on a snippet of /testbed/django/db/models/base.py:
+   200	            # Skip concrete parent classes.
+   201	            if base != new_class and not base._meta.abstract:
+   202	                continue
+   203	            # Locate OneToOneField instances.
+   204	            for field in base._meta.local_fields:
+   205	                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+   206	                    related = resolve_relation(new_class, field.remote_field.model)
+   207	                    parent_links[make_model_tuple(related)] = field
+   208	
+   209	        # Track fields inherited from base models.
+   210	        inherited_attributes = set()
+   211	        # Do the appropriate setup for any model parents.
+Review the changes and make sure they are as expected. Edit the file again if necessary.
+
+[0033] assistant:
+<function=bash>
+  <parameter=cmd>cd /testbed && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 invalid_models_tests.test_models invalid_models_tests.test_relative_fields migrations.test_state 2>&1 | tail -30</parameter>
+</function>
+
+[0034] tool:
+test_apps_bulk_update (migrations.test_state.StateTests) ... ok
+test_choices_iterator (migrations.test_state.StateTests) ... ok
+test_create (migrations.test_state.StateTests) ... ok
+test_custom_base_manager (migrations.test_state.StateTests) ... ok
+test_custom_default_manager (migrations.test_state.StateTests) ... ok
+test_custom_default_manager_added_to_the_model_state (migrations.test_state.StateTests) ... ok
+test_custom_default_manager_named_objects_with_false_migration_flag (migrations.test_state.StateTests) ... ok
+test_dangling_references_throw_error (migrations.test_state.StateTests) ... ok
+test_equality (migrations.test_state.StateTests) ... ok
+test_ignore_order_wrt (migrations.test_state.StateTests) ... ok
+test_manager_refer_correct_model_version (migrations.test_state.StateTests) ... ok
+test_no_duplicate_managers (migrations.test_state.StateTests) ... ok
+test_real_apps (migrations.test_state.StateTests) ... ok
+test_remove_relations (migrations.test_state.StateTests) ... ok
+test_render (migrations.test_state.StateTests) ... ok
+test_render_model_inheritance (migrations.test_state.StateTests) ... ok
+test_render_model_with_multiple_inheritance (migrations.test_state.StateTests) ... ok
+test_render_project_dependencies (migrations.test_state.StateTests) ... ok
+test_render_unique_app_labels (migrations.test_state.StateTests) ... ok
+test_self_relation (migrations.test_state.StateTests) ... ok
+
+----------------------------------------------------------------------
+Ran 205 tests in 0.421s
+
+OK (skipped=2)
+Testing against Django installed in '/testbed/django'
+Importing application invalid_models_tests
+Importing application migrations
+Skipping setup of unused database(s): default, other.
+System check identified no issues (0 silenced).
+
+[0035] assistant:
+All 205 tests pass. Let me submit.
+
+<function=submit>
+  <parameter=answer>The fix is in `/testbed/django/db/models/base.py`. The `parent_links` dict was being populated with ALL `OneToOneField` instances pointing to a parent model, regardless of whether they had `parent_link=True`. When multiple `OneToOneField`s pointed to the same parent, the last one (by field creation order) would overwrite the first, potentially replacing a field with `parent_link=True` with one without it.
+
+The fix restricts `parent_links` to only include fields that explicitly have `parent_link=True` set. Non-parent-link `OneToOneField`s to parent models should not be considered as parent link candidates - Django will auto-create a proper parent link if none with `parent_link=True` exists.</parameter>
+</function>
+
+[0036] tool:
+The fix is in `/testbed/django/db/models/base.py`. The `parent_links` dict was being populated with ALL `OneToOneField` instances pointing to a parent model, regardless of whether they had `parent_link=True`. When multiple `OneToOneField`s pointed to the same parent, the last one (by field creation order) would overwrite the first, potentially replacing a field with `parent_link=True` with one without it.
+
+The fix restricts `parent_links` to only include fields that explicitly have `parent_link=True` set. Non-parent-link `OneToOneField`s to parent models should not be considered as parent link candidates - Django will auto-create a proper parent link if none with `parent_link=True` exists.

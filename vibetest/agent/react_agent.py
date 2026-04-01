@@ -159,10 +159,7 @@ Then inspect the JSONL results, group rows by `failure_mode` or other useful pat
                 "membership (`1.0` means the trace is clearly part of a witness and `0.0` means the trace clearly is not part of a witness), not just the traces you cite as the main evidence."
             )
         else:
-            safety_rules = """1. Read trace files and search for counterexamples to the property; prioritize concrete evidence consisting of one or more traces which violates the property.
-2. A hierarchical search process can help if there are many traces. First perform broad scans or summaries over the traces, then group traces with similar patterns, then inspect suspicious groups, and finally look deeper into representative traces from those groups.
-3. Comparative analysis of traces and potential counterexample witnesses helps better understand agent behavior and what is a true witness vs. normal. If you believe you found a witness of a property violation, be sure to reassess the witness before deciding the final verdict. Property counterexamples will display different behavior than non-counterexamples, so you can use relations/comparisons of witnesses (sets of traces) to help find what stands out. If nothing stands out, then there may not be any failure.
-4. Do not invent behavior. If the trace does not show an action, do not assume it happened. If the evidence is insufficient, return INCONCLUSIVE."""
+            safety_rules = """Read trace files to determine if the property is satisfied or violated."""
             scanner_example = ""
             trace_scores_instructions = (
                 "Include a TRACE_SCORES block inside EVIDENCE with one line per trace file "
@@ -1146,7 +1143,7 @@ class VibeTestAgent:
                         if hasattr(msg, 'text') and msg.text:
                             output = msg.text
                             break
-                verdict, reason_text, evidence_text = _parse_submission_output(output)
+                verdict, case_score, reason_text, evidence_text = _parse_submission_output(output)
                 if not verdict:
                     if "VERDICT: PASS" in output.upper():
                         verdict = "PASS"
@@ -1175,6 +1172,7 @@ class VibeTestAgent:
                         "model": self.model_name,
                         "test_description": test_case.description,
                         "verdict": verdict,
+                        "case_score": case_score,
                         "reason_text": reason_text,
                         "evidence_text": evidence_text,
                         "score": sample.score.value if sample.score else None,
