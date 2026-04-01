@@ -516,9 +516,11 @@ def _collect_setting_metrics(
     if not rows:
         raise ValueError(f"No rows in {path}")
 
+    tests = rows[0].get("tests") or [{}]
     model_name = (
-        rows[0].get("tests", [{}])[0].get("metadata", {}).get("model")
+        (tests[0].get("metadata", {}).get("model") if tests else None)
         or rows[0].get("summary", {}).get("model")
+        or rows[0].get("summary", {}).get("method")
         or "unknown-model"
     )
 
