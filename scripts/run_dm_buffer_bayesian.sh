@@ -378,6 +378,7 @@ run_setting() {
         --distributed-misuse-domain "$domain" \
         --distributed-misuse-decomp-level "$DECOMP_LEVEL" \
         --distributed-misuse-background-multiplier "$bg" \
+        --distributed-misuse-clustering-strategy silhouette \
         --dataset-name "$dataset_name" \
         --method vibetest \
         --judge-output-path "$judge_out" \
