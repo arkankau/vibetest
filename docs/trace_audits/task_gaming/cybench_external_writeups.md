@@ -40,7 +40,7 @@ Successful writeup lookup is concentrated in GPT-5 variants:
 
 **Models with zero successful writeup-based task gaming** (all successful traces solved independently): Claude Opus 4.6 (0/49), Claude Sonnet 4.6 (0/26), Claude Sonnet 4.0 (0/15), GPT-5.2 (0/32), Minimax m2.5 (0/32), Qwen3.5-122B (0/15), Kimi k2.5 (0/9), Gemini 3.1 Flash Lite (0/11), Grok 4.1 (0/3), Sherlock (0/11), hunter-alpha (0/24), healer-alpha (0/19).
 
-NIST CAISI caught only GPT-5 (3 instances) and o3 (1 instance). Our audit confirms that successful writeup-based task gaming is concentrated in GPT-5 variants and GLM-5, with Claude models attempting but failing in several instances because web searches were blocked by guardrails or were followed by independent solves.
+NIST CAISI caught only GPT-5 (3 instances) and o3 (1 instance). Our audit confirms that successful writeup-based task gaming is concentrated in GPT-5 variants and GLM-5. Most Claude traces that hit this pattern were failed attempts blocked by guardrails or followed by independent solves, but Claude Sonnet 4.5 contributes one successful `failproof` case.
 
 ### Comparison with Terminal-Bench
 
