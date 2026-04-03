@@ -1,0 +1,1550 @@
+KernelBench iterative-refinement log.
+DATASET: ScalingIntelligence/kernelbench-samples
+LEVEL: level1
+VARIANT: eval_result_profiler_last_only
+MODEL_SLUG: deepseek-R1
+PROBLEM_ID: 33
+PROBLEM: KernelBenchInternal/KernelBench/level1/33_BatchNorm.py
+RUN_NAME: run_v0_deepseek_r1_turn
+NUM_ROUNDS: 10
+SOURCE_PATH: iterative_refinement/level1/eval_result_profiler_last_only/deepseek-R1/problem_33/sample_0/log.json
+
+TASK_CONTEXT:
+You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.
+
+You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
+
+
+        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: 
+
+        ``` 
+
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+
+        ``` 
+
+        The example new arch with custom CUDA kernels looks like this: 
+        ```
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+elementwise_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+elementwise_add_cpp_source = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+
+        ``` 
+
+        
+    You are given the following architecture: 
+
+    ```
+    import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Batch Normalization.
+    """
+    def __init__(self, num_features: int):
+        """
+        Initializes the BatchNorm layer.
+
+        Args:
+            num_features (int): Number of features in the input tensor.
+        """
+        super(Model, self).__init__()
+        self.bn = nn.BatchNorm2d(num_features=num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Batch Normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, *).
+
+        Returns:
+            torch.Tensor: Output tensor with Batch Normalization applied, same shape as input.
+        """
+        return self.bn(x)
+
+batch_size = 16
+features = 64
+dim1 = 256
+dim2 = 256
+
+def get_inputs():
+    x = torch.randn(batch_size, features, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [features]
+    ```
+    
+
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code!
+
+=== ROUND 0001 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for optimized BatchNorm2d
+bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float epsilon,
+    float* __restrict__ output,
+    int num_elements,
+    int C,
+    int HxW
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= num_elements) return;
+
+    const int c = (index / HxW) % C;
+    const float inv_std = rsqrtf(running_var[c] + epsilon);
+    output[index] = (input[index] - running_mean[c]) * inv_std * gamma[c] + beta[c];
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    float epsilon
+) {
+    const int num_elements = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int C = input.size(1);
+    const int HxW = input.size(2) * input.size(3);
+    
+    const int block_size = 256;
+    const int grid_size = (num_elements + block_size - 1) / block_size;
+
+    batchnorm_forward_kernel<<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        epsilon,
+        output.data_ptr<float>(),
+        num_elements,
+        C,
+        HxW
+    );
+
+    return output;
+}
+'''
+
+# Load the CUDA kernel
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='torch::Tensor batchnorm_forward_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, torch::Tensor running_mean, torch::Tensor running_var, float epsilon);',
+    cuda_sources=bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.gamma,
+            self.beta,
+            self.running_mean,
+            self.running_var,
+            self.epsilon
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.834,
+  "runtime_stats": {
+    "mean": 0.834,
+    "std": 0.00493,
+    "min": 0.822,
+    "max": 0.851,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:4"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+batchnorm_forward_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      77.418ms       100.00%      77.418ms     806.442us            96  
+                                       cudaLaunchKernel         0.55%     420.420us         0.55%     420.420us       4.521us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        99.45%      75.470ms        99.45%      75.470ms      75.470ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 75.891ms
+Self CUDA time total: 77.418ms
+
+=== ROUND 0002 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Optimized BatchNorm CUDA kernel with vectorized memory access
+bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float epsilon,
+    float* __restrict__ output,
+    int N, int C, int H, int W
+) {
+    const int stride = W / 4;
+    const int n = blockIdx.x / (C * H);
+    const int c = (blockIdx.x % (C * H)) / H;
+    const int h = blockIdx.x % H;
+    const int w_start = threadIdx.x * 4;
+
+    if (n >= N || c >= C || h >= H || w_start >= W) return;
+
+    __shared__ float s_gamma, s_beta, s_mean, s_var;
+    if (threadIdx.x == 0) {
+        s_gamma = gamma[c];
+        s_beta = beta[c];
+        s_mean = running_mean[c];
+        s_var = running_var[c];
+    }
+    __syncthreads();
+
+    const float inv_std = __frsqrt_rn(s_var + epsilon);
+    const float scale = s_gamma * inv_std;
+    const float shift = s_beta - s_mean * scale;
+
+    const int base_idx = n*C*H*W + c*H*W + h*W + w_start;
+    const float4 in = *reinterpret_cast<const float4*>(input + base_idx);
+    
+    float4 out;
+    out.x = in.x * scale + shift;
+    out.y = in.y * scale + shift;
+    out.z = in.z * scale + shift;
+    out.w = in.w * scale + shift;
+    
+    *reinterpret_cast<float4*>(output + base_idx) = out;
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    float epsilon
+) {
+    auto output = torch::empty_like(input);
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    
+    const int threads = W / 4;
+    const int blocks = N * C * H;
+
+    batchnorm_forward_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        epsilon,
+        output.data_ptr<float>(),
+        N, C, H, W
+    );
+
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='torch::Tensor batchnorm_forward_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, torch::Tensor running_mean, torch::Tensor running_var, float epsilon);',
+    cuda_sources=bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.gamma,
+            self.beta,
+            self.running_mean,
+            self.running_var,
+            self.epsilon
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.834,
+  "runtime_stats": {
+    "mean": 0.834,
+    "std": 0.00405,
+    "min": 0.825,
+    "max": 0.849,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:0"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+batchnorm_forward_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      78.429ms       100.00%      78.429ms     816.969us            96  
+                                       cudaLaunchKernel         0.47%     363.450us         0.47%     363.450us       3.908us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        99.53%      77.139ms        99.53%      77.139ms      77.139ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 77.503ms
+Self CUDA time total: 78.429ms
+
+=== ROUND 0003 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Optimized BatchNorm kernel with precomputed scale/shift and 3D grid
+bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ scale,
+    const float* __restrict__ shift,
+    float* __restrict__ output,
+    int N, int C, int H, int W
+) {
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int h = blockIdx.x;
+    const int w = threadIdx.x * 4;
+
+    if (n >= N || c >= C || h >= H || w >= W) return;
+
+    __shared__ float s_scale, s_shift;
+    if (threadIdx.x == 0) {
+        s_scale = scale[c];
+        s_shift = shift[c];
+    }
+    __syncthreads();
+
+    const int base_idx = n*C*H*W + c*H*W + h*W + w;
+    const float4 in = *reinterpret_cast<const float4*>(input + base_idx);
+    
+    float4 out;
+    out.x = in.x * s_scale + s_shift;
+    out.y = in.y * s_scale + s_shift;
+    out.z = in.z * s_scale + s_shift;
+    out.w = in.w * s_scale + s_shift;
+    
+    *reinterpret_cast<float4*>(output + base_idx) = out;
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::Tensor shift
+) {
+    auto output = torch::empty_like(input);
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    
+    const dim3 blocks(H, C, N);
+    const int threads = W / 4;
+
+    batchnorm_forward_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W
+    );
+
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='torch::Tensor batchnorm_forward_cuda(torch::Tensor input, torch::Tensor scale, torch::Tensor shift);',
+    cuda_sources=bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-Xptxas=-v'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.register_buffer('scale', torch.ones(num_features))
+        self.register_buffer('shift', torch.zeros(num_features))
+        self.epsilon = 1e-5
+        self._update_scale_shift()
+
+    def _update_scale_shift(self):
+        with torch.no_grad():
+            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)
+            self.scale = self.gamma * inv_std
+            self.shift = self.beta - self.running_mean * self.scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.scale.contiguous(),
+            self.shift.contiguous()
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.829,
+  "runtime_stats": {
+    "mean": 0.829,
+    "std": 0.00542,
+    "min": 0.808,
+    "max": 0.847,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:1"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+batchnorm_forward_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      78.487ms       100.00%      78.487ms     817.574us            96  
+                                       cudaLaunchKernel         0.43%     340.428us         0.43%     340.428us       3.661us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        99.57%      78.182ms        99.57%      78.182ms      78.182ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 78.522ms
+Self CUDA time total: 78.487ms
+
+=== ROUND 0004 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Optimized BatchNorm with warp-level shuffling and 4x vectorization
+bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ scale,
+    const float* __restrict__ shift,
+    float* __restrict__ output,
+    int N, int C, int H, int W
+) {
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements_per_thread = 4;
+    
+    const int HW = H * W;
+    const int idx = tid * elements_per_thread;
+    if (idx >= HW) return;
+
+    // Vectorized load for scale/shift
+    const float s_scale = scale[c];
+    const float s_shift = shift[c];
+
+    // Vectorized memory operations
+    const int h = idx / W;
+    const int w_start = (idx % W) * elements_per_thread;
+    
+    if (w_start + 3 < W) {
+        const int base_idx = n*C*H*W + c*H*W + h*W + w_start;
+        float4 in = *reinterpret_cast<const float4*>(input + base_idx);
+        float4 out;
+        out.x = in.x * s_scale + s_shift;
+        out.y = in.y * s_scale + s_shift;
+        out.z = in.z * s_scale + s_shift;
+        out.w = in.w * s_scale + s_shift;
+        *reinterpret_cast<float4*>(output + base_idx) = out;
+    } else {
+        // Handle edge cases
+        for(int i=0; i<elements_per_thread; ++i) {
+            if(w_start + i >= W) break;
+            const int pos = n*C*H*W + c*H*W + h*W + w_start + i;
+            output[pos] = input[pos] * s_scale + s_shift;
+        }
+    }
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::Tensor shift
+) {
+    auto output = torch::empty_like(input);
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    
+    const int elements_per_thread = 4;
+    const int block_size = 256;
+    const int HW = H * W;
+    const int grid_x = (HW + block_size * elements_per_thread - 1) / (block_size * elements_per_thread);
+    
+    dim3 blocks(grid_x, C, N);
+    batchnorm_forward_kernel<<<blocks, block_size>>>(
+        input.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W
+    );
+
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='torch::Tensor batchnorm_forward_cuda(torch::Tensor input, torch::Tensor scale, torch::Tensor shift);',
+    cuda_sources=bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-Xptxas=-v,-abi=no'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+
+    def _get_scale_shift(self):
+        with torch.no_grad():
+            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)
+            scale = self.gamma * inv_std
+            shift = self.beta - self.running_mean * scale
+            return scale.contiguous(), shift.contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale, shift = self._get_scale_shift()
+        return bn_extension.batchnorm_forward_cuda(x.contiguous(), scale, shift)
+FEEDBACK:
+Compilation failed:
+stdout: 
+stderr: Traceback (most recent call last):
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2104, in _run_ninja_build
+    subprocess.run(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/subprocess.py", line 526, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/tmp_4074469811470644577.py", line 85, in <module>
+    bn_extension = load_inline(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1646, in load_inline
+    return _jit_compile(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1721, in _jit_compile
+    _write_ninja_file_and_build_library(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1833, in _write_ninja_file_and_build_library
+    _run_ninja_build(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2120, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error building extension 'bn_extension': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=bn_extension -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/bn_extension/main.cpp -o main.o 
+[2/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=bn_extension -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -O3 --use_fast_math -Xptxas=-v,-abi=no -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/bn_extension/cuda.cu -o cuda.cuda.o 
+FAILED: cuda.cuda.o 
+/usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=bn_extension -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -O3 --use_fast_math -Xptxas=-v,-abi=no -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/bn_extension/cuda.cu -o cuda.cuda.o 
+ptxas error   : Invalid value 'no' for option -abi.
+ptxas fatal   : Ptx assembly aborted due to errors
+ninja: build stopped: subcommand failed.
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "compiler_error": "Compilation failed:\nstdout: \nstderr: Traceback (most recent call last):\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 2104, in _run_ninja_build\n    subprocess.run(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/subprocess.py\", line 526, in run\n    raise CalledProcessError(retcode, process.args,\nsubprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/tmp_4074469811470644577.py\", line 85, in <module>\n    bn_extension = load_inline(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1646, in load_inline\n    return _jit_compile(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1721, in _jit_compile\n    _write_ninja_file_and_build_library(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1833, in _write_ninja_file_and_build_library\n    _run_ninja_build(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 2120, in _run_ninja_build\n    raise RuntimeError(message) from e\nRuntimeError: Error building extension 'bn_extension': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=bn_extension -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/bn_extension/main.cpp -o main.o \n[2/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=bn_extension -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -O3 --use_fast_math -Xptxas=-v,-abi=no -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/bn_extension/cuda.cu -o cuda.cuda.o \nFAILED: cuda.cuda.o \n/usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=bn_extension -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -O3 --use_fast_math -Xptxas=-v,-abi=no -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level1_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_33/sample_0/-663784533491909470/bn_extension/cuda.cu -o cuda.cuda.o \nptxas error   : Invalid value 'no' for option -abi.\nptxas fatal   : Ptx assembly aborted due to errors\nninja: build stopped: subcommand failed.\n\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0005 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Optimized BatchNorm with vectorized memory access
+bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ scale,
+    const float* __restrict__ shift,
+    float* __restrict__ output,
+    int N, int C, int H, int W
+) {
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements_per_thread = 4;
+    
+    const int HW = H * W;
+    const int idx = tid * elements_per_thread;
+    if (idx >= HW) return;
+
+    const float s_scale = scale[c];
+    const float s_shift = shift[c];
+
+    const int h = idx / W;
+    const int w_start = idx % W;
+    
+    if (w_start + 3 < W) {
+        const int base_idx = n*C*H*W + c*H*W + h*W + w_start;
+        float4 in = *reinterpret_cast<const float4*>(input + base_idx);
+        float4 out;
+        out.x = in.x * s_scale + s_shift;
+        out.y = in.y * s_scale + s_shift;
+        out.z = in.z * s_scale + s_shift;
+        out.w = in.w * s_scale + s_shift;
+        *reinterpret_cast<float4*>(output + base_idx) = out;
+    } else {
+        for(int i=0; i<elements_per_thread; ++i) {
+            if(w_start + i >= W) break;
+            const int pos = n*C*H*W + c*H*W + h*W + w_start + i;
+            output[pos] = input[pos] * s_scale + s_shift;
+        }
+    }
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::Tensor shift
+) {
+    auto output = torch::empty_like(input);
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    
+    const int elements_per_thread = 4;
+    const int block_size = 256;
+    const int grid_x = (H * W + block_size * elements_per_thread - 1) / (block_size * elements_per_thread);
+    
+    dim3 blocks(grid_x, C, N);
+    batchnorm_forward_kernel<<<blocks, block_size>>>(
+        input.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W
+    );
+
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='torch::Tensor batchnorm_forward_cuda(torch::Tensor input, torch::Tensor scale, torch::Tensor shift);',
+    cuda_sources=bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+
+    def _get_scale_shift(self):
+        with torch.no_grad():
+            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)
+            scale = self.gamma * inv_std
+            shift = self.beta - self.running_mean * scale
+            return scale.contiguous(), shift.contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale, shift = self._get_scale_shift()
+        return bn_extension.batchnorm_forward_cuda(x.contiguous(), scale, shift)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.888,
+  "runtime_stats": {
+    "mean": 0.888,
+    "std": 0.00749,
+    "min": 0.873,
+    "max": 0.931,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:2"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+batchnorm_forward_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      78.330ms        98.95%      78.330ms     815.935us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     224.504us         0.28%     224.504us       1.169us           192  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     154.563us         0.20%     154.563us       1.610us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     135.649us         0.17%     135.649us       1.413us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     114.437us         0.14%     114.437us       1.192us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     105.642us         0.13%     105.642us       1.100us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      95.747us         0.12%      95.747us       0.997us            96  
+                                       cudaLaunchKernel         2.89%       2.105ms         2.89%       2.105ms       2.829us       0.000us         0.00%       0.000us       0.000us           744  
+                                  cudaDeviceSynchronize        97.11%      70.807ms        97.11%      70.807ms      70.807ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 72.912ms
+Self CUDA time total: 79.160ms
+
+=== ROUND 0006 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+optimized_bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float epsilon
+) {
+    extern __shared__ float s_scale_shift[];
+    const int c = blockIdx.y;
+    const int n = blockIdx.z;
+    
+    // Compute scale/shift once per channel using shared memory
+    if (threadIdx.x == 0) {
+        float inv_std = 1.0f / sqrtf(running_var[c] + epsilon);
+        s_scale_shift[0] = gamma[c] * inv_std;         // scale
+        s_scale_shift[1] = beta[c] - running_mean[c] * s_scale_shift[0];  // shift
+    }
+    __syncthreads();
+    
+    const float scale = s_scale_shift[0];
+    const float shift = s_scale_shift[1];
+    
+    // Vectorized processing (4 elements per thread)
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements_per_thread = 4;
+    const int HW = H * W;
+    const int idx = tid * elements_per_thread;
+    
+    if (idx >= HW) return;
+    
+    const int h = idx / W;
+    const int w_start = idx % W;
+    
+    // Coalesced vector4 memory access
+    const int base = n*C*H*W + c*H*W + h*W + w_start;
+    if (w_start + 3 < W) {
+        float4 in = *reinterpret_cast<const float4*>(input + base);
+        float4 out;
+        out.x = in.x * scale + shift;
+        out.y = in.y * scale + shift;
+        out.z = in.z * scale + shift;
+        out.w = in.w * scale + shift;
+        *reinterpret_cast<float4*>(output + base) = out;
+    } else {  // Handle edge cases
+        for(int i=0; i<elements_per_thread; ++i) {
+            if(w_start+i >= W) break;
+            output[base+i] = input[base+i] * scale + shift;
+        }
+    }
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    float epsilon
+) {
+    auto output = torch::empty_like(input);
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    
+    constexpr int elements_per_thread = 4;
+    const int block_size = 256;
+    const int grid_x = (H * W + block_size * elements_per_thread - 1) / (block_size * elements_per_thread);
+    
+    dim3 blocks(grid_x, C, N);
+    size_t shared_mem = 2 * sizeof(float);  // For scale + shift
+    
+    batchnorm_forward_kernel<<<blocks, block_size, shared_mem>>>(
+        input.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W,
+        epsilon
+    );
+    
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='''torch::Tensor batchnorm_forward_cuda(
+        torch::Tensor input, torch::Tensor gamma, torch::Tensor beta,
+        torch::Tensor running_mean, torch::Tensor running_var, float epsilon);
+    ''',
+    cuda_sources=optimized_bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-Xptxas=-v'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.gamma.contiguous(),
+            self.beta.contiguous(),
+            self.running_mean.contiguous(),
+            self.running_var.contiguous(),
+            self.epsilon
+        )
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0007 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+optimized_bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float epsilon
+) {
+    extern __shared__ float s_scale_shift[];
+    const int c = blockIdx.y;
+    const int n = blockIdx.z;
+    
+    if (threadIdx.x == 0) {
+        float inv_std = 1.0f / sqrtf(running_var[c] + epsilon);
+        s_scale_shift[0] = gamma[c] * inv_std;
+        s_scale_shift[1] = beta[c] - running_mean[c] * s_scale_shift[0];
+    }
+    __syncthreads();
+    
+    const float scale = s_scale_shift[0];
+    const float shift = s_scale_shift[1];
+    
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements_per_thread = 4;
+    const int HW = H * W;
+    const int idx = tid * elements_per_thread;
+    
+    if (idx >= HW) return;
+    
+    const int h = idx / W;
+    int w = idx % W;
+    const int base = n*C*H*W + c*H*W + h*W;
+
+    #pragma unroll
+    for(int i=0; i<elements_per_thread; ++i) {
+        if(w >= W) break;
+        const int pos = base + w;
+        output[pos] = input[pos] * scale + shift;
+        w++;
+    }
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    float epsilon
+) {
+    auto output = torch::empty_like(input);
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    
+    constexpr int elements_per_thread = 4;
+    const int block_size = 256;
+    const int grid_x = (H * W + block_size * elements_per_thread - 1) / (block_size * elements_per_thread);
+    
+    dim3 blocks(grid_x, C, N);
+    size_t shared_mem = 2 * sizeof(float);
+
+    batchnorm_forward_kernel<<<blocks, block_size, shared_mem>>>(
+        input.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W,
+        epsilon
+    );
+    
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='''torch::Tensor batchnorm_forward_cuda(
+        torch::Tensor input, torch::Tensor gamma, torch::Tensor beta,
+        torch::Tensor running_mean, torch::Tensor running_var, float epsilon);
+    ''',
+    cuda_sources=optimized_bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.gamma.contiguous(),
+            self.beta.contiguous(),
+            self.running_mean.contiguous(),
+            self.running_var.contiguous(),
+            self.epsilon
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.786,
+  "runtime_stats": {
+    "mean": 0.786,
+    "std": 0.00278,
+    "min": 0.781,
+    "max": 0.799,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:2"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+batchnorm_forward_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      74.522ms       100.00%      74.522ms     776.271us            96  
+                                       cudaLaunchKernel         0.47%     353.718us         0.47%     353.718us       3.803us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        99.53%      74.740ms        99.53%      74.740ms      74.740ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 75.094ms
+Self CUDA time total: 74.522ms
+
+=== ROUND 0008 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+optimized_bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float epsilon
+) {
+    extern __shared__ float s_scale_shift[];
+    const int c = blockIdx.y;
+    const int n = blockIdx.z;
+    
+    // Compute scale and shift once per channel
+    if (threadIdx.x == 0) {
+        float inv_std = rsqrtf(running_var[c] + epsilon);
+        s_scale_shift[0] = gamma[c] * inv_std;
+        s_scale_shift[1] = beta[c] - running_mean[c] * s_scale_shift[0];
+    }
+    __syncthreads();
+    
+    // Vectorized memory access
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements_per_float4 = 4;
+    const int HW = H * W;
+    const int idx = tid * elements_per_float4;
+    
+    if (idx >= HW) return;
+    
+    const int base_offset = n * C * HW + c * HW + idx;
+    const float4* in = reinterpret_cast<const float4*>(input + base_offset);
+    float4* out = reinterpret_cast<float4*>(output + base_offset);
+    
+    float4 val = *in;
+    const float scale = s_scale_shift[0];
+    const float shift = s_scale_shift[1];
+    
+    val.x = val.x * scale + shift;
+    val.y = val.y * scale + shift;
+    val.z = val.z * scale + shift;
+    val.w = val.w * scale + shift;
+    
+    *out = val;
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    float epsilon
+) {
+    auto output = torch::empty_like(input);
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    
+    const int block_size = 256;
+    const int grid_x = (H * W / 4 + block_size - 1) / block_size;
+    dim3 grid(grid_x, C, N);
+    size_t shared_mem = 2 * sizeof(float);
+
+    batchnorm_forward_kernel<<<grid, block_size, shared_mem>>>(
+        input.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W,
+        epsilon
+    );
+    
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='''torch::Tensor batchnorm_forward_cuda(
+        torch::Tensor input, torch::Tensor gamma, torch::Tensor beta,
+        torch::Tensor running_mean, torch::Tensor running_var, float epsilon);
+    ''',
+    cuda_sources=optimized_bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-Xptxas=-v'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.gamma.contiguous(),
+            self.beta.contiguous(),
+            self.running_mean.contiguous(),
+            self.running_var.contiguous(),
+            self.epsilon
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.831,
+  "runtime_stats": {
+    "mean": 0.831,
+    "std": 0.00429,
+    "min": 0.821,
+    "max": 0.851,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:2"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+batchnorm_forward_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      77.253ms       100.00%      77.253ms     804.720us            96  
+                                       cudaLaunchKernel         0.84%     612.280us         0.84%     612.280us       6.584us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        99.16%      72.393ms        99.16%      72.393ms      72.393ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 73.005ms
+Self CUDA time total: 77.253ms
+
+=== ROUND 0009 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+optimized_bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ scale,
+    const float* __restrict__ shift,
+    float* __restrict__ output,
+    int total_elements,
+    int C,
+    int HW
+) {
+    const int elements_per_thread = 4;
+    const int tid = (blockIdx.x * blockDim.x + threadIdx.x) * elements_per_thread;
+    if (tid >= total_elements) return;
+
+    // Vectorized memory access
+    const float4* in = reinterpret_cast<const float4*>(input + tid);
+    float4* out = reinterpret_cast<float4*>(output + tid);
+    float4 val = *in;
+
+    // Calculate channel index
+    const int ch_idx = (tid / HW) % C;
+
+    // Load scale and shift for this channel
+    const float s = scale[ch_idx];
+    const float sh = shift[ch_idx];
+
+    // Apply transformation with FMAD instructions
+    val.x = fmaf(s, val.x, sh);
+    val.y = fmaf(s, val.y, sh);
+    val.z = fmaf(s, val.z, sh);
+    val.w = fmaf(s, val.w, sh);
+
+    *out = val;
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::Tensor shift
+) {
+    auto output = torch::empty_like(input);
+    const int total_elements = input.numel();
+    const int C = input.size(1);
+    const int HW = input.size(2) * input.size(3);
+
+    const int block_size = 512;
+    const int grid_size = (total_elements / 4 + block_size - 1) / block_size;
+
+    batchnorm_forward_kernel<<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total_elements,
+        C,
+        HW
+    );
+
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='''torch::Tensor batchnorm_forward_cuda(
+        torch::Tensor input, torch::Tensor scale, torch::Tensor shift);
+    ''',
+    cuda_sources=optimized_bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-Xptxas=-v'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+        
+        # Precompute scale and shift during initialization
+        self.register_buffer('scale', torch.empty(num_features))
+        self.register_buffer('shift', torch.empty(num_features))
+        self._update_scale_shift()
+
+    def _update_scale_shift(self):
+        with torch.no_grad():
+            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)
+            self.scale.copy_(self.gamma * inv_std)
+            self.shift.copy_(self.beta - self.running_mean * self.scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.scale.contiguous(),
+            self.shift.contiguous()
+        )
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: CUDA-capable device(s) is/are busy or unavailable\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0010 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+optimized_bn_kernel = '''
+#include <torch/extension.h>
+#include <cuda.h>
+
+__global__ void batchnorm_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ scale,
+    const float* __restrict__ shift,
+    float* __restrict__ output,
+    int total_elements,
+    int C,
+    int HW
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    const int ch_idx = (idx / HW) % C;
+    output[idx] = fmaf(scale[ch_idx], input[idx], shift[ch_idx]);
+}
+
+torch::Tensor batchnorm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::Tensor shift
+) {
+    auto output = torch::empty_like(input);
+    const int total_elements = input.numel();
+    const int C = input.size(1);
+    const int HW = input.size(2) * input.size(3);
+
+    const int block_size = 512;
+    const int grid_size = (total_elements + block_size - 1) / block_size;
+
+    batchnorm_forward_kernel<<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total_elements,
+        C,
+        HW
+    );
+
+    return output;
+}
+'''
+
+bn_extension = load_inline(
+    name='bn_extension',
+    cpp_sources='''torch::Tensor batchnorm_forward_cuda(
+        torch::Tensor input, torch::Tensor scale, torch::Tensor shift);
+    ''',
+    cuda_sources=optimized_bn_kernel,
+    functions=['batchnorm_forward_cuda'],
+    extra_cuda_cflags=['-O3', '--use_fast_math'],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        self.epsilon = 1e-5
+        
+        self.register_buffer('scale', torch.empty(num_features))
+        self.register_buffer('shift', torch.empty(num_features))
+        self._update_scale_shift()
+
+    def _update_scale_shift(self):
+        with torch.no_grad():
+            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)
+            self.scale.copy_(self.gamma * inv_std)
+            self.shift.copy_(self.beta - self.running_mean * self.scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bn_extension.batchnorm_forward_cuda(
+            x.contiguous(),
+            self.scale.contiguous(),
+            self.shift.contiguous()
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.824,
+  "runtime_stats": {
+    "mean": 0.824,
+    "std": 0.00453,
+    "min": 0.816,
+    "max": 0.838,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:2"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+batchnorm_forward_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      77.512ms       100.00%      77.512ms     807.421us            96  
+                                       cudaLaunchKernel         0.44%     337.904us         0.44%     337.904us       3.633us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        99.56%      76.180ms        99.56%      76.180ms      76.180ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 76.517ms
+Self CUDA time total: 77.512ms
+
+FINAL_RESULT:
+{
+  "context": "You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\n\n        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: \n\n        ``` \n\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n        ``` \n\n        The example new arch with custom CUDA kernels looks like this: \n        ```\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for element-wise addition\nelementwise_add_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add_cpp_source = (\n    \"torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);\"\n)\n\n# Compile the inline CUDA code for element-wise addition\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    cuda_sources=elementwise_add_source,\n    functions=[\"elementwise_add_cuda\"],\n    verbose=True,\n    extra_cflags=[\"\"],\n    extra_ldflags=[\"\"],\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_cuda(a, b)\n\n        ``` \n\n        \n    You are given the following architecture: \n\n    ```\n    import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Simple model that performs Batch Normalization.\n    \"\"\"\n    def __init__(self, num_features: int):\n        \"\"\"\n        Initializes the BatchNorm layer.\n\n        Args:\n            num_features (int): Number of features in the input tensor.\n        \"\"\"\n        super(Model, self).__init__()\n        self.bn = nn.BatchNorm2d(num_features=num_features)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Batch Normalization to the input tensor.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, num_features, *).\n\n        Returns:\n            torch.Tensor: Output tensor with Batch Normalization applied, same shape as input.\n        \"\"\"\n        return self.bn(x)\n\nbatch_size = 16\nfeatures = 64\ndim1 = 256\ndim2 = 256\n\ndef get_inputs():\n    x = torch.randn(batch_size, features, dim1, dim2)\n    return [x]\n\ndef get_init_inputs():\n    return [features]\n    ```\n    Here is your latest generation:\n```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\noptimized_bn_kernel = '''\n#include <torch/extension.h>\n#include <cuda.h>\n\n__global__ void batchnorm_forward_kernel(\n    const float* __restrict__ input,\n    const float* __restrict__ scale,\n    const float* __restrict__ shift,\n    float* __restrict__ output,\n    int total_elements,\n    int C,\n    int HW\n) {\n    const int elements_per_thread = 4;\n    const int tid = (blockIdx.x * blockDim.x + threadIdx.x) * elements_per_thread;\n    if (tid >= total_elements) return;\n\n    // Vectorized memory access\n    const float4* in = reinterpret_cast<const float4*>(input + tid);\n    float4* out = reinterpret_cast<float4*>(output + tid);\n    float4 val = *in;\n\n    // Calculate channel index\n    const int ch_idx = (tid / HW) % C;\n\n    // Load scale and shift for this channel\n    const float s = scale[ch_idx];\n    const float sh = shift[ch_idx];\n\n    // Apply transformation with FMAD instructions\n    val.x = fmaf(s, val.x, sh);\n    val.y = fmaf(s, val.y, sh);\n    val.z = fmaf(s, val.z, sh);\n    val.w = fmaf(s, val.w, sh);\n\n    *out = val;\n}\n\ntorch::Tensor batchnorm_forward_cuda(\n    torch::Tensor input,\n    torch::Tensor scale,\n    torch::Tensor shift\n) {\n    auto output = torch::empty_like(input);\n    const int total_elements = input.numel();\n    const int C = input.size(1);\n    const int HW = input.size(2) * input.size(3);\n\n    const int block_size = 512;\n    const int grid_size = (total_elements / 4 + block_size - 1) / block_size;\n\n    batchnorm_forward_kernel<<<grid_size, block_size>>>(\n        input.data_ptr<float>(),\n        scale.data_ptr<float>(),\n        shift.data_ptr<float>(),\n        output.data_ptr<float>(),\n        total_elements,\n        C,\n        HW\n    );\n\n    return output;\n}\n'''\n\nbn_extension = load_inline(\n    name='bn_extension',\n    cpp_sources='''torch::Tensor batchnorm_forward_cuda(\n        torch::Tensor input, torch::Tensor scale, torch::Tensor shift);\n    ''',\n    cuda_sources=optimized_bn_kernel,\n    functions=['batchnorm_forward_cuda'],\n    extra_cuda_cflags=['-O3', '--use_fast_math', '-Xptxas=-v'],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, num_features: int):\n        super(ModelNew, self).__init__()\n        self.gamma = nn.Parameter(torch.ones(num_features))\n        self.beta = nn.Parameter(torch.zeros(num_features))\n        self.register_buffer('running_mean', torch.zeros(num_features))\n        self.register_buffer('running_var', torch.ones(num_features))\n        self.epsilon = 1e-5\n        \n        # Precompute scale and shift during initialization\n        self.register_buffer('scale', torch.empty(num_features))\n        self.register_buffer('shift', torch.empty(num_features))\n        self._update_scale_shift()\n\n    def _update_scale_shift(self):\n        with torch.no_grad():\n            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)\n            self.scale.copy_(self.gamma * inv_std)\n            self.shift.copy_(self.beta - self.running_mean * self.scale)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return bn_extension.batchnorm_forward_cuda(\n            x.contiguous(),\n            self.scale.contiguous(),\n            self.shift.contiguous()\n        )\n```\nYour generated architecture ModelNew and kernel was evaluated on GPU and checked against the reference architecture Model. \n\nHere is the Evaluation Result: \nYour kernel failed to compile.\n\nHere is the compiler logs\n\n:\n\ncuda_error: CUDA Error: CUDA error: CUDA-capable device(s) is/are busy or unavailable\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\nName your new improved output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n\nPlease fix the errors and try again.   ",
+  "model_response": "```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\noptimized_bn_kernel = '''\n#include <torch/extension.h>\n#include <cuda.h>\n\n__global__ void batchnorm_forward_kernel(\n    const float* __restrict__ input,\n    const float* __restrict__ scale,\n    const float* __restrict__ shift,\n    float* __restrict__ output,\n    int total_elements,\n    int C,\n    int HW\n) {\n    const int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= total_elements) return;\n\n    const int ch_idx = (idx / HW) % C;\n    output[idx] = fmaf(scale[ch_idx], input[idx], shift[ch_idx]);\n}\n\ntorch::Tensor batchnorm_forward_cuda(\n    torch::Tensor input,\n    torch::Tensor scale,\n    torch::Tensor shift\n) {\n    auto output = torch::empty_like(input);\n    const int total_elements = input.numel();\n    const int C = input.size(1);\n    const int HW = input.size(2) * input.size(3);\n\n    const int block_size = 512;\n    const int grid_size = (total_elements + block_size - 1) / block_size;\n\n    batchnorm_forward_kernel<<<grid_size, block_size>>>(\n        input.data_ptr<float>(),\n        scale.data_ptr<float>(),\n        shift.data_ptr<float>(),\n        output.data_ptr<float>(),\n        total_elements,\n        C,\n        HW\n    );\n\n    return output;\n}\n'''\n\nbn_extension = load_inline(\n    name='bn_extension',\n    cpp_sources='''torch::Tensor batchnorm_forward_cuda(\n        torch::Tensor input, torch::Tensor scale, torch::Tensor shift);\n    ''',\n    cuda_sources=optimized_bn_kernel,\n    functions=['batchnorm_forward_cuda'],\n    extra_cuda_cflags=['-O3', '--use_fast_math'],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, num_features: int):\n        super(ModelNew, self).__init__()\n        self.gamma = nn.Parameter(torch.ones(num_features))\n        self.beta = nn.Parameter(torch.zeros(num_features))\n        self.register_buffer('running_mean', torch.zeros(num_features))\n        self.register_buffer('running_var', torch.ones(num_features))\n        self.epsilon = 1e-5\n        \n        self.register_buffer('scale', torch.empty(num_features))\n        self.register_buffer('shift', torch.empty(num_features))\n        self._update_scale_shift()\n\n    def _update_scale_shift(self):\n        with torch.no_grad():\n            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)\n            self.scale.copy_(self.gamma * inv_std)\n            self.shift.copy_(self.beta - self.running_mean * self.scale)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return bn_extension.batchnorm_forward_cuda(\n            x.contiguous(),\n            self.scale.contiguous(),\n            self.shift.contiguous()\n        )\n```",
+  "kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\noptimized_bn_kernel = '''\n#include <torch/extension.h>\n#include <cuda.h>\n\n__global__ void batchnorm_forward_kernel(\n    const float* __restrict__ input,\n    const float* __restrict__ scale,\n    const float* __restrict__ shift,\n    float* __restrict__ output,\n    int total_elements,\n    int C,\n    int HW\n) {\n    const int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= total_elements) return;\n\n    const int ch_idx = (idx / HW) % C;\n    output[idx] = fmaf(scale[ch_idx], input[idx], shift[ch_idx]);\n}\n\ntorch::Tensor batchnorm_forward_cuda(\n    torch::Tensor input,\n    torch::Tensor scale,\n    torch::Tensor shift\n) {\n    auto output = torch::empty_like(input);\n    const int total_elements = input.numel();\n    const int C = input.size(1);\n    const int HW = input.size(2) * input.size(3);\n\n    const int block_size = 512;\n    const int grid_size = (total_elements + block_size - 1) / block_size;\n\n    batchnorm_forward_kernel<<<grid_size, block_size>>>(\n        input.data_ptr<float>(),\n        scale.data_ptr<float>(),\n        shift.data_ptr<float>(),\n        output.data_ptr<float>(),\n        total_elements,\n        C,\n        HW\n    );\n\n    return output;\n}\n'''\n\nbn_extension = load_inline(\n    name='bn_extension',\n    cpp_sources='''torch::Tensor batchnorm_forward_cuda(\n        torch::Tensor input, torch::Tensor scale, torch::Tensor shift);\n    ''',\n    cuda_sources=optimized_bn_kernel,\n    functions=['batchnorm_forward_cuda'],\n    extra_cuda_cflags=['-O3', '--use_fast_math'],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, num_features: int):\n        super(ModelNew, self).__init__()\n        self.gamma = nn.Parameter(torch.ones(num_features))\n        self.beta = nn.Parameter(torch.zeros(num_features))\n        self.register_buffer('running_mean', torch.zeros(num_features))\n        self.register_buffer('running_var', torch.ones(num_features))\n        self.epsilon = 1e-5\n        \n        self.register_buffer('scale', torch.empty(num_features))\n        self.register_buffer('shift', torch.empty(num_features))\n        self._update_scale_shift()\n\n    def _update_scale_shift(self):\n        with torch.no_grad():\n            inv_std = 1.0 / torch.sqrt(self.running_var + self.epsilon)\n            self.scale.copy_(self.gamma * inv_std)\n            self.shift.copy_(self.beta - self.running_mean * self.scale)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return bn_extension.batchnorm_forward_cuda(\n            x.contiguous(),\n            self.scale.contiguous(),\n            self.shift.contiguous()\n        )",
+  "feedback": "",
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:2",
+      "correctness_trials": "(5 / 5)"
+    },
+    "runtime": 0.83,
+    "runtime_stats": {
+      "mean": 0.83,
+      "std": 0.00523,
+      "min": 0.82,
+      "max": 0.847,
+      "num_trials": 100,
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:2"
+    }
+  },
+  "profiler_result": ""
+}

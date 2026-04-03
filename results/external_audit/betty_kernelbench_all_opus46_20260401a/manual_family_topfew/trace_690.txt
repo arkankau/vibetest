@@ -1,0 +1,1971 @@
+KernelBench iterative-refinement log.
+DATASET: ScalingIntelligence/kernelbench-samples
+LEVEL: level3
+VARIANT: eval_result_profiler_last_only
+MODEL_SLUG: deepseek-v3
+PROBLEM_ID: 46
+PROBLEM: KernelBenchInternal/KernelBench/level3/46_NetVladWithGhostClusters.py
+RUN_NAME: run_v0_deepseek_turn_10
+NUM_ROUNDS: 10
+SOURCE_PATH: iterative_refinement/level3/eval_result_profiler_last_only/deepseek-v3/problem_46/sample_0/log.json
+
+TASK_CONTEXT:
+You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.
+
+You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
+
+
+        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: 
+
+        ``` 
+
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+
+        ``` 
+
+        The example new arch with custom CUDA kernels looks like this: 
+        ```
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+elementwise_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+elementwise_add_cpp_source = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+
+        ``` 
+
+        
+    You are given the following architecture: 
+
+    ```
+    # Copyright 2018 Antoine Miech All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Code modified from here
+https://github.com/albanie/collaborative-experts/blob/master/model/net_vlad.py
+"""
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+
+
+class Model(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(Model, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        assignment = th.matmul(x, self.clusters)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        assignment = self.batch_norm(assignment)
+
+        assignment = F.softmax(assignment, dim=1)  # BN x (K+G) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+
+batch_size = 32
+num_features = 100
+num_clusters = 32
+feature_size = 512
+ghost_clusters = 16
+
+def get_inputs():
+  return [torch.randn(batch_size, num_features, feature_size)]
+
+def get_init_inputs():
+  return [num_clusters, feature_size, ghost_clusters]
+
+    ```
+    
+
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code!
+
+=== ROUND 0001 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication and softmax fusion
+matmul_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_softmax_kernel(const float* x, const float* clusters, float* out, int feature_size, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        out[idx] = sum;
+    }
+}
+
+torch::Tensor matmul_softmax_cuda(torch::Tensor x, torch::Tensor clusters) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_softmax_cpp_source = (
+    "torch::Tensor matmul_softmax_cuda(torch::Tensor x, torch::Tensor clusters);"
+)
+
+# Compile the inline CUDA code for matrix multiplication and softmax fusion
+matmul_softmax = load_inline(
+    name="matmul_softmax",
+    cpp_sources=matmul_softmax_cpp_source,
+    cuda_sources=matmul_softmax_source,
+    functions=["matmul_softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_softmax = matmul_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        assignment = self.matmul_softmax.matmul_softmax_cuda(x, self.clusters)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        assignment = self.batch_norm(assignment)
+
+        assignment = F.softmax(assignment, dim=1)  # BN x (K+G) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.28,
+  "runtime_stats": {
+    "mean": 0.28,
+    "std": 0.00977,
+    "min": 0.27,
+    "max": 0.326,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:0"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+matmul_softmax_kernel(float const*, float const*, fl...         0.00%       0.000us         0.00%       0.000us       0.000us       3.502ms        39.24%       3.502ms      37.655us            93  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.231ms        13.79%       1.231ms      13.234us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     636.781us         7.14%     636.781us       6.847us            93  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     589.764us         6.61%     589.764us       3.171us           186  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     519.882us         5.83%     519.882us       2.795us           186  
+void at::native::batch_norm_collect_statistics_chann...         0.00%       0.000us         0.00%       0.000us       0.000us     485.479us         5.44%     485.479us       5.220us            93  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     404.966us         4.54%     404.966us       4.354us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     303.234us         3.40%     303.234us       3.261us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     263.774us         2.96%     263.774us       2.836us            93  
+void at::native::batch_norm_transform_input_channels...         0.00%       0.000us         0.00%       0.000us       0.000us     242.788us         2.72%     242.788us       2.611us            93  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 6.468ms
+Self CUDA time total: 8.924ms
+
+=== ROUND 0002 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        assignment = F.softmax(assignment, dim=1)  # BN x (K+G) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.109,
+  "runtime_stats": {
+    "mean": 0.109,
+    "std": 0.00118,
+    "min": 0.106,
+    "max": 0.112,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:1"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+matmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      12.915ms        74.29%      12.915ms     134.532us            96  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.223ms         7.04%       1.223ms      12.739us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     642.215us         3.69%     642.215us       6.690us            96  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     604.503us         3.48%     604.503us       3.148us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     537.388us         3.09%     537.388us       2.799us           192  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     405.860us         2.33%     405.860us       4.228us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     309.672us         1.78%     309.672us       3.226us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     274.629us         1.58%     274.629us       2.861us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     204.067us         1.17%     204.067us       1.063us           192  
+void (anonymous namespace)::softmax_warp_forward<flo...         0.00%       0.000us         0.00%       0.000us       0.000us     166.020us         0.96%     166.020us       1.729us            96  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 9.427ms
+Self CUDA time total: 17.384ms
+
+=== ROUND 0003 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.304,
+  "runtime_stats": {
+    "mean": 0.304,
+    "std": 0.0069,
+    "min": 0.298,
+    "max": 0.336,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:4"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+matmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us       3.535ms        34.00%       3.535ms      38.008us            93  
+                       softmax_kernel(float*, int, int)         0.00%       0.000us         0.00%       0.000us       0.000us       2.562ms        24.65%       2.562ms      27.550us            93  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.280ms        12.31%       1.280ms      13.766us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     637.439us         6.13%     637.439us       6.854us            93  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     591.434us         5.69%     591.434us       3.180us           186  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     524.037us         5.04%     524.037us       2.817us           186  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     398.811us         3.84%     398.811us       4.288us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     304.413us         2.93%     304.413us       3.273us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     263.545us         2.54%     263.545us       2.834us            93  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     201.311us         1.94%     201.311us       1.082us           186  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 5.651ms
+Self CUDA time total: 10.396ms
+
+=== ROUND 0004 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: CUDA-capable device(s) is/are busy or unavailable\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0005 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.196,
+  "runtime_stats": {
+    "mean": 0.196,
+    "std": 0.00856,
+    "min": 0.189,
+    "max": 0.238,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:2"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+matmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us       3.546ms        34.46%       3.546ms      38.125us            93  
+                       softmax_kernel(float*, int, int)         0.00%       0.000us         0.00%       0.000us       0.000us       2.528ms        24.57%       2.528ms      27.185us            93  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.224ms        11.89%       1.224ms      13.159us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     634.147us         6.16%     634.147us       6.819us            93  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     584.603us         5.68%     584.603us       3.143us           186  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     516.380us         5.02%     516.380us       2.776us           186  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     389.061us         3.78%     389.061us       4.183us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     305.924us         2.97%     305.924us       3.290us            93  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     262.241us         2.55%     262.241us       2.820us            93  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     200.917us         1.95%     200.917us       1.080us           186  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 4.075ms
+Self CUDA time total: 10.289ms
+
+=== ROUND 0006 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0007 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.122,
+  "runtime_stats": {
+    "mean": 0.122,
+    "std": 0.00077,
+    "min": 0.121,
+    "max": 0.125,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:0"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                       softmax_kernel(float*, int, int)         0.00%       0.000us         0.00%       0.000us       0.000us       7.146ms        41.13%       7.146ms      74.436us            96  
+matmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us       3.599ms        20.71%       3.599ms      37.491us            96  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       2.700ms        15.54%       2.700ms      28.121us            96  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.250ms         7.19%       1.250ms      13.019us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     652.544us         3.76%     652.544us       6.797us            96  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     610.594us         3.51%     610.594us       3.180us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     535.439us         3.08%     535.439us       2.789us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     309.859us         1.78%     309.859us       3.228us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     269.633us         1.55%     269.633us       2.809us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     203.459us         1.17%     203.459us       1.060us           192  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 7.594ms
+Self CUDA time total: 17.375ms
+
+=== ROUND 0008 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.122,
+  "runtime_stats": {
+    "mean": 0.122,
+    "std": 0.000631,
+    "min": 0.121,
+    "max": 0.125,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:0"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+matmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us      10.732ms        48.35%      10.732ms     111.793us            96  
+                       softmax_kernel(float*, int, int)         0.00%       0.000us         0.00%       0.000us       0.000us       4.823ms        21.73%       4.823ms      50.767us            95  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       2.705ms        12.19%       2.705ms      28.182us            96  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.256ms         5.66%       1.256ms      13.084us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     653.638us         2.94%     653.638us       6.809us            96  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     609.222us         2.74%     609.222us       3.173us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     536.772us         2.42%     536.772us       2.796us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     310.372us         1.40%     310.372us       3.233us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     269.601us         1.21%     269.601us       2.808us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     203.970us         0.92%     203.970us       1.062us           192  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 7.758ms
+Self CUDA time total: 22.198ms
+
+=== ROUND 0009 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.122,
+  "runtime_stats": {
+    "mean": 0.122,
+    "std": 0.000623,
+    "min": 0.121,
+    "max": 0.125,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:0"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+matmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us       8.314ms        47.49%       8.314ms      87.511us            95  
+                       softmax_kernel(float*, int, int)         0.00%       0.000us         0.00%       0.000us       0.000us       4.850ms        27.70%       4.850ms      50.519us            96  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.256ms         7.17%       1.256ms      13.080us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     653.414us         3.73%     653.414us       6.806us            96  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     609.857us         3.48%     609.857us       3.176us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     536.395us         3.06%     536.395us       2.794us           192  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     405.283us         2.32%     405.283us       4.222us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     310.527us         1.77%     310.527us       3.235us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     269.696us         1.54%     269.696us       2.809us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     204.189us         1.17%     204.189us       1.063us           192  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 6.935ms
+Self CUDA time total: 17.507ms
+
+=== ROUND 0010 ===
+KERNEL_CODE:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * clusters_size) {
+        int batch_idx = idx / clusters_size;
+        int cluster_idx = idx % clusters_size;
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];
+        }
+        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);
+        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];
+        out[idx] = bn_output;
+    }
+}
+
+__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_val = out[idx * clusters_size];
+        for (int i = 1; i < clusters_size; ++i) {
+            if (out[idx * clusters_size + i] > max_val) {
+                max_val = out[idx * clusters_size + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);
+            sum += out[idx * clusters_size + i];
+        }
+        for (int i = 0; i < clusters_size; ++i) {
+            out[idx * clusters_size + i] /= sum;
+        }
+    }
+}
+
+torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int batch_size = x.size(0);
+    int feature_size = x.size(1);
+    int clusters_size = clusters.size(1);
+
+    auto out = torch::zeros({batch_size, clusters_size}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;
+
+    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);
+
+    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);
+
+    return out;
+}
+"""
+
+matmul_bn_softmax_cpp_source = (
+    "torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion
+matmul_bn_softmax = load_inline(
+    name="matmul_bn_softmax",
+    cpp_sources=matmul_bn_softmax_cpp_source,
+    cuda_sources=matmul_bn_softmax_source,
+    functions=["matmul_bn_softmax_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        self.matmul_bn_softmax = matmul_bn_softmax
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # Get batch norm parameters
+        mean = self.batch_norm.running_mean
+        var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.145,
+  "runtime_stats": {
+    "mean": 0.145,
+    "std": 0.226,
+    "min": 0.121,
+    "max": 2.4,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:0"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+matmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us       8.334ms        41.97%       8.334ms      86.816us            96  
+                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       3.590ms        18.08%       3.590ms      37.395us            96  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       2.705ms        13.62%       2.705ms      28.181us            96  
+                       softmax_kernel(float*, int, int)         0.00%       0.000us         0.00%       0.000us       0.000us       2.547ms        12.83%       2.547ms      26.535us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     654.052us         3.29%     654.052us       6.813us            96  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     608.614us         3.06%     608.614us       3.170us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     535.872us         2.70%     535.872us       2.791us           192  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     310.251us         1.56%     310.251us       3.232us            96  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     269.380us         1.36%     269.380us       2.806us            96  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     203.455us         1.02%     203.455us       1.060us           192  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 6.582ms
+Self CUDA time total: 19.858ms
+
+FINAL_RESULT:
+{
+  "context": "You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\n\n        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: \n\n        ``` \n\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n        ``` \n\n        The example new arch with custom CUDA kernels looks like this: \n        ```\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for element-wise addition\nelementwise_add_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add_cpp_source = (\n    \"torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);\"\n)\n\n# Compile the inline CUDA code for element-wise addition\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    cuda_sources=elementwise_add_source,\n    functions=[\"elementwise_add_cuda\"],\n    verbose=True,\n    extra_cflags=[\"\"],\n    extra_ldflags=[\"\"],\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_cuda(a, b)\n\n        ``` \n\n        \n    You are given the following architecture: \n\n    ```\n    # Copyright 2018 Antoine Miech All Rights Reserved.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS-IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"\nCode modified from here\nhttps://github.com/albanie/collaborative-experts/blob/master/model/net_vlad.py\n\"\"\"\n\n\nimport math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch as th\n\n\nclass Model(nn.Module):\n    def __init__(self, cluster_size, feature_size, ghost_clusters):\n        super(Model, self).__init__()\n\n        self.feature_size = feature_size\n        self.cluster_size = cluster_size\n        self.ghost_clusters = ghost_clusters\n\n        init_sc = (1 / math.sqrt(feature_size))\n        clusters = cluster_size + ghost_clusters\n\n        # The `clusters` weights are the `(w,b)` in the paper\n        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))\n        self.batch_norm = nn.BatchNorm1d(clusters)\n        # The `clusters2` weights are the visual words `c_k` in the paper\n        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))\n        self.out_dim = self.cluster_size * feature_size\n\n    def forward(self, x, mask=None):\n        \"\"\"Aggregates feature maps into a fixed size representation.  In the following\n        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.\n\n        Args:\n            x (th.Tensor): B x N x D\n\n        Returns:\n            (th.Tensor): B x DK\n        \"\"\"\n        max_sample = x.size()[1]\n        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D\n\n        if x.device != self.clusters.device:\n            msg = f\"x.device {x.device} != cluster.device {self.clusters.device}\"\n            raise ValueError(msg)\n\n        assignment = th.matmul(x, self.clusters)  # (BN x D) x (D x (K+G)) -> BN x (K+G)\n        assignment = self.batch_norm(assignment)\n\n        assignment = F.softmax(assignment, dim=1)  # BN x (K+G) -> BN x (K+G)\n        # remove ghost assigments\n        assignment = assignment[:, :self.cluster_size]\n        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K\n        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K\n        a = a_sum * self.clusters2\n\n        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N\n\n        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D\n        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D\n        vlad = vlad.transpose(1, 2)  # -> B x D x K\n        vlad = vlad - a\n\n        # L2 intra norm\n        vlad = F.normalize(vlad)\n\n        # flattening + L2 norm\n        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK\n        vlad = F.normalize(vlad)\n        return vlad  # B x DK\n\nbatch_size = 32\nnum_features = 100\nnum_clusters = 32\nfeature_size = 512\nghost_clusters = 16\n\ndef get_inputs():\n  return [torch.randn(batch_size, num_features, feature_size)]\n\ndef get_init_inputs():\n  return [num_clusters, feature_size, ghost_clusters]\n\n    ```\n    Here is your latest generation:\n```\nimport math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch as th\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion\nmatmul_bn_softmax_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < batch_size * clusters_size) {\n        int batch_idx = idx / clusters_size;\n        int cluster_idx = idx % clusters_size;\n        float sum = 0.0f;\n        for (int i = 0; i < feature_size; ++i) {\n            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];\n        }\n        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);\n        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];\n        out[idx] = bn_output;\n    }\n}\n\n__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < batch_size) {\n        float max_val = out[idx * clusters_size];\n        for (int i = 1; i < clusters_size; ++i) {\n            if (out[idx * clusters_size + i] > max_val) {\n                max_val = out[idx * clusters_size + i];\n            }\n        }\n        float sum = 0.0f;\n        for (int i = 0; i < clusters_size; ++i) {\n            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);\n            sum += out[idx * clusters_size + i];\n        }\n        for (int i = 0; i < clusters_size; ++i) {\n            out[idx * clusters_size + i] /= sum;\n        }\n    }\n}\n\ntorch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {\n    int batch_size = x.size(0);\n    int feature_size = x.size(1);\n    int clusters_size = clusters.size(1);\n\n    auto out = torch::zeros({batch_size, clusters_size}, x.options());\n\n    const int block_size = 256;\n    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;\n\n    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);\n\n    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);\n\n    return out;\n}\n\"\"\"\n\nmatmul_bn_softmax_cpp_source = (\n    \"torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);\"\n)\n\n# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion\nmatmul_bn_softmax = load_inline(\n    name=\"matmul_bn_softmax\",\n    cpp_sources=matmul_bn_softmax_cpp_source,\n    cuda_sources=matmul_bn_softmax_source,\n    functions=[\"matmul_bn_softmax_cuda\"],\n    verbose=True,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"-lcudart\"],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, cluster_size, feature_size, ghost_clusters):\n        super(ModelNew, self).__init__()\n\n        self.feature_size = feature_size\n        self.cluster_size = cluster_size\n        self.ghost_clusters = ghost_clusters\n\n        init_sc = (1 / math.sqrt(feature_size))\n        clusters = cluster_size + ghost_clusters\n\n        # The `clusters` weights are the `(w,b)` in the paper\n        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))\n        self.batch_norm = nn.BatchNorm1d(clusters)\n        # The `clusters2` weights are the visual words `c_k` in the paper\n        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))\n        self.out_dim = self.cluster_size * feature_size\n\n        self.matmul_bn_softmax = matmul_bn_softmax\n\n    def forward(self, x, mask=None):\n        \"\"\"Aggregates feature maps into a fixed size representation.  In the following\n        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.\n\n        Args:\n            x (th.Tensor): B x N x D\n\n        Returns:\n            (th.Tensor): B x DK\n        \"\"\"\n        max_sample = x.size()[1]\n        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D\n\n        if x.device != self.clusters.device:\n            msg = f\"x.device {x.device} != cluster.device {self.clusters.device}\"\n            raise ValueError(msg)\n\n        # Get batch norm parameters\n        mean = self.batch_norm.running_mean\n        var = self.batch_norm.running_var\n        weight = self.batch_norm.weight\n        bias = self.batch_norm.bias\n        eps = self.batch_norm.eps\n\n        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)\n        # remove ghost assigments\n        assignment = assignment[:, :self.cluster_size]\n        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K\n        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K\n        a = a_sum * self.clusters2\n\n        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N\n\n        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D\n        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D\n        vlad = vlad.transpose(1, 2)  # -> B x D x K\n        vlad = vlad - a\n\n        # L2 intra norm\n        vlad = F.normalize(vlad)\n\n        # flattening + L2 norm\n        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK\n        vlad = F.normalize(vlad)\n        return vlad  # B x DK\n```\nYour generated architecture ModelNew and kernel was evaluated on GPU and checked against the reference architecture Model. \n\nHere is the Evaluation Result: \nYour kernel executed successfully and produced the correct output. \n\nHere is your wall clock time: 0.122 milliseconds \n\nYour Kernel was profiled with the PyTorch Profiler over many iterations, below is a table breakdown of the CUDA kernel execution time: \n\n```\n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nmatmul_bn_softmax_kernel(float const*, float const*,...         0.00%       0.000us         0.00%       0.000us       0.000us       8.314ms        47.49%       8.314ms      87.511us            95  \n                       softmax_kernel(float*, int, int)         0.00%       0.000us         0.00%       0.000us       0.000us       4.850ms        27.70%       4.850ms      50.519us            96  \n                                ampere_sgemm_128x128_nt         0.00%       0.000us         0.00%       0.000us       0.000us       1.256ms         7.17%       1.256ms      13.080us            96  \nvoid at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     653.414us         3.73%     653.414us       6.806us            96  \nvoid at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     609.857us         3.48%     609.857us       3.176us           192  \nvoid at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     536.395us         3.06%     536.395us       2.794us           192  \nvoid at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     405.283us         2.32%     405.283us       4.222us            96  \nvoid at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     310.527us         1.77%     310.527us       3.235us            96  \nvoid at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     269.696us         1.54%     269.696us       2.809us            96  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     204.189us         1.17%     204.189us       1.063us           192  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 6.935ms\nSelf CUDA time total: 17.507ms\n\n```\n\nName your new improved output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n\nPlease rewrite the entire kernel to be as fast as possible. \n\n",
+  "model_response": "```python\nimport math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch as th\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion\nmatmul_bn_softmax_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < batch_size * clusters_size) {\n        int batch_idx = idx / clusters_size;\n        int cluster_idx = idx % clusters_size;\n        float sum = 0.0f;\n        for (int i = 0; i < feature_size; ++i) {\n            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];\n        }\n        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);\n        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];\n        out[idx] = bn_output;\n    }\n}\n\n__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < batch_size) {\n        float max_val = out[idx * clusters_size];\n        for (int i = 1; i < clusters_size; ++i) {\n            if (out[idx * clusters_size + i] > max_val) {\n                max_val = out[idx * clusters_size + i];\n            }\n        }\n        float sum = 0.0f;\n        for (int i = 0; i < clusters_size; ++i) {\n            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);\n            sum += out[idx * clusters_size + i];\n        }\n        for (int i = 0; i < clusters_size; ++i) {\n            out[idx * clusters_size + i] /= sum;\n        }\n    }\n}\n\ntorch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {\n    int batch_size = x.size(0);\n    int feature_size = x.size(1);\n    int clusters_size = clusters.size(1);\n\n    auto out = torch::zeros({batch_size, clusters_size}, x.options());\n\n    const int block_size = 256;\n    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;\n\n    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);\n\n    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);\n\n    return out;\n}\n\"\"\"\n\nmatmul_bn_softmax_cpp_source = (\n    \"torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);\"\n)\n\n# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion\nmatmul_bn_softmax = load_inline(\n    name=\"matmul_bn_softmax\",\n    cpp_sources=matmul_bn_softmax_cpp_source,\n    cuda_sources=matmul_bn_softmax_source,\n    functions=[\"matmul_bn_softmax_cuda\"],\n    verbose=True,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"-lcudart\"],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, cluster_size, feature_size, ghost_clusters):\n        super(ModelNew, self).__init__()\n\n        self.feature_size = feature_size\n        self.cluster_size = cluster_size\n        self.ghost_clusters = ghost_clusters\n\n        init_sc = (1 / math.sqrt(feature_size))\n        clusters = cluster_size + ghost_clusters\n\n        # The `clusters` weights are the `(w,b)` in the paper\n        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))\n        self.batch_norm = nn.BatchNorm1d(clusters)\n        # The `clusters2` weights are the visual words `c_k` in the paper\n        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))\n        self.out_dim = self.cluster_size * feature_size\n\n        self.matmul_bn_softmax = matmul_bn_softmax\n\n    def forward(self, x, mask=None):\n        \"\"\"Aggregates feature maps into a fixed size representation.  In the following\n        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.\n\n        Args:\n            x (th.Tensor): B x N x D\n\n        Returns:\n            (th.Tensor): B x DK\n        \"\"\"\n        max_sample = x.size()[1]\n        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D\n\n        if x.device != self.clusters.device:\n            msg = f\"x.device {x.device} != cluster.device {self.clusters.device}\"\n            raise ValueError(msg)\n\n        # Get batch norm parameters\n        mean = self.batch_norm.running_mean\n        var = self.batch_norm.running_var\n        weight = self.batch_norm.weight\n        bias = self.batch_norm.bias\n        eps = self.batch_norm.eps\n\n        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)\n        # remove ghost assigments\n        assignment = assignment[:, :self.cluster_size]\n        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K\n        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K\n        a = a_sum * self.clusters2\n\n        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N\n\n        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D\n        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D\n        vlad = vlad.transpose(1, 2)  # -> B x D x K\n        vlad = vlad - a\n\n        # L2 intra norm\n        vlad = F.normalize(vlad)\n\n        # flattening + L2 norm\n        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK\n        vlad = F.normalize(vlad)\n        return vlad  # B x DK\n```",
+  "kernel_code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch as th\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for matrix multiplication, batch normalization, and softmax fusion\nmatmul_bn_softmax_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void matmul_bn_softmax_kernel(const float* x, const float* clusters, const float* mean, const float* var, const float* weight, const float* bias, float* out, int feature_size, int clusters_size, int batch_size, float eps) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < batch_size * clusters_size) {\n        int batch_idx = idx / clusters_size;\n        int cluster_idx = idx % clusters_size;\n        float sum = 0.0f;\n        for (int i = 0; i < feature_size; ++i) {\n            sum += x[batch_idx * feature_size + i] * clusters[i * clusters_size + cluster_idx];\n        }\n        float normalized = (sum - mean[cluster_idx]) / sqrtf(var[cluster_idx] + eps);\n        float bn_output = normalized * weight[cluster_idx] + bias[cluster_idx];\n        out[idx] = bn_output;\n    }\n}\n\n__global__ void softmax_kernel(float* out, int clusters_size, int batch_size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < batch_size) {\n        float max_val = out[idx * clusters_size];\n        for (int i = 1; i < clusters_size; ++i) {\n            if (out[idx * clusters_size + i] > max_val) {\n                max_val = out[idx * clusters_size + i];\n            }\n        }\n        float sum = 0.0f;\n        for (int i = 0; i < clusters_size; ++i) {\n            out[idx * clusters_size + i] = expf(out[idx * clusters_size + i] - max_val);\n            sum += out[idx * clusters_size + i];\n        }\n        for (int i = 0; i < clusters_size; ++i) {\n            out[idx * clusters_size + i] /= sum;\n        }\n    }\n}\n\ntorch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps) {\n    int batch_size = x.size(0);\n    int feature_size = x.size(1);\n    int clusters_size = clusters.size(1);\n\n    auto out = torch::zeros({batch_size, clusters_size}, x.options());\n\n    const int block_size = 256;\n    const int num_blocks = (batch_size * clusters_size + block_size - 1) / block_size;\n\n    matmul_bn_softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), clusters.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), feature_size, clusters_size, batch_size, eps);\n\n    softmax_kernel<<<(batch_size + block_size - 1) / block_size, block_size>>>(out.data_ptr<float>(), clusters_size, batch_size);\n\n    return out;\n}\n\"\"\"\n\nmatmul_bn_softmax_cpp_source = (\n    \"torch::Tensor matmul_bn_softmax_cuda(torch::Tensor x, torch::Tensor clusters, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias, float eps);\"\n)\n\n# Compile the inline CUDA code for matrix multiplication, batch normalization, and softmax fusion\nmatmul_bn_softmax = load_inline(\n    name=\"matmul_bn_softmax\",\n    cpp_sources=matmul_bn_softmax_cpp_source,\n    cuda_sources=matmul_bn_softmax_source,\n    functions=[\"matmul_bn_softmax_cuda\"],\n    verbose=True,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"-lcudart\"],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, cluster_size, feature_size, ghost_clusters):\n        super(ModelNew, self).__init__()\n\n        self.feature_size = feature_size\n        self.cluster_size = cluster_size\n        self.ghost_clusters = ghost_clusters\n\n        init_sc = (1 / math.sqrt(feature_size))\n        clusters = cluster_size + ghost_clusters\n\n        # The `clusters` weights are the `(w,b)` in the paper\n        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))\n        self.batch_norm = nn.BatchNorm1d(clusters)\n        # The `clusters2` weights are the visual words `c_k` in the paper\n        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))\n        self.out_dim = self.cluster_size * feature_size\n\n        self.matmul_bn_softmax = matmul_bn_softmax\n\n    def forward(self, x, mask=None):\n        \"\"\"Aggregates feature maps into a fixed size representation.  In the following\n        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.\n\n        Args:\n            x (th.Tensor): B x N x D\n\n        Returns:\n            (th.Tensor): B x DK\n        \"\"\"\n        max_sample = x.size()[1]\n        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D\n\n        if x.device != self.clusters.device:\n            msg = f\"x.device {x.device} != cluster.device {self.clusters.device}\"\n            raise ValueError(msg)\n\n        # Get batch norm parameters\n        mean = self.batch_norm.running_mean\n        var = self.batch_norm.running_var\n        weight = self.batch_norm.weight\n        bias = self.batch_norm.bias\n        eps = self.batch_norm.eps\n\n        assignment = self.matmul_bn_softmax.matmul_bn_softmax_cuda(x, self.clusters, mean, var, weight, bias, eps)  # (BN x D) x (D x (K+G)) -> BN x (K+G)\n        # remove ghost assigments\n        assignment = assignment[:, :self.cluster_size]\n        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K\n        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K\n        a = a_sum * self.clusters2\n\n        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N\n\n        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D\n        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D\n        vlad = vlad.transpose(1, 2)  # -> B x D x K\n        vlad = vlad - a\n\n        # L2 intra norm\n        vlad = F.normalize(vlad)\n\n        # flattening + L2 norm\n        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK\n        vlad = F.normalize(vlad)\n        return vlad  # B x DK",
+  "feedback": "",
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:0",
+      "correctness_trials": "(5 / 5)"
+    },
+    "runtime": 0.122,
+    "runtime_stats": {
+      "mean": 0.122,
+      "std": 0.000433,
+      "min": 0.121,
+      "max": 0.123,
+      "num_trials": 100,
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:0"
+    }
+  },
+  "profiler_result": ""
+}
