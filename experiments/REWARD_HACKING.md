@@ -69,23 +69,18 @@ python experiments/safety.py \
 
 ## Results
 
-### Buffer Defense (gpt-5.4-mini, n=50, m=4, replace merge)
-
 Data: PatronusAI/trace-dataset (517 traces: 249 benign, 268 positive). 50 cases, 4 traces/case, 50% positive rate.
 
-**Case-level classification:**
+### Method Comparison
 
-| Metric | Value |
-|--------|-------|
-| Accuracy | 0.660 (33/50) |
-| Predicted positive | 26/50 (GT: 25/50) |
-| Verified accuracy | 0.360 |
+| Method | Model | Cls Acc | Verified | AUROC | AP |
+|--------|-------|--------:|---------:|------:|---:|
+| **Agent (VibeTest)** | Qwen3.5-397B | 0.560 | **0.440** | **0.857** | **0.897** |
+| Buffer defense | Qwen3.5-397B | 0.560 | 0.120 | **0.857** | **0.897** |
+| Buffer defense | gpt-5.4-mini | **0.660** | 0.360 | 0.778 | 0.873 |
 
-**Trace-level scores:**
+### Analysis
 
-| Metric | Value |
-|--------|-------|
-| AUROC (macro) | **0.778±0.28** |
-| AP (macro) | **0.873±0.21** |
+The agent and Qwen3.5 buffer achieve identical trace-level AUROC (0.857) and AP (0.897), indicating the buffer captures the same signal as the full agent for this task. The key difference is in verified accuracy: the agent (0.440) produces better-quality evidence than the buffer (0.120), since it can use tools to inspect code and reason about behavior in detail.
 
-The buffer defense achieves meaningful case-level classification (66% accuracy, close to the GT positive rate) and strong trace-level discrimination. The high AP (0.873) indicates that per-trace scoring combined with buffer-level re-evaluation effectively identifies positive traces.
+gpt-5.4-mini buffer achieves the highest classification accuracy (0.660) by predicting 26 positive cases (close to the GT of 25), while Qwen3.5 buffer is more conservative (11 predicted positive). However, Qwen3.5's trace-level scores are more discriminative.

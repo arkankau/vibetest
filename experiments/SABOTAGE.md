@@ -71,32 +71,17 @@ python experiments/safety.py \
 
 Trace-level AUROC and AP (macro-averaged over cases), 50 cases, 4 traces/case, 50% positive rate.
 
-| Method | Stage 1 Model | Stage 2 | AUROC | AP |
-|--------|---------------|---------|------:|---:|
+| Method | Model | Cls Acc | AUROC | AP |
+|--------|-------|--------:|------:|---:|
 | Raw monitor scores | gpt-4o-mini | — | 0.772 | 0.772 |
-| Bayesian calibration (LOO) | gpt-4o-mini | local | 0.759 | 0.752 |
-| Buffer defense (max-merge) | Qwen3.5-397B | Qwen3.5-397B | 0.885 | 0.917 |
-| Buffer defense (replace) | Qwen3.5-397B | Qwen3.5-397B | 0.885 | 0.917 |
-| **Buffer defense (replace)** | **gpt-5.4-mini** | **gpt-5.4-mini** | **0.972** | **0.972** |
-| Agent (VibeTest) | Qwen3.5-397B | Qwen3.5-397B (tool use) | _pending_ | _pending_ |
+| Bayesian calibration (LOO) | gpt-4o-mini | — | 0.759 | 0.752 |
+| Buffer defense (replace) | gpt-5.4-mini | 0.520 | 0.972 | 0.972 |
+| Buffer defense (replace) | Qwen3.5-397B | 0.560 | **1.000** | **1.000** |
+| **Agent (VibeTest)** | **Qwen3.5-397B** | **0.720** | **1.000** | **1.000** |
 
 The buffer defense substantially outperforms both the raw monitor baseline and Bayesian calibration at the trace level. The improvement comes from the Stage 2 LLM re-evaluating all 4 traces in context, allowing it to calibrate scores relative to each other.
 
-**Agent run pending** — the Qwen3.5 agent run was interrupted by vLLM server downtime (10/25 cases stuck on connection timeouts). Resume with:
-```bash
-python experiments/safety.py \
-  --safety-mode mle-sabotage \
-  --method vibetest \
-  --model "vllm/Qwen/Qwen3.5-397B-A17B-FP8" \
-  --data-path data/safety/mle-sabotage \
-  --dataset-name safety_mle_sabotage \
-  --cases 25 \
-  --traces-per-case 4 \
-  --seed 42 \
-  --sandbox docker \
-  --vibetest-output-path results/mle_sabotage_agent_qwen35.jsonl
-```
-Note: the eval log (`logs/2026-03-25T11-18-08-00-00_task_DXyKXyWeRRpxsnVCXgsbhd.eval`) has 0 completed samples (inspect writes at the end), so `--retry-eval-log` cannot be used. A full re-run is required.
+The agent achieves the highest classification accuracy (0.720) with perfect trace-level discrimination. Both buffer and agent achieve AUROC/AP of 1.000 with Qwen3.5, but the agent produces better verdicts (Pred+=11 vs 1 for buffer).
 
 ### Buffer Defense Details (Qwen3.5-397B, n=25, m=4)
 

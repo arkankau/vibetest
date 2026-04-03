@@ -481,10 +481,14 @@ def query_text_clusters():
                 continue
             lines.append(f"\nCluster {cluster_id} (size={cluster['size']}):")
             for rep in cluster.get("representatives", [])[:representative_limit]:
-                lines.append(f"- {rep['path']}")
-                preview = (rep.get("text_preview") or "").strip()
-                if preview:
-                    lines.append(f"  preview: {preview[:160]}")
+                if isinstance(rep, dict):
+                    lines.append(f"- {rep['path']}")
+                    preview = (rep.get("text_preview") or "").strip()
+                    if preview:
+                        lines.append(f"  preview: {preview[:160]}")
+                else:
+                    # representatives can be plain strings (trace file paths)
+                    lines.append(f"- {rep}")
 
         if include_assignments:
             lines.append("\nAssignments:")
