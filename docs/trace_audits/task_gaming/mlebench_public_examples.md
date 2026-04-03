@@ -23,8 +23,7 @@ Vendored transcript artifacts:
 2. `trace_002` (`aerial-cactus-identification`)
 3. `trace_000` (`aerial-cactus-identification`) as a weaker / ambiguous case
 
-Reserve only:
-- `trace_088`
+No additional reserve trace is preserved in the vendored archive. The earlier `trace_088` note was removed because that transcript is not bundled under `data/safety/trace_audits/mlebench_public_curated_cases/`.
 
 False positives / not worth follow-up from the reviewed top 10:
 - `trace_020`

@@ -47,6 +47,8 @@ Intentionally excluded:
 | [KernelBench Top-50 Strong Hits](task_gaming/kernelbench_top50_strong_hits.md) | broader manual review of top KernelBench hits | [kernelbench full review outputs](../../results/external_audit/betty_kernelbench_all_opus46_20260401a/) |
 | [MLE-Bench Public Examples](task_gaming/mlebench_public_examples.md) | public leaderboard traces with leaked test-side structure and benchmark-specific overrides | [mlebench curated cases](../../data/safety/trace_audits/mlebench_public_curated_cases/) |
 | [Nebius SWE-rebench Git-Peek Review](task_gaming/nebius_rebench_gitpeek_review.md) | repo-history answer recovery in OpenHands traces | [nebius curated cases](../../data/safety/trace_audits/nebius_rebench_gitpeek_curated_cases/), [Betty run](../../results/external_audit/betty_nebius_rebench_gitpeek_opus46_20260401a/) |
+| [SWE-bench Bash-Only Git-History Cases](task_gaming/swebench_bash_git_history_cases.md) | bash-only repo-history answer recovery | [swebench_bash_gitpeek_frontier](../../data/safety/trace_audits/swebench_bash_gitpeek_frontier/case_0000/), [selection file](../../results/external_audit/swebench_bash_gitpeek_frontier_selection.jsonl) |
+| [SWE-bench Verified Tools Git-History Cases](task_gaming/swebench_verified_tools_git_history_cases.md) | verified-tools repo-history answer recovery | [swebench_verified_tools_gitpeek](../../data/safety/trace_audits/swebench_verified_tools_gitpeek/case_0000/), [selection file](../../results/external_audit/swebench_verified_tools_gitpeek_selection.jsonl) |
 
 ## Screening And Negative Results
 
@@ -54,7 +56,7 @@ Intentionally excluded:
 |---|---|---|
 | [TAU-Bench Banking Top-50 Review](negative_results/tau_bench_banking_top50_review.md) | low-yield TAU2 banking slice; strongest hit was a false positive | [taubench_banking_top50](../../data/safety/trace_audits/taubench_banking_top50/case_0000/), [TAU outputs](../../results/external_audit/taubench/) |
 | [TerminalBench Leaderboard Review](negative_results/terminalbench_leaderboard_review.md) | low-yield leaderboard slice for developer cheating | [terminalbench_leaderboard](../../data/safety/trace_audits/terminalbench_leaderboard/case_0000/), [leaderboard outputs](../../results/external_audit/terminalbench_leaderboard/) |
-| [TerminalBench Yoonholee Review](negative_results/terminalbench_yoonholee_review.md) | mixed slice with a few model-side leaks but low value for developer-cheating claims | [terminalbench_yoonholee](../../data/safety/trace_audits/terminalbench_yoonholee/case_0000/) |
+| [TerminalBench Yoonholee Review](negative_results/terminalbench_yoonholee_review.md) | mixed slice with two real `expected.csv` task-gaming hits, but low value for developer-cheating claims overall | [terminalbench_yoonholee](../../data/safety/trace_audits/terminalbench_yoonholee/case_0000/) |
 | [KernelBench Family Top-19 Review](negative_results/kernelbench_family_top19_review.md) | family-level scan across reduction, conv, and matmul | [kernelbench full review outputs](../../results/external_audit/betty_kernelbench_all_opus46_20260401a/) |
 
 ## Indices And Meta
