@@ -1711,11 +1711,14 @@ def _embed_traces(
     max_chars: int = 2000,
     batch_size: int = 64,
 ):
-    """Embed all traces for a case. Returns (trace_ids, trace_texts, embeddings_array)."""
-    from openai import OpenAI
+    """Embed all traces for a case. Returns (trace_ids, trace_texts, embeddings_array).
+
+    If *embedding_model* starts with ``st/``, use a local sentence-transformers
+    model (e.g. ``st/Alibaba-NLP/gte-base-en-v1.5``).  Otherwise fall back to
+    the OpenAI embeddings API.
+    """
     import numpy as np
 
-    client = OpenAI()
     trace_texts: list[str] = []
     trace_ids: list[str] = []
     for rel in case.trace_files:
@@ -1728,6 +1731,16 @@ def _embed_traces(
     if not trace_texts:
         return [], [], np.array([])
 
+    if embedding_model.startswith("st/"):
+        from sentence_transformers import SentenceTransformer
+        st_model_name = embedding_model[3:]
+        st_model = SentenceTransformer(st_model_name, trust_remote_code=True)
+        embeddings = st_model.encode(trace_texts, batch_size=batch_size, show_progress_bar=False)
+        return trace_ids, trace_texts, np.array(embeddings, dtype=float)
+
+    # Default: OpenAI API
+    from openai import OpenAI
+    client = OpenAI()
     all_embeddings: list[list[float]] = []
     for start in range(0, len(trace_texts), batch_size):
         batch = trace_texts[start:start + batch_size]
@@ -3951,6 +3964,7 @@ def _extract_trace_scores_from_text(text: str) -> dict[str, float]:
         return {}
     block = m.group(1)
     scores: dict[str, float] = {}
+    _valid_re = re.compile(r"^traces/trace_\d{2,4}\.txt$")
     for line in block.strip().split("\n"):
         line = line.strip()
         if not line:
@@ -3971,6 +3985,8 @@ def _extract_trace_scores_from_text(text: str) -> dict[str, float]:
             if path_raw.startswith(prefix):
                 path_raw = path_raw[len(prefix):]
                 break
+        if not _valid_re.match(path_raw):
+            continue  # skip corrupted/truncated paths
         scores[path_raw] = max(0.0, min(1.0, score))
     return scores
 
@@ -5199,7 +5215,9 @@ def main() -> None:
         if args.method != "buffer" and not args.skip_clustering:
             print("Running trace embedding and clustering...")
             _run_trace_embedding_and_clustering(
-                all_cases, strategy=args.distributed_misuse_clustering_strategy,
+                all_cases,
+                strategy=args.distributed_misuse_clustering_strategy,
+                embedding_model=args.embedding_model,
             )
             print("Clustering complete.")
             print("Labeling cluster topics...")
