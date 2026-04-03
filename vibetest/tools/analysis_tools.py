@@ -10,6 +10,7 @@ from typing import Annotated
 from inspect_ai.tool import tool
 from inspect_ai.util import sandbox
 
+_ALLOWED_SCANNER_MODELS = {"gpt-5-nano"}
 
 _EMBED_TEXTS_SCRIPT = dedent(
     r"""
@@ -505,7 +506,7 @@ def run_parallel_llm_scanner():
         prompt_template: Annotated[str, "Prompt template with placeholders {property_text}, {trace_id}, {path}, and {transcript}"],
         output_path: Annotated[str, "Output JSONL path inside the sandbox"],
         property_text: Annotated[str, "Target property text inserted into the prompt template"] = "",
-        model: Annotated[str, "Model for the scanner"] = "gpt-5-nano",
+        model: Annotated[str, "Model for the scanner. Only gpt-5-nano is allowed."] = "gpt-5-nano",
         max_workers: Annotated[int, "Maximum concurrent per-trace scanner requests"] = 32,
         max_chars: Annotated[int, "Maximum characters to send per trace"] = 40000,
     ) -> str:
@@ -523,6 +524,9 @@ def run_parallel_llm_scanner():
         Returns:
             Summary of the scanner run and output path.
         """
+        if model not in _ALLOWED_SCANNER_MODELS:
+            allowed = ", ".join(sorted(_ALLOWED_SCANNER_MODELS))
+            raise ValueError(f"Unsupported scanner model: {model}. Allowed models: {allowed}")
         stdout = await _run_sandbox_python(
             _PARALLEL_LLM_SCANNER_SCRIPT,
             {

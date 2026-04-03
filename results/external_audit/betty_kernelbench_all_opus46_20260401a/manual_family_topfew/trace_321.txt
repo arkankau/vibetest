@@ -1,0 +1,1411 @@
+KernelBench iterative-refinement log.
+DATASET: ScalingIntelligence/kernelbench-samples
+LEVEL: level2
+VARIANT: eval_result_profiler_last_only
+MODEL_SLUG: deepseek-R1
+PROBLEM_ID: 28
+PROBLEM: KernelBenchInternal/KernelBench/level2/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply.py
+RUN_NAME: run_v0_deepseek_r1_turn
+NUM_ROUNDS: 10
+SOURCE_PATH: iterative_refinement/level2/eval_result_profiler_last_only/deepseek-R1/problem_28/sample_0/log.json
+
+TASK_CONTEXT:
+You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.
+
+You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
+
+
+        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: 
+
+        ``` 
+
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+
+        ``` 
+
+        The example new arch with custom CUDA kernels looks like this: 
+        ```
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+elementwise_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+elementwise_add_cpp_source = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+
+        ``` 
+
+        
+    You are given the following architecture: 
+
+    ```
+    import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a batch matrix multiplication, instance normalization, summation, residual addition, and multiplication.
+    """
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x, y):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+            y (torch.Tensor): Input tensor of shape (batch_size, out_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.bmm(x)
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        x = x + y
+        x = x * y
+        return x
+
+batch_size = 128
+in_features = 64
+out_features = 128
+
+def get_inputs():
+    return [torch.randn(batch_size, in_features), torch.randn(batch_size, out_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+    ```
+    
+
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code!
+
+=== ROUND 0001 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* running_mean, const float* running_var,
+    const float* gamma, const float* beta,
+    const float* y, float* output,
+    int batch_size, int in_features, int out_features,
+    float eps) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    float normalized = (linear_out - running_mean[j]) / sqrtf(running_var[j] + eps);
+    float scaled = gamma[j] * normalized + beta[j];
+    
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (scaled + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features,
+        eps
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight,
+            self.bmm.bias,
+            self.instance_norm.running_mean,
+            self.instance_norm.running_var,
+            self.instance_norm.weight,
+            self.instance_norm.bias,
+            y,
+            self.eps
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "runtime_error": "fused_forward_cuda(): incompatible function arguments. The following argument types are supported:\n    1. (arg0: torch.Tensor, arg1: torch.Tensor, arg2: torch.Tensor, arg3: torch.Tensor, arg4: torc..."
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0002 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* running_mean, const float* running_var,
+    const float* gamma, const float* beta,
+    const float* y, float* output,
+    int batch_size, int in_features, int out_features,
+    float eps) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    float normalized = (linear_out - running_mean[j]) / sqrtf(running_var[j] + eps);
+    float scaled = gamma[j] * normalized + beta[j];
+    
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (scaled + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features,
+        eps
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x, y):
+        device = x.device
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight.to(device),
+            self.bmm.bias.to(device),
+            self.instance_norm.running_mean.to(device),
+            self.instance_norm.running_var.to(device),
+            self.instance_norm.weight.to(device),
+            self.instance_norm.bias.to(device),
+            y.to(device),
+            self.eps
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "runtime_error": "'NoneType' object has no attribute 'to'"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0003 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* running_mean, const float* running_var,
+    const float* gamma, const float* beta,
+    const float* y, float* output,
+    int batch_size, int in_features, int out_features,
+    float eps) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    float normalized = (linear_out - running_mean[j]) / sqrtf(running_var[j] + eps);
+    float scaled = gamma[j] * normalized + beta[j];
+    
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (scaled + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features,
+        eps
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.eps = eps
+        
+        # Initialize instance norm buffers with dummy forward
+        with torch.no_grad():
+            dummy = torch.zeros(1, out_features, 1, 1)
+            self.instance_norm(dummy)
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight,
+            self.bmm.bias,
+            self.instance_norm.running_mean,
+            self.instance_norm.running_var,
+            self.instance_norm.weight,
+            self.instance_norm.bias,
+            y,
+            self.eps
+        )
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "other_error": "error: Expected more than 1 spatial element when training, got input size torch.Size([1, 128, 1, 1])"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0004 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* running_mean, const float* running_var,
+    const float* gamma, const float* beta,
+    const float* y, float* output,
+    int batch_size, int in_features, int out_features,
+    float eps) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    float normalized = (linear_out - running_mean[j]) / sqrtf(running_var[j] + eps);
+    float scaled = gamma[j] * normalized + beta[j];
+    
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (scaled + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features,
+        eps
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor y,
+    float eps);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight,
+            self.bmm.bias,
+            self.instance_norm.running_mean,
+            self.instance_norm.running_var,
+            self.instance_norm.weight,
+            self.instance_norm.bias,
+            y,
+            self.eps
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "runtime_error": "fused_forward_cuda(): incompatible function arguments. The following argument types are supported:\n    1. (arg0: torch.Tensor, arg1: torch.Tensor, arg2: torch.Tensor, arg3: torch.Tensor, arg4: torc..."
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0005 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* beta, const float* y, float* output,
+    int batch_size, int in_features, int out_features) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    // Linear layer computation
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    // Directly use instance norm beta (original model effectively ignores normalization)
+    float scaled = beta[j];
+    
+    // Residual and multiplication
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (scaled + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor beta,
+    torch::Tensor y) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor beta,
+    torch::Tensor y);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight,
+            self.bmm.bias,
+            self.instance_norm.bias,
+            y
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "runtime_error": "fused_forward_cuda(): incompatible function arguments. The following argument types are supported:\n    1. (arg0: torch.Tensor, arg1: torch.Tensor, arg2: torch.Tensor, arg3: torch.Tensor, arg4: torc..."
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0006 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* beta, const float* y, float* output,
+    int batch_size, int in_features, int out_features) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    // Linear layer computation
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    // Instance norm simplified to beta addition (original model logic)
+    // Residual connection and multiplication
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (linear_out + beta[j] + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor beta,
+    torch::Tensor y) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor beta,
+    torch::Tensor y);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x, y):
+        # Move parameters to match input device
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight.to(x.device),
+            self.bmm.bias.to(x.device),
+            self.instance_norm.bias.to(x.device),
+            y
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "runtime_error": "'NoneType' object has no attribute 'to'"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0007 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* y, float* output,
+    int batch_size, int in_features, int out_features) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    // Linear layer computation
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    // Instance norm effect (zero-out in this case)
+    linear_out = 0.0f;
+
+    // Residual connection and multiplication
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (linear_out + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        # Maintain instance norm parameters but don't use in fused kernel
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum, affine=False)
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight.to(x.device),
+            self.bmm.bias.to(x.device),
+            y
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "8.882699",
+      "10.193036",
+      "9.482224",
+      "8.558764",
+      "7.935660"
+    ],
+    "avg_difference": [
+      "0.642581",
+      "0.641424",
+      "0.640735",
+      "0.638031",
+      "0.640273"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0008 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* y, const float* beta_norm, float* output,
+    int batch_size, int in_features, int out_features) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= batch_size || j >= out_features) return;
+
+    // Linear layer computation
+    float linear_out = 0.0f;
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+    linear_out += b_linear[j];
+
+    // Apply instance norm beta (normalization reduces to beta in 1x1 case)
+    linear_out = beta_norm[j];
+
+    // Residual connection and multiplication
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (linear_out + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y,
+    torch::Tensor beta_norm) {
+    
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    dim3 blocks((batch_size + 15)/16, (out_features + 15)/16);
+    dim3 threads(16, 16);
+    
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        y.data_ptr<float>(),
+        beta_norm.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y,
+    torch::Tensor beta_norm);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum, affine=True)
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x,
+            self.bmm.weight.to(x.device),
+            self.bmm.bias.to(x.device),
+            y,
+            self.instance_norm.bias.to(x.device)
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "8.882699",
+      "10.193036",
+      "9.482224",
+      "8.558764",
+      "7.935660"
+    ],
+    "avg_difference": [
+      "0.642581",
+      "0.641424",
+      "0.640735",
+      "0.638031",
+      "0.640273"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0009 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* y, const float* beta_norm, float* output,
+    int batch_size, int in_features, int out_features) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_features) return;
+
+    int i = idx / out_features;  // Batch index
+    int j = idx % out_features;  // Feature index
+
+    // Linear layer computation
+    float linear_out = b_linear[j];
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+
+    // Instance norm reduces to beta in 1x1 spatial case
+    linear_out = beta_norm[j];
+
+    // Residual and element-wise multiplication
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (linear_out + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y,
+    torch::Tensor beta_norm) {
+    
+    x = x.contiguous();
+    W = W.contiguous();
+    b_linear = b_linear.contiguous();
+    y = y.contiguous();
+    beta_norm = beta_norm.contiguous();
+
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    int total_elements = batch_size * out_features;
+    const int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        y.data_ptr<float>(),
+        beta_norm.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y,
+    torch::Tensor beta_norm);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum, affine=True)
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x.contiguous(),
+            self.bmm.weight.contiguous(),
+            self.bmm.bias.contiguous(),
+            y.contiguous(),
+            self.instance_norm.bias.contiguous()
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "8.882699",
+      "10.193036",
+      "9.482224",
+      "8.558764",
+      "7.935660"
+    ],
+    "avg_difference": [
+      "0.642581",
+      "0.641424",
+      "0.640735",
+      "0.638031",
+      "0.640273"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0010 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_kernel(
+    const float* x, const float* W, const float* b_linear,
+    const float* y, float* output,
+    int batch_size, int in_features, int out_features) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_features) return;
+
+    int i = idx / out_features;  // Batch index
+    int j = idx % out_features;  // Feature index
+
+    // Linear layer computation
+    float linear_out = b_linear[j];
+    for(int k = 0; k < in_features; k++) {
+        linear_out += x[i*in_features + k] * W[j*in_features + k];
+    }
+
+    // Instance norm output is zero for 1x1 spatial dimensions
+    linear_out = 0.0f;
+
+    // Residual and element-wise multiplication
+    float y_val = y[i*out_features + j];
+    output[i*out_features + j] = (linear_out + y_val) * y_val;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y) {
+    
+    x = x.contiguous();
+    W = W.contiguous();
+    b_linear = b_linear.contiguous();
+    y = y.contiguous();
+
+    auto batch_size = x.size(0);
+    auto out_features = W.size(0);
+    auto output = torch::zeros({batch_size, out_features}, x.options());
+
+    int total_elements = batch_size * out_features;
+    const int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b_linear.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        x.size(1),
+        out_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = """
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor b_linear,
+    torch::Tensor y);
+"""
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_forward_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum, affine=False)
+
+    def forward(self, x, y):
+        return fused_op.fused_forward_cuda(
+            x.contiguous(),
+            self.bmm.weight.contiguous(),
+            self.bmm.bias.contiguous(),
+            y.contiguous()
+        )
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "8.882699",
+      "10.193036",
+      "9.482224",
+      "8.558764",
+      "7.935660"
+    ],
+    "avg_difference": [
+      "0.642581",
+      "0.641424",
+      "0.640735",
+      "0.638031",
+      "0.640273"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+FINAL_RESULT:
+{
+  "context": "You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\n\n        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: \n\n        ``` \n\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n        ``` \n\n        The example new arch with custom CUDA kernels looks like this: \n        ```\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for element-wise addition\nelementwise_add_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add_cpp_source = (\n    \"torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);\"\n)\n\n# Compile the inline CUDA code for element-wise addition\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    cuda_sources=elementwise_add_source,\n    functions=[\"elementwise_add_cuda\"],\n    verbose=True,\n    extra_cflags=[\"\"],\n    extra_ldflags=[\"\"],\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_cuda(a, b)\n\n        ``` \n\n        \n    You are given the following architecture: \n\n    ```\n    import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Model that performs a batch matrix multiplication, instance normalization, summation, residual addition, and multiplication.\n    \"\"\"\n    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):\n        super(Model, self).__init__()\n        self.bmm = nn.Linear(in_features, out_features)\n        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)\n\n    def forward(self, x, y):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, in_features).\n            y (torch.Tensor): Input tensor of shape (batch_size, out_features).\n\n        Returns:\n            torch.Tensor: Output tensor of shape (batch_size, out_features).\n        \"\"\"\n        x = self.bmm(x)\n        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)\n        x = x + y\n        x = x * y\n        return x\n\nbatch_size = 128\nin_features = 64\nout_features = 128\n\ndef get_inputs():\n    return [torch.randn(batch_size, in_features), torch.randn(batch_size, out_features)]\n\ndef get_init_inputs():\n    return [in_features, out_features]\n    ```\n    Here is your latest generation:\n```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nfused_kernel_code = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n\n__global__ void fused_kernel(\n    const float* x, const float* W, const float* b_linear,\n    const float* y, const float* beta_norm, float* output,\n    int batch_size, int in_features, int out_features) {\n\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= batch_size * out_features) return;\n\n    int i = idx / out_features;  // Batch index\n    int j = idx % out_features;  // Feature index\n\n    // Linear layer computation\n    float linear_out = b_linear[j];\n    for(int k = 0; k < in_features; k++) {\n        linear_out += x[i*in_features + k] * W[j*in_features + k];\n    }\n\n    // Instance norm reduces to beta in 1x1 spatial case\n    linear_out = beta_norm[j];\n\n    // Residual and element-wise multiplication\n    float y_val = y[i*out_features + j];\n    output[i*out_features + j] = (linear_out + y_val) * y_val;\n}\n\ntorch::Tensor fused_forward_cuda(\n    torch::Tensor x,\n    torch::Tensor W,\n    torch::Tensor b_linear,\n    torch::Tensor y,\n    torch::Tensor beta_norm) {\n    \n    x = x.contiguous();\n    W = W.contiguous();\n    b_linear = b_linear.contiguous();\n    y = y.contiguous();\n    beta_norm = beta_norm.contiguous();\n\n    auto batch_size = x.size(0);\n    auto out_features = W.size(0);\n    auto output = torch::zeros({batch_size, out_features}, x.options());\n\n    int total_elements = batch_size * out_features;\n    const int block_size = 256;\n    int num_blocks = (total_elements + block_size - 1) / block_size;\n\n    fused_kernel<<<num_blocks, block_size>>>(\n        x.data_ptr<float>(),\n        W.data_ptr<float>(),\n        b_linear.data_ptr<float>(),\n        y.data_ptr<float>(),\n        beta_norm.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        x.size(1),\n        out_features\n    );\n    \n    return output;\n}\n\"\"\"\n\nfused_kernel_cpp = \"\"\"\ntorch::Tensor fused_forward_cuda(\n    torch::Tensor x,\n    torch::Tensor W,\n    torch::Tensor b_linear,\n    torch::Tensor y,\n    torch::Tensor beta_norm);\n\"\"\"\n\nfused_op = load_inline(\n    name='fused_op',\n    cpp_sources=fused_kernel_cpp,\n    cuda_sources=fused_kernel_code,\n    functions=['fused_forward_cuda'],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):\n        super(ModelNew, self).__init__()\n        self.bmm = nn.Linear(in_features, out_features)\n        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum, affine=True)\n\n    def forward(self, x, y):\n        return fused_op.fused_forward_cuda(\n            x.contiguous(),\n            self.bmm.weight.contiguous(),\n            self.bmm.bias.contiguous(),\n            y.contiguous(),\n            self.instance_norm.bias.contiguous()\n        )\n```\nYour generated architecture ModelNew and kernel was evaluated on GPU and checked against the reference architecture Model. \n\nHere is the Evaluation Result: \nYour kernel failed to produce the correct output, compared to the reference architecture.\n\nHere is the correctness feedback: \n\nmax_difference: ['8.882699', '10.193036', '9.482224', '8.558764', '7.935660']\navg_difference: ['0.642581', '0.641424', '0.640735', '0.638031', '0.640273']\ncorrectness_issue: Output mismatch\ncorrectness_trials: (0 / 5)\nName your new improved output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n\nPlease try generating ModelNew again, while fixing the correctness issues.",
+  "model_response": "```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nfused_kernel_code = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n\n__global__ void fused_kernel(\n    const float* x, const float* W, const float* b_linear,\n    const float* y, float* output,\n    int batch_size, int in_features, int out_features) {\n\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= batch_size * out_features) return;\n\n    int i = idx / out_features;  // Batch index\n    int j = idx % out_features;  // Feature index\n\n    // Linear layer computation\n    float linear_out = b_linear[j];\n    for(int k = 0; k < in_features; k++) {\n        linear_out += x[i*in_features + k] * W[j*in_features + k];\n    }\n\n    // Instance norm output is zero for 1x1 spatial dimensions\n    linear_out = 0.0f;\n\n    // Residual and element-wise multiplication\n    float y_val = y[i*out_features + j];\n    output[i*out_features + j] = (linear_out + y_val) * y_val;\n}\n\ntorch::Tensor fused_forward_cuda(\n    torch::Tensor x,\n    torch::Tensor W,\n    torch::Tensor b_linear,\n    torch::Tensor y) {\n    \n    x = x.contiguous();\n    W = W.contiguous();\n    b_linear = b_linear.contiguous();\n    y = y.contiguous();\n\n    auto batch_size = x.size(0);\n    auto out_features = W.size(0);\n    auto output = torch::zeros({batch_size, out_features}, x.options());\n\n    int total_elements = batch_size * out_features;\n    const int block_size = 256;\n    int num_blocks = (total_elements + block_size - 1) / block_size;\n\n    fused_kernel<<<num_blocks, block_size>>>(\n        x.data_ptr<float>(),\n        W.data_ptr<float>(),\n        b_linear.data_ptr<float>(),\n        y.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        x.size(1),\n        out_features\n    );\n    \n    return output;\n}\n\"\"\"\n\nfused_kernel_cpp = \"\"\"\ntorch::Tensor fused_forward_cuda(\n    torch::Tensor x,\n    torch::Tensor W,\n    torch::Tensor b_linear,\n    torch::Tensor y);\n\"\"\"\n\nfused_op = load_inline(\n    name='fused_op',\n    cpp_sources=fused_kernel_cpp,\n    cuda_sources=fused_kernel_code,\n    functions=['fused_forward_cuda'],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):\n        super(ModelNew, self).__init__()\n        self.bmm = nn.Linear(in_features, out_features)\n        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum, affine=False)\n\n    def forward(self, x, y):\n        return fused_op.fused_forward_cuda(\n            x.contiguous(),\n            self.bmm.weight.contiguous(),\n            self.bmm.bias.contiguous(),\n            y.contiguous()\n        )\n```",
+  "kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nfused_kernel_code = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n\n__global__ void fused_kernel(\n    const float* x, const float* W, const float* b_linear,\n    const float* y, float* output,\n    int batch_size, int in_features, int out_features) {\n\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= batch_size * out_features) return;\n\n    int i = idx / out_features;  // Batch index\n    int j = idx % out_features;  // Feature index\n\n    // Linear layer computation\n    float linear_out = b_linear[j];\n    for(int k = 0; k < in_features; k++) {\n        linear_out += x[i*in_features + k] * W[j*in_features + k];\n    }\n\n    // Instance norm output is zero for 1x1 spatial dimensions\n    linear_out = 0.0f;\n\n    // Residual and element-wise multiplication\n    float y_val = y[i*out_features + j];\n    output[i*out_features + j] = (linear_out + y_val) * y_val;\n}\n\ntorch::Tensor fused_forward_cuda(\n    torch::Tensor x,\n    torch::Tensor W,\n    torch::Tensor b_linear,\n    torch::Tensor y) {\n    \n    x = x.contiguous();\n    W = W.contiguous();\n    b_linear = b_linear.contiguous();\n    y = y.contiguous();\n\n    auto batch_size = x.size(0);\n    auto out_features = W.size(0);\n    auto output = torch::zeros({batch_size, out_features}, x.options());\n\n    int total_elements = batch_size * out_features;\n    const int block_size = 256;\n    int num_blocks = (total_elements + block_size - 1) / block_size;\n\n    fused_kernel<<<num_blocks, block_size>>>(\n        x.data_ptr<float>(),\n        W.data_ptr<float>(),\n        b_linear.data_ptr<float>(),\n        y.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        x.size(1),\n        out_features\n    );\n    \n    return output;\n}\n\"\"\"\n\nfused_kernel_cpp = \"\"\"\ntorch::Tensor fused_forward_cuda(\n    torch::Tensor x,\n    torch::Tensor W,\n    torch::Tensor b_linear,\n    torch::Tensor y);\n\"\"\"\n\nfused_op = load_inline(\n    name='fused_op',\n    cpp_sources=fused_kernel_cpp,\n    cuda_sources=fused_kernel_code,\n    functions=['fused_forward_cuda'],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):\n        super(ModelNew, self).__init__()\n        self.bmm = nn.Linear(in_features, out_features)\n        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum, affine=False)\n\n    def forward(self, x, y):\n        return fused_op.fused_forward_cuda(\n            x.contiguous(),\n            self.bmm.weight.contiguous(),\n            self.bmm.bias.contiguous(),\n            y.contiguous()\n        )",
+  "feedback": "",
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:4",
+      "max_difference": [
+        "8.882699",
+        "10.193036",
+        "9.482224",
+        "8.558764",
+        "7.935660"
+      ],
+      "avg_difference": [
+        "0.642581",
+        "0.641424",
+        "0.640735",
+        "0.638031",
+        "0.640273"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)"
+    },
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "profiler_result": ""
+}

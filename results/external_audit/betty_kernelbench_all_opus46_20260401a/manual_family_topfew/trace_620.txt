@@ -1,0 +1,3231 @@
+KernelBench iterative-refinement log.
+DATASET: ScalingIntelligence/kernelbench-samples
+LEVEL: level3
+VARIANT: eval_result_profiler_last_only
+MODEL_SLUG: deepseek-R1
+PROBLEM_ID: 28
+PROBLEM: KernelBenchInternal/KernelBench/level3/28_VisionTransformer.py
+RUN_NAME: run_v0_deepseek_r1_turn
+NUM_ROUNDS: 10
+SOURCE_PATH: iterative_refinement/level3/eval_result_profiler_last_only/deepseek-R1/problem_28/sample_0/log.json
+
+TASK_CONTEXT:
+You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.
+
+You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
+
+
+        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: 
+
+        ``` 
+
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+
+        ``` 
+
+        The example new arch with custom CUDA kernels looks like this: 
+        ```
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+elementwise_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+elementwise_add_cpp_source = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+
+        ``` 
+
+        
+    You are given the following architecture: 
+
+    ```
+    import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        """
+        Vision Transformer (ViT) model.
+
+        :param image_size: The size of the input image (assumed to be square).
+        :param patch_size: The size of each patch (assumed to be square).
+        :param num_classes: The number of output classes.
+        :param dim: The dimensionality of the embedding space.
+        :param depth: The number of transformer layers.
+        :param heads: The number of attention heads.
+        :param mlp_dim: The dimensionality of the MLP (Multi-Layer Perceptron) in the transformer.
+        :param channels: The number of channels in the input image (default is 3 for RGB).
+        :param dropout: Dropout rate applied in the MLP.
+        :param emb_dropout: Dropout rate applied to the embedded patches.
+        """
+        super(Model, self).__init__()
+        
+        assert image_size % patch_size == 0, "Image dimensions must be divisible by the patch size."
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dim_feedforward=mlp_dim, dropout=dropout),
+            num_layers=depth
+        )
+        
+        self.to_cls_token = nn.Identity()
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+    
+    def forward(self, img):
+        """
+        Forward pass of the Vision Transformer.
+
+        :param img: The input image tensor, shape (batch_size, channels, image_size, image_size).
+        :return: The output tensor, shape (batch_size, num_classes).
+        """
+        p = self.patch_size
+        
+        x = img.unfold(2, p, p).unfold(3, p, p).reshape(img.shape[0], -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        cls_tokens = self.cls_token.expand(img.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        x = self.transformer(x)
+        
+        x = self.to_cls_token(x[:, 0])
+        return self.mlp_head(x)
+
+# Test code
+image_size = 224
+patch_size = 16
+num_classes = 10
+dim = 512
+depth = 6
+heads = 8
+mlp_dim = 2048
+channels = 3
+dropout = 0.0
+emb_dropout = 0.0
+
+def get_inputs():
+    return [torch.randn(2, channels, image_size, image_size)]
+
+def get_init_inputs():
+    return [image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels, dropout, emb_dropout]
+    ```
+    
+
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code!
+
+=== ROUND 0001 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for critical ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+// Fused QKV projection kernel
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* q_weight,
+    const float* k_weight,
+    const float* v_weight,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    int head = feat / head_dim;
+    int head_feat = feat % head_dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[i * dim + feat];
+        k_val += in_ptr[i] * k_weight[i * dim + feat];
+        v_val += in_ptr[i] * v_weight[i * dim + feat];
+    }
+    
+    q_out[batch * seq_len * dim + seq * dim + feat] = q_val;
+    k_out[batch * seq_len * dim + seq * dim + feat] = k_val;
+    v_out[batch * seq_len * dim + seq * dim + feat] = v_val;
+}
+
+// Online softmax with dropout
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    float* dropout_mask,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + idx * seq_len;
+    float* softmax_row = softmax_out + idx * seq_len;
+    float* mask_row = dropout_mask + idx * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // Find max and sum exp
+    for(int i = 0; i < seq_len; ++i) {
+        float val = qk_row[i];
+        max_val = max(max_val, val);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    // Apply softmax and dropout
+    curandStatePhilox4_32_10_t state;
+    curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        softmax_row[i] /= sum_exp;
+        mask_row[i] = (curand_uniform(&state) < dropout_prob) ? 0.0f : 1.0f / (1.0f - dropout_prob);
+        softmax_row[i] *= mask_row[i];
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor q_weight,
+    torch::Tensor k_weight,
+    torch::Tensor v_weight
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    auto head_dim = dim / 8;  // heads=8
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        q_weight.data_ptr<float>(),
+        k_weight.data_ptr<float>(),
+        v_weight.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim,
+        head_dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    auto dropout_mask = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        dropout_mask.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor q_weight, torch::Tensor k_weight, torch::Tensor v_weight);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        # QKV projections
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        
+        # MLP with fused GELU
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        # Fused QKV projection
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        qkv = vit_ext.fused_qkv_projection(x, 
+            self.q_proj.weight, self.k_proj.weight, self.v_proj.weight)
+        
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout)
+        x = torch.matmul(attn, v)
+        
+        # Residual connection
+        x = self.norm1(x + x)
+        
+        # MLP with fused GELU
+        x = self.norm2(x + self.mlp(x))
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        # Custom transformer encoder with fused layers
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+    
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        # Patch embedding with efficient CUDA ops
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        # Add CLS token and position embedding
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        # Process with fused transformer
+        x = self.transformer(x)
+        
+        # Classifier
+        return self.mlp_head(x[:, 0])
+FEEDBACK:
+Compilation failed:
+stdout: [1/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=vit_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu -o cuda.cuda.o 
+FAILED: cuda.cuda.o 
+/usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=vit_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu -o cuda.cuda.o 
+/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu(88): error: identifier "curandStatePhilox4_32_10_t" is undefined
+      curandStatePhilox4_32_10_t state;
+      ^
+
+/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu(89): error: identifier "curand_init" is undefined
+      curand_init(clock64(), idx, 0, &state);
+      ^
+
+/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu(93): error: identifier "curand_uniform" is undefined
+          mask_row[i] = (curand_uniform(&state) < dropout_prob) ? 0.0f : 1.0f / (1.0f - dropout_prob);
+                         ^
+
+3 errors detected in the compilation of "/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu".
+[2/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=vit_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/main.cpp -o main.o 
+ninja: build stopped: subcommand failed.
+
+stderr: Using /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425 as PyTorch extensions root...
+Creating extension directory /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext...
+Detected CUDA files, patching ldflags
+Emitting ninja build file /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/build.ninja...
+Building extension module vit_ext...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+Traceback (most recent call last):
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2104, in _run_ninja_build
+    subprocess.run(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/subprocess.py", line 526, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/tmp_-1090179030755131181.py", line 170, in <module>
+    vit_ext = load_inline(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1646, in load_inline
+    return _jit_compile(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1721, in _jit_compile
+    _write_ninja_file_and_build_library(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1833, in _write_ninja_file_and_build_library
+    _run_ninja_build(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2120, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error building extension 'vit_ext'
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "compiler_error": "Compilation failed:\nstdout: [1/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=vit_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu -o cuda.cuda.o \nFAILED: cuda.cuda.o \n/usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=vit_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu -o cuda.cuda.o \n/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu(88): error: identifier \"curandStatePhilox4_32_10_t\" is undefined\n      curandStatePhilox4_32_10_t state;\n      ^\n\n/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu(89): error: identifier \"curand_init\" is undefined\n      curand_init(clock64(), idx, 0, &state);\n      ^\n\n/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu(93): error: identifier \"curand_uniform\" is undefined\n          mask_row[i] = (curand_uniform(&state) < dropout_prob) ? 0.0f : 1.0f / (1.0f - dropout_prob);\n                         ^\n\n3 errors detected in the compilation of \"/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/cuda.cu\".\n[2/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=vit_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/main.cpp -o main.o \nninja: build stopped: subcommand failed.\n\nstderr: Using /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425 as PyTorch extensions root...\nCreating extension directory /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext...\nDetected CUDA files, patching ldflags\nEmitting ninja build file /matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/vit_ext/build.ninja...\nBuilding extension module vit_ext...\nAllowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)\nTraceback (most recent call last):\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 2104, in _run_ninja_build\n    subprocess.run(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/subprocess.py\", line 526, in run\n    raise CalledProcessError(retcode, process.args,\nsubprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/matx/u/simonguo/kernel_eval_build/level3_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_28/sample_0/5609349914690466425/tmp_-1090179030755131181.py\", line 170, in <module>\n    vit_ext = load_inline(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1646, in load_inline\n    return _jit_compile(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1721, in _jit_compile\n    _write_ninja_file_and_build_library(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1833, in _write_ninja_file_and_build_library\n    _run_ninja_build(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 2120, in _run_ninja_build\n    raise RuntimeError(message) from e\nRuntimeError: Error building extension 'vit_ext'\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0002 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for critical ViT components with fixed includes
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+#include <cub/cub.cuh>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+// Fused QKV projection kernel
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* q_weight,
+    const float* k_weight,
+    const float* v_weight,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[i * dim + feat];
+        k_val += in_ptr[i] * k_weight[i * dim + feat];
+        v_val += in_ptr[i] * v_weight[i * dim + feat];
+    }
+    
+    q_out[batch * seq_len * dim + seq * dim + feat] = q_val;
+    k_out[batch * seq_len * dim + seq * dim + feat] = k_val;
+    v_out[batch * seq_len * dim + seq * dim + feat] = v_val;
+}
+
+// Online softmax with dropout (fixed curand includes)
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    float* dropout_mask,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + idx * seq_len;
+    float* softmax_row = softmax_out + idx * seq_len;
+    float* mask_row = dropout_mask + idx * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // Find max and sum exp
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = max(max_val, qk_row[i]);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    // Apply softmax and dropout
+    curandStatePhilox4_32_10_t state;
+    curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        softmax_row[i] /= sum_exp;
+        mask_row[i] = (curand_uniform(&state) < dropout_prob) ? 0.0f : 1.0f / (1.0f - dropout_prob);
+        softmax_row[i] *= mask_row[i];
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor q_weight,
+    torch::Tensor k_weight,
+    torch::Tensor v_weight
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        q_weight.data_ptr<float>(),
+        k_weight.data_ptr<float>(),
+        v_weight.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim,
+        dim / 8  // heads=8
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    auto dropout_mask = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        dropout_mask.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor q_weight, torch::Tensor k_weight, torch::Tensor v_weight);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        # QKV projections
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        
+        # MLP with fused GELU
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        # Fused QKV projection
+        qkv = vit_ext.fused_qkv_projection(x, 
+            self.q_proj.weight, self.k_proj.weight, self.v_proj.weight)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout)
+        x = torch.matmul(attn, v)
+        
+        # Residual connection
+        x = self.norm1(x + x)
+        
+        # MLP with fused GELU
+        x = self.norm2(x + self.mlp(x))
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        # Custom transformer encoder with fused layers
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+    
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        # Patch embedding
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        # Add CLS token and position embedding
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        # Process with fused transformer
+        x = self.transformer(x)
+        
+        # Classifier
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0003 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* q_weight,
+    const float* k_weight,
+    const float* v_weight,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[feat * dim + i];
+        k_val += in_ptr[i] * k_weight[feat * dim + i];
+        v_val += in_ptr[i] * v_weight[feat * dim + i];
+    }
+    
+    q_out[idx] = q_val;
+    k_out[idx] = k_val;
+    v_out[idx] = v_val;
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // Find max and sum exp
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    // Apply dropout
+    curandStatePhilox4_32_10_t state;
+    curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float keep_prob = 1.0f - dropout_prob;
+        float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+        softmax_row[i] = (softmax_row[i] / sum_exp) * mask;
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor q_weight,
+    torch::Tensor k_weight,
+    torch::Tensor v_weight
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        q_weight.data_ptr<float>(),
+        k_weight.data_ptr<float>(),
+        v_weight.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor q_weight, torch::Tensor k_weight, torch::Tensor v_weight);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        # QKV projections
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        
+        # MLP with fused GELU
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        residual = x
+        
+        # Fused QKV projection
+        qkv = vit_ext.fused_qkv_projection(
+            x, 
+            self.q_proj.weight,
+            self.k_proj.weight,
+            self.v_proj.weight
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Split into heads
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        # Attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout)
+        x = torch.matmul(attn, v)
+        
+        # Merge heads
+        x = x.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        
+        # Residual connection
+        x = self.norm1(x + residual)
+        
+        # MLP
+        x = self.norm2(x + self.mlp(x))
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        # Custom transformer encoder with fused layers
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+    
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        # Patch embedding
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        # Add CLS token and position embedding
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        # Process with fused transformer
+        x = self.transformer(x)
+        
+        # Classifier
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "1.121305",
+      "1.037930",
+      "1.093794",
+      "1.092410",
+      "1.040678"
+    ],
+    "avg_difference": [
+      "0.553433",
+      "0.528630",
+      "0.527545",
+      "0.527060",
+      "0.531760"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0004 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* qkv_weight,
+    const float* qkv_bias,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    
+    // Split weights and biases into Q, K, V parts
+    const float* q_weight = qkv_weight;
+    const float* k_weight = qkv_weight + dim * dim;
+    const float* v_weight = qkv_weight + 2 * dim * dim;
+    
+    const float* q_bias = qkv_bias;
+    const float* k_bias = qkv_bias + dim;
+    const float* v_bias = qkv_bias + 2 * dim;
+    
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[feat * dim + i];
+        k_val += in_ptr[i] * k_weight[feat * dim + i];
+        v_val += in_ptr[i] * v_weight[feat * dim + i];
+    }
+    
+    q_val += q_bias[feat];
+    k_val += k_bias[feat];
+    v_val += v_bias[feat];
+    
+    q_out[idx] = q_val;
+    k_out[idx] = k_val;
+    v_out[idx] = v_val;
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // Find max and sum exp
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    // Apply dropout
+    curandStatePhilox4_32_10_t state;
+    curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float keep_prob = 1.0f - dropout_prob;
+        float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+        softmax_row[i] = (softmax_row[i] / sum_exp) * mask;
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor qkv_weight,
+    torch::Tensor qkv_bias
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        qkv_weight.data_ptr<float>(),
+        qkv_bias.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        # Combined QKV projection
+        self.qkv_proj = nn.Linear(dim, 3 * dim)
+        
+        # MLP with fused GELU
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        residual = x
+        
+        # Fused QKV projection
+        qkv = vit_ext.fused_qkv_projection(
+            self.norm1(x),
+            self.qkv_proj.weight,
+            self.qkv_proj.bias
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Split into heads
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        # Attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout)
+        x = torch.matmul(attn, v)
+        
+        # Merge heads
+        x = x.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        
+        # Residual connection
+        x = residual + x
+        
+        # MLP
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        # Custom transformer encoder with fused layers
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+    
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        # Patch embedding
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        # Add CLS token and position embedding
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        # Process with fused transformer
+        x = self.transformer(x)
+        
+        # Classifier
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "1.012003",
+      "1.011493",
+      "1.008971",
+      "1.023548",
+      "1.044896"
+    ],
+    "avg_difference": [
+      "0.488693",
+      "0.479511",
+      "0.487156",
+      "0.489024",
+      "0.495547"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0005 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* qkv_weight,
+    const float* qkv_bias,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    
+    // Split weights into Q, K, V parts (transposed access)
+    const float* q_weight = qkv_weight;
+    const float* k_weight = qkv_weight + dim * dim;
+    const float* v_weight = qkv_weight + 2 * dim * dim;
+    
+    const float* q_bias = qkv_bias;
+    const float* k_bias = qkv_bias + dim;
+    const float* v_bias = qkv_bias + 2 * dim;
+    
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[i * dim + feat];
+        k_val += in_ptr[i] * k_weight[i * dim + feat];
+        v_val += in_ptr[i] * v_weight[i * dim + feat];
+    }
+    
+    q_out[idx] = q_val + q_bias[feat];
+    k_out[idx] = k_val + k_bias[feat];
+    v_out[idx] = v_val + v_bias[feat];
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob,
+    bool training
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // Find max and sum exp
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    // Apply dropout only during training
+    curandStatePhilox4_32_10_t state;
+    if(training) curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float val = softmax_row[i] / sum_exp;
+        if(training) {
+            float keep_prob = 1.0f - dropout_prob;
+            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+            val *= mask;
+        }
+        softmax_row[i] = val;
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor qkv_weight,
+    torch::Tensor qkv_bias
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        qkv_weight.data_ptr<float>(),
+        qkv_bias.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob,
+    bool training
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob,
+        training
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        # Combined QKV projection
+        self.qkv_proj = nn.Linear(dim, 3 * dim)
+        
+        # MLP with fused GELU
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        # Self-attention block
+        residual = x
+        
+        # Fused QKV projection
+        qkv = vit_ext.fused_qkv_projection(
+            x,  # No norm here for post-LN structure
+            self.qkv_proj.weight,
+            self.qkv_proj.bias
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Split into heads
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        # Attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)
+        x = torch.matmul(attn, v)
+        
+        # Merge heads
+        x = x.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        
+        # Post-LN structure
+        x = residual + x
+        x = self.norm1(x)
+        
+        # MLP block
+        residual = x
+        x = self.mlp(x)
+        x = residual + x
+        x = self.norm2(x)
+        
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        # Custom transformer encoder with fused layers
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+    
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        # Patch embedding
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        # Add CLS token and position embedding
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        # Process with fused transformer
+        x = self.transformer(x)
+        
+        # Classifier
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "0.837472",
+      "0.803507",
+      "0.798193",
+      "0.854659",
+      "0.826317"
+    ],
+    "avg_difference": [
+      "0.486807",
+      "0.477495",
+      "0.477022",
+      "0.468296",
+      "0.465748"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0006 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* qkv_weight,
+    const float* qkv_bias,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    
+    // Split weights into Q, K, V parts (transposed access)
+    const float* q_weight = qkv_weight;
+    const float* k_weight = qkv_weight + dim * dim;
+    const float* v_weight = qkv_weight + 2 * dim * dim;
+    
+    const float* q_bias = qkv_bias;
+    const float* k_bias = qkv_bias + dim;
+    const float* v_bias = qkv_bias + 2 * dim;
+    
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[feat * dim + i];  // Fixed weight indexing
+        k_val += in_ptr[i] * k_weight[feat * dim + i];
+        v_val += in_ptr[i] * v_weight[feat * dim + i];
+    }
+    
+    q_out[idx] = q_val + q_bias[feat];
+    k_out[idx] = k_val + k_bias[feat];
+    v_out[idx] = v_val + v_bias[feat];
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob,
+    bool training
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // Find max and sum exp
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    // Apply dropout only during training
+    curandStatePhilox4_32_10_t state;
+    if(training) curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float val = softmax_row[i] / sum_exp;
+        if(training) {
+            float keep_prob = 1.0f - dropout_prob;
+            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+            val *= mask;
+        }
+        softmax_row[i] = val;
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor qkv_weight,
+    torch::Tensor qkv_bias
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        qkv_weight.data_ptr<float>(),
+        qkv_bias.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob,
+    bool training
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob,
+        training
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        # Combined QKV projection
+        self.qkv_proj = nn.Linear(dim, 3 * dim)
+        
+        # MLP with fused GELU
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        # Self-attention block
+        residual = x
+        
+        # Fused QKV projection with correct normalization order
+        qkv = vit_ext.fused_qkv_projection(
+            self.norm1(x),  # Apply layer norm before projection
+            self.qkv_proj.weight,
+            self.qkv_proj.bias
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Split into heads
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        # Attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)
+        x = torch.matmul(attn, v)
+        
+        # Merge heads
+        x = x.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        
+        # Post-LN structure
+        x = residual + x
+        
+        # MLP block
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = residual + x
+        
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        # Custom transformer encoder with fused layers
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+    
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        # Patch embedding
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        # Add CLS token and position embedding
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        # Process with fused transformer
+        x = self.transformer(x)
+        
+        # Classifier
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "1.012003",
+      "1.011493",
+      "1.008966",
+      "1.023548",
+      "1.044896"
+    ],
+    "avg_difference": [
+      "0.488693",
+      "0.479511",
+      "0.487154",
+      "0.489024",
+      "0.495547"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0007 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* qkv_weight,
+    const float* qkv_bias,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    
+    // Split weights into Q, K, V parts
+    const float* q_weight = qkv_weight;
+    const float* k_weight = qkv_weight + dim * dim;
+    const float* v_weight = qkv_weight + 2 * dim * dim;
+    
+    const float* q_bias = qkv_bias;
+    const float* k_bias = qkv_bias + dim;
+    const float* v_bias = qkv_bias + 2 * dim;
+    
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[i * dim + feat];  // Transposed access
+        k_val += in_ptr[i] * k_weight[i * dim + feat];
+        v_val += in_ptr[i] * v_weight[i * dim + feat];
+    }
+    
+    q_out[idx] = q_val + q_bias[feat];
+    k_out[idx] = k_val + k_bias[feat];
+    v_out[idx] = v_val + v_bias[feat];
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob,
+    bool training
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    curandStatePhilox4_32_10_t state;
+    if(training) curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float val = softmax_row[i] / sum_exp;
+        if(training) {
+            float keep_prob = 1.0f - dropout_prob;
+            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+            val *= mask;
+        }
+        softmax_row[i] = val;
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor qkv_weight,
+    torch::Tensor qkv_bias
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        qkv_weight.data_ptr<float>(),
+        qkv_bias.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob,
+    bool training
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob,
+        training
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        self.qkv_proj = nn.Linear(dim, 3 * dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        # Self-attention block
+        residual = x
+        
+        qkv = vit_ext.fused_qkv_projection(
+            x,
+            self.qkv_proj.weight,
+            self.qkv_proj.bias
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)
+        attn_output = torch.matmul(attn, v)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        x = residual + attn_output
+        x = self.norm1(x)
+        
+        # MLP block
+        residual = x
+        x = self.mlp(x)
+        x = residual + x
+        x = self.norm2(x)
+        
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        x = self.transformer(x)
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "0.939798",
+      "0.928936",
+      "0.930332",
+      "0.932182",
+      "0.923063"
+    ],
+    "avg_difference": [
+      "0.173321",
+      "0.163970",
+      "0.165382",
+      "0.162145",
+      "0.160247"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0008 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* qkv_weight,
+    const float* qkv_bias,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    
+    // Split weights into Q, K, V parts
+    const float* q_weight = qkv_weight;
+    const float* k_weight = qkv_weight + dim * dim;
+    const float* v_weight = qkv_weight + 2 * dim * dim;
+    
+    const float* q_bias = qkv_bias;
+    const float* k_bias = qkv_bias + dim;
+    const float* v_bias = qkv_bias + 2 * dim;
+    
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[feat * dim + i];
+        k_val += in_ptr[i] * k_weight[feat * dim + i];
+        v_val += in_ptr[i] * v_weight[feat * dim + i];
+    }
+    
+    q_out[idx] = q_val + q_bias[feat];
+    k_out[idx] = k_val + k_bias[feat];
+    v_out[idx] = v_val + v_bias[feat];
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob,
+    bool training
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    sum_exp += 1e-6f;
+    
+    curandStatePhilox4_32_10_t state;
+    if(training) curand_init(clock64(), idx, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float val = softmax_row[i] / sum_exp;
+        if(training) {
+            float keep_prob = 1.0f - dropout_prob;
+            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+            val *= mask;
+        }
+        softmax_row[i] = val;
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor qkv_weight,
+    torch::Tensor qkv_bias
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        qkv_weight.data_ptr<float>(),
+        qkv_bias.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob,
+    bool training
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob,
+        training
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        self.qkv_proj = nn.Linear(dim, 3 * dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout_attn = nn.Dropout(dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        residual = x
+        
+        qkv = vit_ext.fused_qkv_projection(
+            x,
+            self.qkv_proj.weight,
+            self.qkv_proj.bias
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)
+        attn_output = torch.matmul(attn, v)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        attn_output = self.out_proj(attn_output)
+        attn_output = self.dropout_attn(attn_output)
+        x = residual + attn_output
+        x = self.norm1(x)
+        
+        residual = x
+        x = self.mlp(x)
+        x = residual + x
+        x = self.norm2(x)
+        
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        x = self.transformer(x)
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "0.566087",
+      "0.569639",
+      "0.569058",
+      "0.563334",
+      "0.561635"
+    ],
+    "avg_difference": [
+      "0.225870",
+      "0.221999",
+      "0.226962",
+      "0.223894",
+      "0.225823"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0009 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized ViT components
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* qkv_weight,
+    const float* qkv_bias,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    
+    // Split weights into Q, K, V parts with transposed access
+    const float* q_weight = qkv_weight;
+    const float* k_weight = qkv_weight + dim * dim;
+    const float* v_weight = qkv_weight + 2 * dim * dim;
+    
+    const float* q_bias = qkv_bias;
+    const float* k_bias = qkv_bias + dim;
+    const float* v_bias = qkv_bias + 2 * dim;
+    
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        q_val += in_ptr[i] * q_weight[i * dim + feat];  // Transposed access
+        k_val += in_ptr[i] * k_weight[i * dim + feat];
+        v_val += in_ptr[i] * v_weight[i * dim + feat];
+    }
+    
+    q_out[idx] = q_val + q_bias[feat];
+    k_out[idx] = k_val + k_bias[feat];
+    v_out[idx] = v_val + v_bias[feat];
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob,
+    bool training
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // First pass: find max and compute exp
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    // Second pass: compute exponentials and sum
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    // Third pass: normalize and apply dropout
+    curandStatePhilox4_32_10_t state;
+    if(training) curand_init(blockIdx.x * blockDim.x + threadIdx.x, 0, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        float val = softmax_row[i] / sum_exp;
+        if(training && dropout_prob > 0.0f) {
+            float keep_prob = 1.0f - dropout_prob;
+            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+            val *= mask;
+        }
+        softmax_row[i] = val;
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor qkv_weight,
+    torch::Tensor qkv_bias
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        qkv_weight.data_ptr<float>(),
+        qkv_bias.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob,
+    bool training
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob,
+        training
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        self.qkv_proj = nn.Linear(dim, 3 * dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout_attn = nn.Dropout(dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        residual = x
+        
+        qkv = vit_ext.fused_qkv_projection(
+            x,
+            self.qkv_proj.weight,
+            self.qkv_proj.bias
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)
+        attn_output = torch.matmul(attn, v)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        attn_output = self.out_proj(attn_output)
+        attn_output = self.dropout_attn(attn_output)
+        x = residual + attn_output
+        x = self.norm1(x)
+        
+        residual = x
+        x = self.mlp(x)
+        x = residual + x
+        x = self.norm2(x)
+        
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        x = self.transformer(x)
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "0.551915",
+      "0.560380",
+      "0.559741",
+      "0.544343",
+      "0.555274"
+    ],
+    "avg_difference": [
+      "0.239366",
+      "0.238790",
+      "0.243301",
+      "0.240613",
+      "0.240291"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0010 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Corrected CUDA kernels with proper weight access pattern
+vit_kernels = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#define CEIL_DIV(a, b) ((a + b - 1) / b)
+
+__global__ void qkv_projection_kernel(
+    const float* input,
+    const float* qkv_weight,
+    const float* qkv_bias,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * seq_len * dim) return;
+    
+    int batch = idx / (seq_len * dim);
+    int seq = (idx / dim) % seq_len;
+    int feat = idx % dim;
+    
+    const float* in_ptr = input + batch * seq_len * dim + seq * dim;
+    
+    // Split weights into Q, K, V parts with corrected access pattern
+    const float* q_weight = qkv_weight;
+    const float* k_weight = qkv_weight + dim * dim;
+    const float* v_weight = qkv_weight + 2 * dim * dim;
+    
+    const float* q_bias = qkv_bias;
+    const float* k_bias = qkv_bias + dim;
+    const float* v_bias = qkv_bias + 2 * dim;
+    
+    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
+    
+    for(int i = 0; i < dim; ++i) {
+        // Corrected weight access: feat*dim + i instead of i*dim + feat
+        q_val += in_ptr[i] * q_weight[feat * dim + i];
+        k_val += in_ptr[i] * k_weight[feat * dim + i];
+        v_val += in_ptr[i] * v_weight[feat * dim + i];
+    }
+    
+    q_out[idx] = q_val + q_bias[feat];
+    k_out[idx] = k_val + k_bias[feat];
+    v_out[idx] = v_val + v_bias[feat];
+}
+
+__global__ void online_softmax_dropout_kernel(
+    const float* qk_mat,
+    float* softmax_out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    float dropout_prob,
+    bool training
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= batch_size * num_heads * seq_len) return;
+
+    int batch = idx / (num_heads * seq_len);
+    int head = (idx / seq_len) % num_heads;
+    int seq = idx % seq_len;
+    
+    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;
+    
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    
+    // Find max value for numerical stability
+    for(int i = 0; i < seq_len; ++i) {
+        max_val = fmaxf(max_val, qk_row[i]);
+    }
+    
+    // Compute exponentials and sum
+    for(int i = 0; i < seq_len; ++i) {
+        float exp_val = expf(qk_row[i] - max_val);
+        sum_exp += exp_val;
+        softmax_row[i] = exp_val;
+    }
+    
+    // Normalize and apply dropout
+    curandStatePhilox4_32_10_t state;
+    if(training) curand_init(blockIdx.x * blockDim.x + threadIdx.x, 0, 0, &state);
+    
+    for(int i = 0; i < seq_len; ++i) {
+        softmax_row[i] /= sum_exp;
+        if(training && dropout_prob > 0.0f) {
+            float keep_prob = 1.0f - dropout_prob;
+            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;
+            softmax_row[i] *= mask;
+        }
+    }
+}
+
+torch::Tensor fused_qkv_projection(
+    torch::Tensor input,
+    torch::Tensor qkv_weight,
+    torch::Tensor qkv_bias
+) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto dim = input.size(2);
+    
+    auto q_out = torch::empty_like(input);
+    auto k_out = torch::empty_like(input);
+    auto v_out = torch::empty_like(input);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);
+    
+    qkv_projection_kernel<<<num_blocks, num_threads>>>(
+        input.data_ptr<float>(),
+        qkv_weight.data_ptr<float>(),
+        qkv_bias.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        v_out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        dim
+    );
+    
+    return torch::cat({q_out, k_out, v_out}, -1);
+}
+
+torch::Tensor online_softmax_dropout(
+    torch::Tensor qk_mat,
+    float dropout_prob,
+    bool training
+) {
+    auto batch_size = qk_mat.size(0);
+    auto num_heads = qk_mat.size(1);
+    auto seq_len = qk_mat.size(2);
+    
+    auto softmax_out = torch::empty_like(qk_mat);
+    
+    int num_threads = 256;
+    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);
+    
+    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(
+        qk_mat.data_ptr<float>(),
+        softmax_out.data_ptr<float>(),
+        batch_size,
+        num_heads,
+        seq_len,
+        dropout_prob,
+        training
+    );
+    
+    return softmax_out;
+}
+"""
+
+vit_cpp = """
+torch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);
+torch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);
+"""
+
+vit_ext = load_inline(
+    name='vit_ext',
+    cpp_sources=vit_cpp,
+    cuda_sources=vit_kernels,
+    functions=['fused_qkv_projection', 'online_softmax_dropout'],
+    verbose=True
+)
+
+class FusedTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        
+        self.qkv_proj = nn.Linear(dim, 3 * dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout_attn = nn.Dropout(dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        residual = x
+        
+        # Fused QKV projection with corrected kernel
+        qkv = vit_ext.fused_qkv_projection(
+            x,
+            self.qkv_proj.weight,
+            self.qkv_proj.bias
+        )
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        batch_size, seq_len, _ = q.size()
+        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        
+        # Attention computation with online softmax
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)
+        attn_output = torch.matmul(attn, v)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        attn_output = self.out_proj(attn_output)
+        attn_output = self.dropout_attn(attn_output)
+        x = residual + attn_output
+        x = self.norm1(x)
+        
+        # MLP with residual
+        residual = x
+        x = self.mlp(x)
+        x = residual + x
+        x = self.norm2(x)
+        
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        self.transformer = nn.Sequential(*[
+            FusedTransformerLayer(dim, heads, mlp_dim, dropout)
+            for _ in range(depth)
+        ])
+        
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+
+    def forward(self, img):
+        p = self.patch_size
+        batch_size = img.shape[0]
+        
+        # Extract patches and project to embeddings
+        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()
+        x = x.view(batch_size, -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        # Add CLS token and position embeddings
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        # Process through transformer layers
+        x = self.transformer(x)
+        
+        # Final classification head
+        return self.mlp_head(x[:, 0])
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "0.566087",
+      "0.569639",
+      "0.569058",
+      "0.563334",
+      "0.561635"
+    ],
+    "avg_difference": [
+      "0.225870",
+      "0.221999",
+      "0.226962",
+      "0.223894",
+      "0.225823"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+FINAL_RESULT:
+{
+  "context": "You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\n\n        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: \n\n        ``` \n\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n        ``` \n\n        The example new arch with custom CUDA kernels looks like this: \n        ```\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for element-wise addition\nelementwise_add_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add_cpp_source = (\n    \"torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);\"\n)\n\n# Compile the inline CUDA code for element-wise addition\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    cuda_sources=elementwise_add_source,\n    functions=[\"elementwise_add_cuda\"],\n    verbose=True,\n    extra_cflags=[\"\"],\n    extra_ldflags=[\"\"],\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_cuda(a, b)\n\n        ``` \n\n        \n    You are given the following architecture: \n\n    ```\n    import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nclass Model(nn.Module):\n    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):\n        \"\"\"\n        Vision Transformer (ViT) model.\n\n        :param image_size: The size of the input image (assumed to be square).\n        :param patch_size: The size of each patch (assumed to be square).\n        :param num_classes: The number of output classes.\n        :param dim: The dimensionality of the embedding space.\n        :param depth: The number of transformer layers.\n        :param heads: The number of attention heads.\n        :param mlp_dim: The dimensionality of the MLP (Multi-Layer Perceptron) in the transformer.\n        :param channels: The number of channels in the input image (default is 3 for RGB).\n        :param dropout: Dropout rate applied in the MLP.\n        :param emb_dropout: Dropout rate applied to the embedded patches.\n        \"\"\"\n        super(Model, self).__init__()\n        \n        assert image_size % patch_size == 0, \"Image dimensions must be divisible by the patch size.\"\n        num_patches = (image_size // patch_size) ** 2\n        patch_dim = channels * patch_size ** 2\n        \n        self.patch_size = patch_size\n        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))\n        self.patch_to_embedding = nn.Linear(patch_dim, dim)\n        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))\n        self.dropout = nn.Dropout(emb_dropout)\n        \n        self.transformer = nn.TransformerEncoder(\n            nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dim_feedforward=mlp_dim, dropout=dropout),\n            num_layers=depth\n        )\n        \n        self.to_cls_token = nn.Identity()\n        self.mlp_head = nn.Sequential(\n            nn.Linear(dim, mlp_dim),\n            nn.GELU(),\n            nn.Dropout(dropout),\n            nn.Linear(mlp_dim, num_classes)\n        )\n    \n    def forward(self, img):\n        \"\"\"\n        Forward pass of the Vision Transformer.\n\n        :param img: The input image tensor, shape (batch_size, channels, image_size, image_size).\n        :return: The output tensor, shape (batch_size, num_classes).\n        \"\"\"\n        p = self.patch_size\n        \n        x = img.unfold(2, p, p).unfold(3, p, p).reshape(img.shape[0], -1, p*p*img.shape[1])\n        x = self.patch_to_embedding(x)\n        \n        cls_tokens = self.cls_token.expand(img.shape[0], -1, -1)\n        x = torch.cat((cls_tokens, x), dim=1)\n        x += self.pos_embedding\n        x = self.dropout(x)\n        \n        x = self.transformer(x)\n        \n        x = self.to_cls_token(x[:, 0])\n        return self.mlp_head(x)\n\n# Test code\nimage_size = 224\npatch_size = 16\nnum_classes = 10\ndim = 512\ndepth = 6\nheads = 8\nmlp_dim = 2048\nchannels = 3\ndropout = 0.0\nemb_dropout = 0.0\n\ndef get_inputs():\n    return [torch.randn(2, channels, image_size, image_size)]\n\ndef get_init_inputs():\n    return [image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels, dropout, emb_dropout]\n    ```\n    Here is your latest generation:\n```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Custom CUDA kernels for optimized ViT components\nvit_kernels = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n#include <curand_kernel.h>\n\n#define CEIL_DIV(a, b) ((a + b - 1) / b)\n\n__global__ void qkv_projection_kernel(\n    const float* input,\n    const float* qkv_weight,\n    const float* qkv_bias,\n    float* q_out,\n    float* k_out,\n    float* v_out,\n    int batch_size,\n    int seq_len,\n    int dim\n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= batch_size * seq_len * dim) return;\n    \n    int batch = idx / (seq_len * dim);\n    int seq = (idx / dim) % seq_len;\n    int feat = idx % dim;\n    \n    const float* in_ptr = input + batch * seq_len * dim + seq * dim;\n    \n    // Split weights into Q, K, V parts with transposed access\n    const float* q_weight = qkv_weight;\n    const float* k_weight = qkv_weight + dim * dim;\n    const float* v_weight = qkv_weight + 2 * dim * dim;\n    \n    const float* q_bias = qkv_bias;\n    const float* k_bias = qkv_bias + dim;\n    const float* v_bias = qkv_bias + 2 * dim;\n    \n    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n    \n    for(int i = 0; i < dim; ++i) {\n        q_val += in_ptr[i] * q_weight[i * dim + feat];  // Transposed access\n        k_val += in_ptr[i] * k_weight[i * dim + feat];\n        v_val += in_ptr[i] * v_weight[i * dim + feat];\n    }\n    \n    q_out[idx] = q_val + q_bias[feat];\n    k_out[idx] = k_val + k_bias[feat];\n    v_out[idx] = v_val + v_bias[feat];\n}\n\n__global__ void online_softmax_dropout_kernel(\n    const float* qk_mat,\n    float* softmax_out,\n    int batch_size,\n    int num_heads,\n    int seq_len,\n    float dropout_prob,\n    bool training\n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if(idx >= batch_size * num_heads * seq_len) return;\n\n    int batch = idx / (num_heads * seq_len);\n    int head = (idx / seq_len) % num_heads;\n    int seq = idx % seq_len;\n    \n    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;\n    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;\n    \n    float max_val = -INFINITY;\n    float sum_exp = 0.0f;\n    \n    // First pass: find max and compute exp\n    for(int i = 0; i < seq_len; ++i) {\n        max_val = fmaxf(max_val, qk_row[i]);\n    }\n    \n    // Second pass: compute exponentials and sum\n    for(int i = 0; i < seq_len; ++i) {\n        float exp_val = expf(qk_row[i] - max_val);\n        sum_exp += exp_val;\n        softmax_row[i] = exp_val;\n    }\n    \n    // Third pass: normalize and apply dropout\n    curandStatePhilox4_32_10_t state;\n    if(training) curand_init(blockIdx.x * blockDim.x + threadIdx.x, 0, 0, &state);\n    \n    for(int i = 0; i < seq_len; ++i) {\n        float val = softmax_row[i] / sum_exp;\n        if(training && dropout_prob > 0.0f) {\n            float keep_prob = 1.0f - dropout_prob;\n            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;\n            val *= mask;\n        }\n        softmax_row[i] = val;\n    }\n}\n\ntorch::Tensor fused_qkv_projection(\n    torch::Tensor input,\n    torch::Tensor qkv_weight,\n    torch::Tensor qkv_bias\n) {\n    auto batch_size = input.size(0);\n    auto seq_len = input.size(1);\n    auto dim = input.size(2);\n    \n    auto q_out = torch::empty_like(input);\n    auto k_out = torch::empty_like(input);\n    auto v_out = torch::empty_like(input);\n    \n    int num_threads = 256;\n    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);\n    \n    qkv_projection_kernel<<<num_blocks, num_threads>>>(\n        input.data_ptr<float>(),\n        qkv_weight.data_ptr<float>(),\n        qkv_bias.data_ptr<float>(),\n        q_out.data_ptr<float>(),\n        k_out.data_ptr<float>(),\n        v_out.data_ptr<float>(),\n        batch_size,\n        seq_len,\n        dim\n    );\n    \n    return torch::cat({q_out, k_out, v_out}, -1);\n}\n\ntorch::Tensor online_softmax_dropout(\n    torch::Tensor qk_mat,\n    float dropout_prob,\n    bool training\n) {\n    auto batch_size = qk_mat.size(0);\n    auto num_heads = qk_mat.size(1);\n    auto seq_len = qk_mat.size(2);\n    \n    auto softmax_out = torch::empty_like(qk_mat);\n    \n    int num_threads = 256;\n    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);\n    \n    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(\n        qk_mat.data_ptr<float>(),\n        softmax_out.data_ptr<float>(),\n        batch_size,\n        num_heads,\n        seq_len,\n        dropout_prob,\n        training\n    );\n    \n    return softmax_out;\n}\n\"\"\"\n\nvit_cpp = \"\"\"\ntorch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);\ntorch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);\n\"\"\"\n\nvit_ext = load_inline(\n    name='vit_ext',\n    cpp_sources=vit_cpp,\n    cuda_sources=vit_kernels,\n    functions=['fused_qkv_projection', 'online_softmax_dropout'],\n    verbose=True\n)\n\nclass FusedTransformerLayer(nn.Module):\n    def __init__(self, dim, heads, mlp_dim, dropout):\n        super().__init__()\n        self.dim = dim\n        self.heads = heads\n        self.head_dim = dim // heads\n        self.dropout = dropout\n        \n        self.qkv_proj = nn.Linear(dim, 3 * dim)\n        self.out_proj = nn.Linear(dim, dim)\n        self.dropout_attn = nn.Dropout(dropout)\n        self.mlp = nn.Sequential(\n            nn.Linear(dim, mlp_dim),\n            nn.GELU(),\n            nn.Dropout(dropout),\n            nn.Linear(mlp_dim, dim),\n            nn.Dropout(dropout)\n        )\n        \n        self.norm1 = nn.LayerNorm(dim)\n        self.norm2 = nn.LayerNorm(dim)\n        \n    def forward(self, x):\n        residual = x\n        \n        qkv = vit_ext.fused_qkv_projection(\n            x,\n            self.qkv_proj.weight,\n            self.qkv_proj.bias\n        )\n        q, k, v = qkv.chunk(3, dim=-1)\n        \n        batch_size, seq_len, _ = q.size()\n        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        \n        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)\n        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)\n        attn_output = torch.matmul(attn, v)\n        \n        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)\n        attn_output = self.out_proj(attn_output)\n        attn_output = self.dropout_attn(attn_output)\n        x = residual + attn_output\n        x = self.norm1(x)\n        \n        residual = x\n        x = self.mlp(x)\n        x = residual + x\n        x = self.norm2(x)\n        \n        return x\n\nclass ModelNew(nn.Module):\n    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):\n        super().__init__()\n        num_patches = (image_size // patch_size) ** 2\n        patch_dim = channels * patch_size ** 2\n        \n        self.patch_size = patch_size\n        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))\n        self.patch_to_embedding = nn.Linear(patch_dim, dim)\n        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))\n        self.dropout = nn.Dropout(emb_dropout)\n        \n        self.transformer = nn.Sequential(*[\n            FusedTransformerLayer(dim, heads, mlp_dim, dropout)\n            for _ in range(depth)\n        ])\n        \n        self.mlp_head = nn.Sequential(\n            nn.Linear(dim, mlp_dim),\n            nn.GELU(),\n            nn.Dropout(dropout),\n            nn.Linear(mlp_dim, num_classes)\n        )\n\n    def forward(self, img):\n        p = self.patch_size\n        batch_size = img.shape[0]\n        \n        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()\n        x = x.view(batch_size, -1, p*p*img.shape[1])\n        x = self.patch_to_embedding(x)\n        \n        cls_tokens = self.cls_token.expand(batch_size, -1, -1)\n        x = torch.cat((cls_tokens, x), dim=1)\n        x += self.pos_embedding\n        x = self.dropout(x)\n        \n        x = self.transformer(x)\n        return self.mlp_head(x[:, 0])\n```\nYour generated architecture ModelNew and kernel was evaluated on GPU and checked against the reference architecture Model. \n\nHere is the Evaluation Result: \nYour kernel failed to produce the correct output, compared to the reference architecture.\n\nHere is the correctness feedback: \n\nmax_difference: ['0.551915', '0.560380', '0.559741', '0.544343', '0.555274']\navg_difference: ['0.239366', '0.238790', '0.243301', '0.240613', '0.240291']\ncorrectness_issue: Output mismatch\ncorrectness_trials: (0 / 5)\nName your new improved output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n\nPlease try generating ModelNew again, while fixing the correctness issues.",
+  "model_response": "```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Corrected CUDA kernels with proper weight access pattern\nvit_kernels = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n#include <curand_kernel.h>\n\n#define CEIL_DIV(a, b) ((a + b - 1) / b)\n\n__global__ void qkv_projection_kernel(\n    const float* input,\n    const float* qkv_weight,\n    const float* qkv_bias,\n    float* q_out,\n    float* k_out,\n    float* v_out,\n    int batch_size,\n    int seq_len,\n    int dim\n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= batch_size * seq_len * dim) return;\n    \n    int batch = idx / (seq_len * dim);\n    int seq = (idx / dim) % seq_len;\n    int feat = idx % dim;\n    \n    const float* in_ptr = input + batch * seq_len * dim + seq * dim;\n    \n    // Split weights into Q, K, V parts with corrected access pattern\n    const float* q_weight = qkv_weight;\n    const float* k_weight = qkv_weight + dim * dim;\n    const float* v_weight = qkv_weight + 2 * dim * dim;\n    \n    const float* q_bias = qkv_bias;\n    const float* k_bias = qkv_bias + dim;\n    const float* v_bias = qkv_bias + 2 * dim;\n    \n    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n    \n    for(int i = 0; i < dim; ++i) {\n        // Corrected weight access: feat*dim + i instead of i*dim + feat\n        q_val += in_ptr[i] * q_weight[feat * dim + i];\n        k_val += in_ptr[i] * k_weight[feat * dim + i];\n        v_val += in_ptr[i] * v_weight[feat * dim + i];\n    }\n    \n    q_out[idx] = q_val + q_bias[feat];\n    k_out[idx] = k_val + k_bias[feat];\n    v_out[idx] = v_val + v_bias[feat];\n}\n\n__global__ void online_softmax_dropout_kernel(\n    const float* qk_mat,\n    float* softmax_out,\n    int batch_size,\n    int num_heads,\n    int seq_len,\n    float dropout_prob,\n    bool training\n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if(idx >= batch_size * num_heads * seq_len) return;\n\n    int batch = idx / (num_heads * seq_len);\n    int head = (idx / seq_len) % num_heads;\n    int seq = idx % seq_len;\n    \n    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;\n    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;\n    \n    float max_val = -INFINITY;\n    float sum_exp = 0.0f;\n    \n    // Find max value for numerical stability\n    for(int i = 0; i < seq_len; ++i) {\n        max_val = fmaxf(max_val, qk_row[i]);\n    }\n    \n    // Compute exponentials and sum\n    for(int i = 0; i < seq_len; ++i) {\n        float exp_val = expf(qk_row[i] - max_val);\n        sum_exp += exp_val;\n        softmax_row[i] = exp_val;\n    }\n    \n    // Normalize and apply dropout\n    curandStatePhilox4_32_10_t state;\n    if(training) curand_init(blockIdx.x * blockDim.x + threadIdx.x, 0, 0, &state);\n    \n    for(int i = 0; i < seq_len; ++i) {\n        softmax_row[i] /= sum_exp;\n        if(training && dropout_prob > 0.0f) {\n            float keep_prob = 1.0f - dropout_prob;\n            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;\n            softmax_row[i] *= mask;\n        }\n    }\n}\n\ntorch::Tensor fused_qkv_projection(\n    torch::Tensor input,\n    torch::Tensor qkv_weight,\n    torch::Tensor qkv_bias\n) {\n    auto batch_size = input.size(0);\n    auto seq_len = input.size(1);\n    auto dim = input.size(2);\n    \n    auto q_out = torch::empty_like(input);\n    auto k_out = torch::empty_like(input);\n    auto v_out = torch::empty_like(input);\n    \n    int num_threads = 256;\n    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);\n    \n    qkv_projection_kernel<<<num_blocks, num_threads>>>(\n        input.data_ptr<float>(),\n        qkv_weight.data_ptr<float>(),\n        qkv_bias.data_ptr<float>(),\n        q_out.data_ptr<float>(),\n        k_out.data_ptr<float>(),\n        v_out.data_ptr<float>(),\n        batch_size,\n        seq_len,\n        dim\n    );\n    \n    return torch::cat({q_out, k_out, v_out}, -1);\n}\n\ntorch::Tensor online_softmax_dropout(\n    torch::Tensor qk_mat,\n    float dropout_prob,\n    bool training\n) {\n    auto batch_size = qk_mat.size(0);\n    auto num_heads = qk_mat.size(1);\n    auto seq_len = qk_mat.size(2);\n    \n    auto softmax_out = torch::empty_like(qk_mat);\n    \n    int num_threads = 256;\n    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);\n    \n    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(\n        qk_mat.data_ptr<float>(),\n        softmax_out.data_ptr<float>(),\n        batch_size,\n        num_heads,\n        seq_len,\n        dropout_prob,\n        training\n    );\n    \n    return softmax_out;\n}\n\"\"\"\n\nvit_cpp = \"\"\"\ntorch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);\ntorch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);\n\"\"\"\n\nvit_ext = load_inline(\n    name='vit_ext',\n    cpp_sources=vit_cpp,\n    cuda_sources=vit_kernels,\n    functions=['fused_qkv_projection', 'online_softmax_dropout'],\n    verbose=True\n)\n\nclass FusedTransformerLayer(nn.Module):\n    def __init__(self, dim, heads, mlp_dim, dropout):\n        super().__init__()\n        self.dim = dim\n        self.heads = heads\n        self.head_dim = dim // heads\n        self.dropout = dropout\n        \n        self.qkv_proj = nn.Linear(dim, 3 * dim)\n        self.out_proj = nn.Linear(dim, dim)\n        self.dropout_attn = nn.Dropout(dropout)\n        self.mlp = nn.Sequential(\n            nn.Linear(dim, mlp_dim),\n            nn.GELU(),\n            nn.Dropout(dropout),\n            nn.Linear(mlp_dim, dim),\n            nn.Dropout(dropout)\n        )\n        \n        self.norm1 = nn.LayerNorm(dim)\n        self.norm2 = nn.LayerNorm(dim)\n        \n    def forward(self, x):\n        residual = x\n        \n        # Fused QKV projection with corrected kernel\n        qkv = vit_ext.fused_qkv_projection(\n            x,\n            self.qkv_proj.weight,\n            self.qkv_proj.bias\n        )\n        q, k, v = qkv.chunk(3, dim=-1)\n        \n        batch_size, seq_len, _ = q.size()\n        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        \n        # Attention computation with online softmax\n        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)\n        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)\n        attn_output = torch.matmul(attn, v)\n        \n        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)\n        attn_output = self.out_proj(attn_output)\n        attn_output = self.dropout_attn(attn_output)\n        x = residual + attn_output\n        x = self.norm1(x)\n        \n        # MLP with residual\n        residual = x\n        x = self.mlp(x)\n        x = residual + x\n        x = self.norm2(x)\n        \n        return x\n\nclass ModelNew(nn.Module):\n    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):\n        super().__init__()\n        num_patches = (image_size // patch_size) ** 2\n        patch_dim = channels * patch_size ** 2\n        \n        self.patch_size = patch_size\n        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))\n        self.patch_to_embedding = nn.Linear(patch_dim, dim)\n        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))\n        self.dropout = nn.Dropout(emb_dropout)\n        \n        self.transformer = nn.Sequential(*[\n            FusedTransformerLayer(dim, heads, mlp_dim, dropout)\n            for _ in range(depth)\n        ])\n        \n        self.mlp_head = nn.Sequential(\n            nn.Linear(dim, mlp_dim),\n            nn.GELU(),\n            nn.Dropout(dropout),\n            nn.Linear(mlp_dim, num_classes)\n        )\n\n    def forward(self, img):\n        p = self.patch_size\n        batch_size = img.shape[0]\n        \n        # Extract patches and project to embeddings\n        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()\n        x = x.view(batch_size, -1, p*p*img.shape[1])\n        x = self.patch_to_embedding(x)\n        \n        # Add CLS token and position embeddings\n        cls_tokens = self.cls_token.expand(batch_size, -1, -1)\n        x = torch.cat((cls_tokens, x), dim=1)\n        x += self.pos_embedding\n        x = self.dropout(x)\n        \n        # Process through transformer layers\n        x = self.transformer(x)\n        \n        # Final classification head\n        return self.mlp_head(x[:, 0])\n```",
+  "kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Corrected CUDA kernels with proper weight access pattern\nvit_kernels = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n#include <curand_kernel.h>\n\n#define CEIL_DIV(a, b) ((a + b - 1) / b)\n\n__global__ void qkv_projection_kernel(\n    const float* input,\n    const float* qkv_weight,\n    const float* qkv_bias,\n    float* q_out,\n    float* k_out,\n    float* v_out,\n    int batch_size,\n    int seq_len,\n    int dim\n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx >= batch_size * seq_len * dim) return;\n    \n    int batch = idx / (seq_len * dim);\n    int seq = (idx / dim) % seq_len;\n    int feat = idx % dim;\n    \n    const float* in_ptr = input + batch * seq_len * dim + seq * dim;\n    \n    // Split weights into Q, K, V parts with corrected access pattern\n    const float* q_weight = qkv_weight;\n    const float* k_weight = qkv_weight + dim * dim;\n    const float* v_weight = qkv_weight + 2 * dim * dim;\n    \n    const float* q_bias = qkv_bias;\n    const float* k_bias = qkv_bias + dim;\n    const float* v_bias = qkv_bias + 2 * dim;\n    \n    float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n    \n    for(int i = 0; i < dim; ++i) {\n        // Corrected weight access: feat*dim + i instead of i*dim + feat\n        q_val += in_ptr[i] * q_weight[feat * dim + i];\n        k_val += in_ptr[i] * k_weight[feat * dim + i];\n        v_val += in_ptr[i] * v_weight[feat * dim + i];\n    }\n    \n    q_out[idx] = q_val + q_bias[feat];\n    k_out[idx] = k_val + k_bias[feat];\n    v_out[idx] = v_val + v_bias[feat];\n}\n\n__global__ void online_softmax_dropout_kernel(\n    const float* qk_mat,\n    float* softmax_out,\n    int batch_size,\n    int num_heads,\n    int seq_len,\n    float dropout_prob,\n    bool training\n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if(idx >= batch_size * num_heads * seq_len) return;\n\n    int batch = idx / (num_heads * seq_len);\n    int head = (idx / seq_len) % num_heads;\n    int seq = idx % seq_len;\n    \n    const float* qk_row = qk_mat + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;\n    float* softmax_row = softmax_out + (batch * num_heads + head) * seq_len * seq_len + seq * seq_len;\n    \n    float max_val = -INFINITY;\n    float sum_exp = 0.0f;\n    \n    // Find max value for numerical stability\n    for(int i = 0; i < seq_len; ++i) {\n        max_val = fmaxf(max_val, qk_row[i]);\n    }\n    \n    // Compute exponentials and sum\n    for(int i = 0; i < seq_len; ++i) {\n        float exp_val = expf(qk_row[i] - max_val);\n        sum_exp += exp_val;\n        softmax_row[i] = exp_val;\n    }\n    \n    // Normalize and apply dropout\n    curandStatePhilox4_32_10_t state;\n    if(training) curand_init(blockIdx.x * blockDim.x + threadIdx.x, 0, 0, &state);\n    \n    for(int i = 0; i < seq_len; ++i) {\n        softmax_row[i] /= sum_exp;\n        if(training && dropout_prob > 0.0f) {\n            float keep_prob = 1.0f - dropout_prob;\n            float mask = (curand_uniform(&state) < keep_prob) ? 1.0f / keep_prob : 0.0f;\n            softmax_row[i] *= mask;\n        }\n    }\n}\n\ntorch::Tensor fused_qkv_projection(\n    torch::Tensor input,\n    torch::Tensor qkv_weight,\n    torch::Tensor qkv_bias\n) {\n    auto batch_size = input.size(0);\n    auto seq_len = input.size(1);\n    auto dim = input.size(2);\n    \n    auto q_out = torch::empty_like(input);\n    auto k_out = torch::empty_like(input);\n    auto v_out = torch::empty_like(input);\n    \n    int num_threads = 256;\n    int num_blocks = CEIL_DIV(batch_size * seq_len * dim, num_threads);\n    \n    qkv_projection_kernel<<<num_blocks, num_threads>>>(\n        input.data_ptr<float>(),\n        qkv_weight.data_ptr<float>(),\n        qkv_bias.data_ptr<float>(),\n        q_out.data_ptr<float>(),\n        k_out.data_ptr<float>(),\n        v_out.data_ptr<float>(),\n        batch_size,\n        seq_len,\n        dim\n    );\n    \n    return torch::cat({q_out, k_out, v_out}, -1);\n}\n\ntorch::Tensor online_softmax_dropout(\n    torch::Tensor qk_mat,\n    float dropout_prob,\n    bool training\n) {\n    auto batch_size = qk_mat.size(0);\n    auto num_heads = qk_mat.size(1);\n    auto seq_len = qk_mat.size(2);\n    \n    auto softmax_out = torch::empty_like(qk_mat);\n    \n    int num_threads = 256;\n    int num_blocks = CEIL_DIV(batch_size * num_heads * seq_len, num_threads);\n    \n    online_softmax_dropout_kernel<<<num_blocks, num_threads>>>(\n        qk_mat.data_ptr<float>(),\n        softmax_out.data_ptr<float>(),\n        batch_size,\n        num_heads,\n        seq_len,\n        dropout_prob,\n        training\n    );\n    \n    return softmax_out;\n}\n\"\"\"\n\nvit_cpp = \"\"\"\ntorch::Tensor fused_qkv_projection(torch::Tensor input, torch::Tensor qkv_weight, torch::Tensor qkv_bias);\ntorch::Tensor online_softmax_dropout(torch::Tensor qk_mat, float dropout_prob, bool training);\n\"\"\"\n\nvit_ext = load_inline(\n    name='vit_ext',\n    cpp_sources=vit_cpp,\n    cuda_sources=vit_kernels,\n    functions=['fused_qkv_projection', 'online_softmax_dropout'],\n    verbose=True\n)\n\nclass FusedTransformerLayer(nn.Module):\n    def __init__(self, dim, heads, mlp_dim, dropout):\n        super().__init__()\n        self.dim = dim\n        self.heads = heads\n        self.head_dim = dim // heads\n        self.dropout = dropout\n        \n        self.qkv_proj = nn.Linear(dim, 3 * dim)\n        self.out_proj = nn.Linear(dim, dim)\n        self.dropout_attn = nn.Dropout(dropout)\n        self.mlp = nn.Sequential(\n            nn.Linear(dim, mlp_dim),\n            nn.GELU(),\n            nn.Dropout(dropout),\n            nn.Linear(mlp_dim, dim),\n            nn.Dropout(dropout)\n        )\n        \n        self.norm1 = nn.LayerNorm(dim)\n        self.norm2 = nn.LayerNorm(dim)\n        \n    def forward(self, x):\n        residual = x\n        \n        # Fused QKV projection with corrected kernel\n        qkv = vit_ext.fused_qkv_projection(\n            x,\n            self.qkv_proj.weight,\n            self.qkv_proj.bias\n        )\n        q, k, v = qkv.chunk(3, dim=-1)\n        \n        batch_size, seq_len, _ = q.size()\n        q = q.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        k = k.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        v = v.view(batch_size, seq_len, self.heads, self.head_dim).transpose(1, 2)\n        \n        # Attention computation with online softmax\n        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)\n        attn = vit_ext.online_softmax_dropout(attn, self.dropout, self.training)\n        attn_output = torch.matmul(attn, v)\n        \n        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)\n        attn_output = self.out_proj(attn_output)\n        attn_output = self.dropout_attn(attn_output)\n        x = residual + attn_output\n        x = self.norm1(x)\n        \n        # MLP with residual\n        residual = x\n        x = self.mlp(x)\n        x = residual + x\n        x = self.norm2(x)\n        \n        return x\n\nclass ModelNew(nn.Module):\n    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):\n        super().__init__()\n        num_patches = (image_size // patch_size) ** 2\n        patch_dim = channels * patch_size ** 2\n        \n        self.patch_size = patch_size\n        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))\n        self.patch_to_embedding = nn.Linear(patch_dim, dim)\n        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))\n        self.dropout = nn.Dropout(emb_dropout)\n        \n        self.transformer = nn.Sequential(*[\n            FusedTransformerLayer(dim, heads, mlp_dim, dropout)\n            for _ in range(depth)\n        ])\n        \n        self.mlp_head = nn.Sequential(\n            nn.Linear(dim, mlp_dim),\n            nn.GELU(),\n            nn.Dropout(dropout),\n            nn.Linear(mlp_dim, num_classes)\n        )\n\n    def forward(self, img):\n        p = self.patch_size\n        batch_size = img.shape[0]\n        \n        # Extract patches and project to embeddings\n        x = img.unfold(2, p, p).unfold(3, p, p).contiguous()\n        x = x.view(batch_size, -1, p*p*img.shape[1])\n        x = self.patch_to_embedding(x)\n        \n        # Add CLS token and position embeddings\n        cls_tokens = self.cls_token.expand(batch_size, -1, -1)\n        x = torch.cat((cls_tokens, x), dim=1)\n        x += self.pos_embedding\n        x = self.dropout(x)\n        \n        # Process through transformer layers\n        x = self.transformer(x)\n        \n        # Final classification head\n        return self.mlp_head(x[:, 0])",
+  "feedback": "",
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:2",
+      "max_difference": [
+        "0.566087",
+        "0.569639",
+        "0.569058",
+        "0.563334",
+        "0.561635"
+      ],
+      "avg_difference": [
+        "0.225870",
+        "0.221999",
+        "0.226962",
+        "0.223894",
+        "0.225823"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)"
+    },
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "profiler_result": ""
+}

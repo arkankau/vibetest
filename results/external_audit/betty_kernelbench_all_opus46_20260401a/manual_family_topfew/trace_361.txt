@@ -1,0 +1,1678 @@
+KernelBench iterative-refinement log.
+DATASET: ScalingIntelligence/kernelbench-samples
+LEVEL: level2
+VARIANT: eval_result_profiler_last_only
+MODEL_SLUG: deepseek-R1
+PROBLEM_ID: 64
+PROBLEM: KernelBenchInternal/KernelBench/level2/64_Gemm_LogSumExp_LeakyReLU_LeakyReLU_GELU_GELU.py
+RUN_NAME: run_v0_deepseek_r1_turn
+NUM_ROUNDS: 10
+SOURCE_PATH: iterative_refinement/level2/eval_result_profiler_last_only/deepseek-R1/problem_64/sample_0/log.json
+
+TASK_CONTEXT:
+You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.
+
+You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
+
+
+        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: 
+
+        ``` 
+
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+
+        ``` 
+
+        The example new arch with custom CUDA kernels looks like this: 
+        ```
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+elementwise_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+elementwise_add_cpp_source = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+
+        ``` 
+
+        
+    You are given the following architecture: 
+
+    ```
+    import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a matrix multiplication (Gemm), followed by LogSumExp, LeakyReLU, 
+    LeakyReLU, GELU, and GELU activations.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(Model, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        # Gemm
+        x = self.linear(x)
+        # LogSumExp
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        # LeakyReLU
+        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+        # LeakyReLU
+        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+        # GELU
+        x = torch.nn.functional.gelu(x)
+        # GELU
+        x = torch.nn.functional.gelu(x)
+        return x
+
+batch_size = 128
+in_features = 1024
+out_features = 512
+
+def get_inputs():
+    return [torch.randn(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+    ```
+    
+
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code!
+
+=== ROUND 0001 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+lse_activations_kernel = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    const float kBeta = 0.7978845608028654f;  // sqrt(2/pi)
+    const float kKappa = 0.044715f;
+    float x_cubed = x * x * x;
+    float tanh_arg = kBeta * (x + kKappa * x_cubed);
+    return 0.5f * x * (1.0f + tanhf(tanh_arg));
+}
+
+__global__ void lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features,
+    int num_elements
+) {
+    extern __shared__ float smem[];
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    // Load data into shared memory
+    float val = tid < num_features ? input[batch_idx * num_features + tid] : -FLT_MAX;
+    smem[tid] = val;
+    __syncthreads();
+
+    // Find max for numerical stability
+    for(int s = blockDim.x/2; s > 0; s >>= 1) {
+        if(tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    float max_val = smem[0];
+    __syncthreads();
+
+    // Compute exp(x - max)
+    val = tid < num_features ? expf(val - max_val) : 0.0f;
+    smem[tid] = val;
+    __syncthreads();
+
+    // Sum exponents
+    for(int s = blockDim.x/2; s > 0; s >>= 1) {
+        if(tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float log_sum = logf(smem[0]) + max_val;
+
+    // Apply activations (only first thread writes)
+    if(tid == 0) {
+        // Combined LeakyReLU (0.01^2 = 0.0001)
+        float x = log_sum > 0 ? log_sum : 0.0001f * log_sum;
+        
+        // Apply GELU twice
+        x = gelu(gelu(x));
+        output[batch_idx] = x;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    auto output = torch::empty({input.size(0), 1}, input.options());
+    
+    dim3 grid(input.size(0));
+    dim3 block((input.size(1) + 31) / 32 * 32);  // Round up to nearest 32
+    size_t smem = input.size(1) * sizeof(float);
+    
+    lse_activations_kernel<<<grid, block, smem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1),
+        input.numel()
+    );
+    
+    return output;
+}
+"""
+
+lse_activations_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=lse_activations_cpp,
+    cuda_sources=lse_activations_kernel,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3'],
+    extra_ldflags=[]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.0156,
+  "runtime_stats": {
+    "mean": 0.0156,
+    "std": 4.6e-05,
+    "min": 0.0155,
+    "max": 0.0159,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:6"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                        ampere_sgemm_64x32_sliced1x4_tn         0.00%       0.000us         0.00%       0.000us       0.000us     718.118us        64.25%     718.118us       7.559us            95  
+lse_activations_kernel(float const*, float*, int, in...         0.00%       0.000us         0.00%       0.000us       0.000us     237.381us        21.24%     237.381us       2.499us            95  
+void cublasLt::splitKreduce_kernel<32, 16, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us     162.207us        14.51%     162.207us       1.707us            95  
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor         7.64%      82.151us         7.64%      82.151us       0.883us       0.000us         0.00%       0.000us       0.000us            93  
+                                       cudaLaunchKernel        85.64%     920.981us        85.64%     920.981us       3.301us       0.000us         0.00%       0.000us       0.000us           279  
+                                  cudaDeviceSynchronize         6.72%      72.262us         6.72%      72.262us      72.262us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.075ms
+Self CUDA time total: 1.118ms
+
+=== ROUND 0002 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+lse_activations_kernel = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+__global__ void lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features,
+    int num_elements
+) {
+    extern __shared__ float smem[];
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;  // tid / 32
+    const int lane_id = tid & 0x1f;  // tid % 32
+
+    // Load input with coalesced access
+    float val = tid < num_features ? input[batch_idx * num_features + tid] : -FLT_MAX;
+
+    // Warp-wise max reduction
+    float warp_max = val;
+    #pragma unroll
+    for(int offset=16; offset>0; offset>>=1)
+        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+
+    // Store warp maxima to shared memory
+    if(lane_id == 0) smem[warp_id] = warp_max;
+    __syncthreads();
+
+    // Global max reduction (first warp only)
+    float global_max = -FLT_MAX;
+    if(warp_id == 0) {
+        float v = lane_id < (blockDim.x>>5) ? smem[lane_id] : -FLT_MAX;
+        #pragma unroll
+        for(int offset=16; offset>0; offset>>=1)
+            v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));
+        global_max = v;
+    }
+    global_max = __shfl_sync(0xffffffff, global_max, 0);
+
+    // Compute exp with numerical stability
+    float exp_val = tid < num_features ? expf(val - global_max) : 0.0f;
+
+    // Warp-wise sum reduction
+    float warp_sum = exp_val;
+    #pragma unroll
+    for(int offset=16; offset>0; offset>>=1)
+        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+
+    // Store warp sums to shared memory
+    if(lane_id == 0) smem[warp_id] = warp_sum;
+    __syncthreads();
+
+    // Global sum reduction (first warp only)
+    float global_sum = 0.0f;
+    if(warp_id == 0) {
+        float v = lane_id < (blockDim.x>>5) ? smem[lane_id] : 0.0f;
+        #pragma unroll
+        for(int offset=16; offset>0; offset>>=1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        global_sum = v;
+    }
+    global_sum = __shfl_sync(0xffffffff, global_sum, 0);
+
+    // Final computations and activations
+    if(tid == 0) {
+        float log_sum = logf(global_sum) + global_max;
+        
+        // Dual LeakyReLU
+        log_sum = log_sum > 0 ? log_sum : 0.01f * log_sum;
+        log_sum = log_sum > 0 ? log_sum : 0.01f * log_sum;
+        
+        // Dual GELU with fast approximation
+        log_sum = gelu(gelu(log_sum));
+        
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    const int num_features = input.size(1);
+    int block_size = 1;
+    while(block_size < num_features) block_size <<= 1;
+    block_size = min(block_size, 1024);
+    
+    auto output = torch::empty({input.size(0), 1}, input.options());
+    
+    dim3 grid(input.size(0));
+    dim3 block(block_size);
+    size_t smem = (block_size / 32) * sizeof(float);
+    
+    lse_activations_kernel<<<grid, block, smem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        num_features,
+        input.numel()
+    );
+    
+    return output;
+}
+"""
+
+lse_activations_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=lse_activations_cpp,
+    cuda_sources=lse_activations_kernel,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '--use_fast_math'],
+    extra_ldflags=[]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+FEEDBACK:
+Compilation failed:
+stdout: [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -O3 --use_fast_math -c /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/main.cpp -o main.o 
+FAILED: main.o 
+c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -O3 --use_fast_math -c /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/main.cpp -o main.o 
+c++: error: unrecognized command line option ‘--use_fast_math’; did you mean ‘--fast-math’?
+[2/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/cuda.cu -o cuda.cuda.o 
+ninja: build stopped: subcommand failed.
+
+stderr: Using /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349 as PyTorch extensions root...
+Creating extension directory /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op...
+Detected CUDA files, patching ldflags
+Emitting ninja build file /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/build.ninja...
+Building extension module fused_op...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+Traceback (most recent call last):
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2104, in _run_ninja_build
+    subprocess.run(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/subprocess.py", line 526, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/tmp_-4544380693582239716.py", line 116, in <module>
+    fused_op = load_inline(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1646, in load_inline
+    return _jit_compile(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1721, in _jit_compile
+    _write_ninja_file_and_build_library(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1833, in _write_ninja_file_and_build_library
+    _run_ninja_build(
+  File "/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2120, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error building extension 'fused_op'
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "compiler_error": "Compilation failed:\nstdout: [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -O3 --use_fast_math -c /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/main.cpp -o main.o \nFAILED: main.o \nc++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -O3 --use_fast_math -c /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/main.cpp -o main.o \nc++: error: unrecognized command line option ‘--use_fast_math’; did you mean ‘--fast-math’?\n[2/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\\\"_gcc\\\" -DPYBIND11_STDLIB=\\\"_libstdcpp\\\" -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\" -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/TH -isystem /matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /matx/u/simonguo/conda/cuda-monkeys/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/cuda.cu -o cuda.cuda.o \nninja: build stopped: subcommand failed.\n\nstderr: Using /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349 as PyTorch extensions root...\nCreating extension directory /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op...\nDetected CUDA files, patching ldflags\nEmitting ninja build file /matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/fused_op/build.ninja...\nBuilding extension module fused_op...\nAllowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)\nTraceback (most recent call last):\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 2104, in _run_ninja_build\n    subprocess.run(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/subprocess.py\", line 526, in run\n    raise CalledProcessError(retcode, process.args,\nsubprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/matx/u/simonguo/kernel_eval_build/level2_eval_result_profiler_last_only_deepseek/run_v0_deepseek_r1_turn/problem_64/sample_0/4587836661520174349/tmp_-4544380693582239716.py\", line 116, in <module>\n    fused_op = load_inline(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1646, in load_inline\n    return _jit_compile(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1721, in _jit_compile\n    _write_ninja_file_and_build_library(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 1833, in _write_ninja_file_and_build_library\n    _run_ninja_build(\n  File \"/matx/u/simonguo/conda/cuda-monkeys/lib/python3.10/site-packages/torch/utils/cpp_extension.py\", line 2120, in _run_ninja_build\n    raise RuntimeError(message) from e\nRuntimeError: Error building extension 'fused_op'\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0003 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+lse_activations_kernel = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+__global__ void lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features,
+    int num_elements
+) {
+    extern __shared__ float smem[];
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 0x1f;
+
+    float val = tid < num_features ? input[batch_idx * num_features + tid] : -FLT_MAX;
+
+    float warp_max = val;
+    #pragma unroll
+    for(int offset=16; offset>0; offset>>=1)
+        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+
+    if(lane_id == 0) smem[warp_id] = warp_max;
+    __syncthreads();
+
+    float global_max = -FLT_MAX;
+    if(warp_id == 0) {
+        float v = lane_id < (blockDim.x>>5) ? smem[lane_id] : -FLT_MAX;
+        #pragma unroll
+        for(int offset=16; offset>0; offset>>=1)
+            v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));
+        global_max = v;
+    }
+    global_max = __shfl_sync(0xffffffff, global_max, 0);
+
+    float exp_val = tid < num_features ? expf(val - global_max) : 0.0f;
+
+    float warp_sum = exp_val;
+    #pragma unroll
+    for(int offset=16; offset>0; offset>>=1)
+        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+
+    if(lane_id == 0) smem[warp_id] = warp_sum;
+    __syncthreads();
+
+    float global_sum = 0.0f;
+    if(warp_id == 0) {
+        float v = lane_id < (blockDim.x>>5) ? smem[lane_id] : 0.0f;
+        #pragma unroll
+        for(int offset=16; offset>0; offset>>=1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        global_sum = v;
+    }
+    global_sum = __shfl_sync(0xffffffff, global_sum, 0);
+
+    if(tid == 0) {
+        float log_sum = logf(global_sum) + global_max;
+        log_sum = log_sum > 0 ? log_sum : 0.01f * log_sum;
+        log_sum = log_sum > 0 ? log_sum : 0.01f * log_sum;
+        log_sum = gelu(gelu(log_sum));
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    const int num_features = input.size(1);
+    int block_size = 1024;
+    while(block_size > num_features) block_size >>= 1;
+    
+    auto output = torch::empty({input.size(0), 1}, input.options());
+    
+    dim3 grid(input.size(0));
+    dim3 block(block_size);
+    size_t smem = (block_size / 32) * sizeof(float);
+    
+    lse_activations_kernel<<<grid, block, smem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        num_features,
+        input.numel()
+    );
+    
+    return output;
+}
+"""
+
+lse_activations_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=lse_activations_cpp,
+    cuda_sources=lse_activations_kernel,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=[]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "inf",
+      "inf",
+      "inf",
+      "inf",
+      "inf"
+    ],
+    "avg_difference": [
+      "inf",
+      "inf",
+      "inf",
+      "inf",
+      "inf"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0004 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+lse_activations_kernel = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+__global__ void lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features,
+    int num_elements
+) {
+    extern __shared__ float smem[];
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    // First pass: find maximum value
+    float thread_max = -FLT_MAX;
+    for(int i = tid; i < num_features; i += num_threads) {
+        float val = input[batch_idx * num_features + i];
+        thread_max = fmaxf(thread_max, val);
+    }
+
+    // Warp reduction for max
+    float warp_max = thread_max;
+    for(int offset=16; offset>0; offset>>=1)
+        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+
+    if(threadIdx.x % 32 == 0)
+        smem[threadIdx.x/32] = warp_max;
+    __syncthreads();
+
+    // Block reduction for max
+    if(tid < 32) {
+        float v = tid < (num_threads+31)/32 ? smem[tid] : -FLT_MAX;
+        for(int offset=16; offset>0; offset>>=1)
+            v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));
+        if(tid == 0) smem[0] = v;
+    }
+    __syncthreads();
+    float global_max = smem[0];
+
+    // Second pass: compute sum of exps
+    float thread_sum = 0.0f;
+    for(int i = tid; i < num_features; i += num_threads) {
+        float val = input[batch_idx * num_features + i];
+        thread_sum += expf(val - global_max);
+    }
+
+    // Warp reduction for sum
+    float warp_sum = thread_sum;
+    for(int offset=16; offset>0; offset>>=1)
+        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+
+    if(threadIdx.x % 32 == 0)
+        smem[threadIdx.x/32] = warp_sum;
+    __syncthreads();
+
+    // Block reduction for sum
+    if(tid < 32) {
+        float v = tid < (num_threads+31)/32 ? smem[tid] : 0.0f;
+        for(int offset=16; offset>0; offset>>=1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        if(tid == 0) smem[1] = v;
+    }
+    __syncthreads();
+    float global_sum = smem[1];
+
+    // Final computation and activations
+    if(tid == 0) {
+        float log_sum = logf(global_sum) + global_max;
+        log_sum = fmaxf(0.01f * log_sum, log_sum);  // LeakyReLU
+        log_sum = fmaxf(0.01f * log_sum, log_sum);  // LeakyReLU
+        log_sum = gelu(gelu(log_sum));              // GELU x2
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int num_features = input.size(1);
+    
+    auto output = torch::empty({batch_size, 1}, input.options());
+    
+    const int block_size = 512;
+    size_t smem = (block_size/32 + 1) * sizeof(float) * 2;
+    
+    lse_activations_kernel<<<batch_size, block_size, smem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        num_features,
+        input.numel()
+    );
+    
+    return output;
+}
+"""
+
+lse_activations_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=lse_activations_cpp,
+    cuda_sources=lse_activations_kernel,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=[]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.0226,
+  "runtime_stats": {
+    "mean": 0.0226,
+    "std": 0.000439,
+    "min": 0.0216,
+    "max": 0.0237,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:3"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                        ampere_sgemm_64x32_sliced1x4_tn         0.00%       0.000us         0.00%       0.000us       0.000us     916.204us        67.36%     916.204us       9.544us            96  
+lse_activations_kernel(float const*, float*, int, in...         0.00%       0.000us         0.00%       0.000us       0.000us     236.034us        17.35%     236.034us       2.459us            96  
+void cublasLt::splitKreduce_kernel<32, 16, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us     207.839us        15.28%     207.839us       2.165us            96  
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor         5.37%      96.362us         5.37%      96.362us       1.036us       0.000us         0.00%       0.000us       0.000us            93  
+                                       cudaLaunchKernel        76.32%       1.368ms        76.32%       1.368ms       4.905us       0.000us         0.00%       0.000us       0.000us           279  
+                                  cudaDeviceSynchronize        18.30%     328.135us        18.30%     328.135us     328.135us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.793ms
+Self CUDA time total: 1.360ms
+
+=== ROUND 0005 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    const float kBeta = 1.702f;
+    return 0.5f * x * (1.0f + tanhf(x * 0.7978845608f * (1.0f + 0.044715f * x * x)));
+}
+
+__global__ void fused_lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features
+) {
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* batch_input = input + batch_idx * num_features;
+    
+    const int stride = blockDim.x * 4;
+    int idx = tid * 4;
+    
+    // Vectorized load with float4
+    float4 reg = reinterpret_cast<const float4*>(&batch_input[idx])[0];
+    float vals[4] = {reg.x, reg.y, reg.z, reg.w};
+    
+    // Find local max
+    float thread_max = -FLT_MAX;
+    #pragma unroll
+    for(int i = 0; i < 4; ++i) {
+        thread_max = fmaxf(thread_max, vals[i]);
+    }
+    
+    // Warp reduce max
+    float warp_max = thread_max;
+    for(int offset = 16; offset > 0; offset >>= 1) {
+        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+    }
+    
+    // Compute sum of exps
+    float thread_sum = 0.0f;
+    #pragma unroll
+    for(int i = 0; i < 4; ++i) {
+        thread_sum += expf(vals[i] - warp_max);
+    }
+    
+    // Warp reduce sum
+    float warp_sum = thread_sum;
+    for(int offset = 16; offset > 0; offset >>= 1) {
+        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+    }
+    
+    // Final computations
+    if(tid == 0) {
+        float log_sum = logf(warp_sum) + warp_max;
+        // Combined LeakyReLU (0.01^2 = 0.0001)
+        log_sum = fmaxf(0.0001f * log_sum, log_sum);
+        // Double GELU
+        log_sum = gelu(gelu(log_sum));
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int num_features = input.size(1);
+    auto output = torch::empty({batch_size, 1}, input.options());
+    
+    const int block_size = 128;  // Optimal for vectorized access
+    dim3 blocks(batch_size);
+    dim3 threads(block_size);
+    
+    fused_lse_activations_kernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        num_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=['-lcudart']
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "1.479976",
+      "1.434530",
+      "1.443325",
+      "1.450252",
+      "1.419722"
+    ],
+    "avg_difference": [
+      "1.150516",
+      "1.156036",
+      "1.136410",
+      "1.145531",
+      "1.153962"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0006 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    const float kBeta = 1.702f;
+    return 0.5f * x * (1.0f + tanhf(x * 0.7978845608f * (1.0f + 0.044715f * x * x)));
+}
+
+__global__ void fused_lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features
+) {
+    extern __shared__ float smem[];
+    float* max_shared = smem;
+    float* sum_shared = smem + blockDim.x;
+
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* batch_input = input + batch_idx * num_features;
+    
+    // Vectorized load with float4
+    float4 reg = reinterpret_cast<const float4*>(&batch_input[tid*4])[0];
+    float vals[4] = {reg.x, reg.y, reg.z, reg.w};
+    
+    // Compute thread max
+    float thread_max = -FLT_MAX;
+    #pragma unroll
+    for(int i = 0; i < 4; ++i) {
+        thread_max = fmaxf(thread_max, vals[i]);
+    }
+    
+    // Block max reduction
+    max_shared[tid] = thread_max;
+    __syncthreads();
+    for(int s = blockDim.x/2; s > 0; s >>= 1) {
+        if(tid < s) {
+            max_shared[tid] = fmaxf(max_shared[tid], max_shared[tid + s]);
+        }
+        __syncthreads();
+    }
+    float global_max = max_shared[0];
+    
+    // Compute sum of exps with global max
+    float thread_sum = 0.0f;
+    #pragma unroll
+    for(int i = 0; i < 4; ++i) {
+        thread_sum += expf(vals[i] - global_max);
+    }
+    
+    // Block sum reduction
+    sum_shared[tid] = thread_sum;
+    __syncthreads();
+    for(int s = blockDim.x/2; s > 0; s >>= 1) {
+        if(tid < s) {
+            sum_shared[tid] += sum_shared[tid + s];
+        }
+        __syncthreads();
+    }
+    float sum_exp = sum_shared[0];
+    
+    // Final computations
+    if(tid == 0) {
+        float log_sum = logf(sum_exp) + global_max;
+        // Combined LeakyReLU (0.01^2 = 0.0001)
+        log_sum = fmaxf(0.0001f * log_sum, log_sum);
+        // Double GELU
+        log_sum = gelu(gelu(log_sum));
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int num_features = input.size(1);
+    auto output = torch::empty({batch_size, 1}, input.options());
+    
+    const int block_size = 128;  // Must handle 4 elements per thread (512/4=128)
+    dim3 blocks(batch_size);
+    dim3 threads(block_size);
+    
+    fused_lse_activations_kernel<<<blocks, threads, 2*block_size*sizeof(float), cudaStreamPerThread>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        num_features
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=['-lcudart']
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.0529,
+  "runtime_stats": {
+    "mean": 0.0529,
+    "std": 0.00245,
+    "min": 0.0506,
+    "max": 0.0699,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:4"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                        ampere_sgemm_64x32_sliced1x4_tn         0.00%       0.000us         0.00%       0.000us       0.000us     723.335us        68.31%     723.335us       7.778us            93  
+fused_lse_activations_kernel(float const*, float*, i...         0.00%       0.000us         0.00%       0.000us       0.000us     177.825us        16.79%     177.825us       1.912us            93  
+void cublasLt::splitKreduce_kernel<32, 16, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us     157.729us        14.90%     157.729us       1.696us            93  
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor         6.22%      66.911us         6.22%      66.911us       0.719us       0.000us         0.00%       0.000us       0.000us            93  
+                                       cudaLaunchKernel        93.32%       1.004ms        93.32%       1.004ms       3.599us       0.000us         0.00%       0.000us       0.000us           279  
+                                  cudaDeviceSynchronize         0.46%       5.000us         0.46%       5.000us       5.000us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.076ms
+Self CUDA time total: 1.059ms
+
+=== ROUND 0007 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float fast_gelu(float x) {
+    const float scale = 1.702f;
+    float sx = scale * x;
+    float sigmoid = 1.0f / (1.0f + __expf(-sx));
+    return x * sigmoid;
+}
+
+__global__ void fused_lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features
+) {
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* batch_input = input + batch_idx * num_features;
+    
+    // Vectorized load with float4 through read-only cache
+    const float4* vec_ptr = reinterpret_cast<const float4*>(batch_input + tid*4);
+    float4 reg = __ldg(vec_ptr);
+    float vals[4] = {reg.x, reg.y, reg.z, reg.w};
+    
+    // Thread-local max
+    float thread_max = -FLT_MAX;
+    #pragma unroll
+    for(int i = 0; i < 4; ++i) {
+        thread_max = fmaxf(thread_max, vals[i]);
+    }
+    
+    // Warp-level max reduction
+    float warp_max = thread_max;
+    for(int offset = 16; offset > 0; offset >>= 1) {
+        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+    }
+    
+    // Block-level max reduction
+    if (tid % 32 == 0) {
+        __shared__ float smax[4];
+        smax[tid/32] = warp_max;
+        __syncthreads();
+        
+        if (tid < 4) {
+            float block_max = smax[tid];
+            for(int offset = 2; offset > 0; offset >>= 1) {
+                block_max = fmaxf(block_max, __shfl_down_sync(0xffffffff, block_max, offset));
+            }
+            if (tid == 0) smax[0] = block_max;
+        }
+        __syncthreads();
+    }
+    float global_max = __shfl_sync(0xffffffff, warp_max, 0);
+    
+    // Thread-local sum with fast exp
+    float thread_sum = 0.0f;
+    #pragma unroll
+    for(int i = 0; i < 4; ++i) {
+        thread_sum += __expf(vals[i] - global_max);
+    }
+    
+    // Warp-level sum reduction
+    float warp_sum = thread_sum;
+    for(int offset = 16; offset > 0; offset >>= 1) {
+        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+    }
+    
+    // Block-level sum reduction
+    if (tid % 32 == 0) {
+        __shared__ float ssum[4];
+        ssum[tid/32] = warp_sum;
+        __syncthreads();
+        
+        if (tid < 4) {
+            float block_sum = ssum[tid];
+            for(int offset = 2; offset > 0; offset >>= 1) {
+                block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+            }
+            if (tid == 0) ssum[0] = block_sum;
+        }
+        __syncthreads();
+    }
+    float sum_exp = __shfl_sync(0xffffffff, warp_sum, 0);
+    
+    // Final computations with fused activations
+    if (tid == 0) {
+        float log_sum = __logf(sum_exp) + global_max;
+        log_sum = fmaxf(0.0001f * log_sum, log_sum);  // Combined LeakyReLUs
+        log_sum = fast_gelu(fast_gelu(log_sum));       // Double GELU
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    auto output = torch::empty({batch_size, 1}, input.options());
+    
+    const int block_size = 128;
+    fused_lse_activations_kernel<<<batch_size, block_size, 0, cudaStreamPerThread>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1)
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=['-lcudart']
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0008 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+
+__device__ __forceinline__ float fast_gelu(float x) {
+    const float scale = 1.702f;
+    float sx = scale * x;
+    float sigmoid = 1.0f / (1.0f + __expf(-sx));
+    return x * sigmoid;
+}
+
+__global__ void fused_lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features
+) {
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* batch_input = input + batch_idx * num_features;
+    
+    // Vectorized load with bounds checking
+    float vals[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
+    int start_idx = tid*4;
+    
+    if(start_idx < num_features) {
+        int remaining = num_features - start_idx;
+        if(remaining >= 4) {
+            const float4* vec_ptr = reinterpret_cast<const float4*>(batch_input + start_idx);
+            float4 reg = __ldg(vec_ptr);
+            vals[0] = reg.x; vals[1] = reg.y; vals[2] = reg.z; vals[3] = reg.w;
+        } else {
+            for(int i = 0; i < remaining; ++i) {
+                vals[i] = batch_input[start_idx + i];
+            }
+        }
+    }
+
+    // Max reduction
+    float thread_max = fmaxf(fmaxf(vals[0], vals[1]), fmaxf(vals[2], vals[3]));
+    for(int offset = 16; offset > 0; offset >>= 1)
+        thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
+    
+    __shared__ float smax;
+    if(threadIdx.x == 0) smax = -FLT_MAX;
+    __syncthreads();
+    
+    if(thread_max > smax) atomicMax((int*)&smax, __float_as_int(thread_max));
+    __syncthreads();
+    float global_max = __int_as_float(*((int*)&smax));
+
+    // Sum reduction
+    float thread_sum = 0.0f;
+    for(int i = 0; i < 4; ++i) {
+        if(start_idx + i < num_features)
+            thread_sum += __expf(vals[i] - global_max);
+    }
+    
+    for(int offset = 16; offset > 0; offset >>= 1)
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    
+    __shared__ float ssum;
+    if(threadIdx.x == 0) ssum = 0.0f;
+    __syncthreads();
+    
+    atomicAdd(&ssum, thread_sum);
+    __syncthreads();
+    float sum_exp = ssum;
+
+    // Activations
+    if(threadIdx.x == 0) {
+        float log_sum = __logf(sum_exp) + global_max;
+        log_sum = fmaxf(0.01f * log_sum, log_sum); // LeakyReLU
+        log_sum = fmaxf(0.01f * log_sum, log_sum); // LeakyReLU
+        log_sum = fast_gelu(log_sum);              // GELU
+        log_sum = fast_gelu(log_sum);              // GELU
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto output = torch::empty({batch_size, 1}, input.options());
+    
+    auto stream = at::cuda::getCurrentCUDAStream(input.device().index());
+    fused_lse_activations_kernel<<<batch_size, 256, 0, stream>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1)
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=['-lcudart']
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "3.522503",
+      "3.520647",
+      "3.534690",
+      "3.524957",
+      "3.521535"
+    ],
+    "avg_difference": [
+      "3.463650",
+      "3.459592",
+      "3.463993",
+      "3.459510",
+      "3.466434"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0009 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <math.h>
+
+__device__ __forceinline__ float exact_gelu(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));
+}
+
+__global__ void fused_lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features
+) {
+    extern __shared__ float smem[];
+    float* smax = smem;
+    float* ssum = smem + blockDim.x;
+
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* batch_input = input + batch_idx * num_features;
+    
+    float vals[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
+    int start_idx = tid * 4;
+    
+    if (start_idx < num_features) {
+        int remaining = num_features - start_idx;
+        if (remaining >= 4) {
+            const float4* vec_ptr = reinterpret_cast<const float4*>(batch_input + start_idx);
+            float4 reg = __ldg(vec_ptr);
+            vals[0] = reg.x; vals[1] = reg.y; vals[2] = reg.z; vals[3] = reg.w;
+        } else {
+            for(int i = 0; i < remaining; ++i) {
+                vals[i] = batch_input[start_idx + i];
+            }
+        }
+    }
+
+    float thread_max = fmaxf(fmaxf(vals[0], vals[1]), fmaxf(vals[2], vals[3]));
+    smax[tid] = thread_max;
+    __syncthreads();
+
+    for(int s = blockDim.x/2; s > 0; s >>= 1) {
+        if(tid < s) smax[tid] = fmaxf(smax[tid], smax[tid + s]);
+        __syncthreads();
+    }
+    float global_max = smax[0];
+
+    float thread_sum = 0.0f;
+    for(int i = 0; i < 4; ++i) {
+        if(start_idx + i < num_features)
+            thread_sum += __expf(vals[i] - global_max);
+    }
+
+    ssum[tid] = thread_sum;
+    __syncthreads();
+
+    for(int s = blockDim.x/2; s > 0; s >>= 1) {
+        if(tid < s) ssum[tid] += ssum[tid + s];
+        __syncthreads();
+    }
+    float sum_exp = ssum[0];
+
+    if(tid == 0) {
+        float log_sum = __logf(sum_exp) + global_max;
+        log_sum = fmaxf(0.01f * log_sum, log_sum);
+        log_sum = fmaxf(0.01f * log_sum, log_sum);
+        log_sum = exact_gelu(log_sum);
+        log_sum = exact_gelu(log_sum);
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto output = torch::empty({batch_size, 1}, input.options());
+    
+    int threads = 256;
+    size_t shared_size = 2 * threads * sizeof(float);
+    
+    auto stream = at::cuda::getCurrentCUDAStream(input.device().index());
+    fused_lse_activations_kernel<<<batch_size, threads, shared_size, stream>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1)
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=['-lcudart']
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.0149,
+  "runtime_stats": {
+    "mean": 0.0149,
+    "std": 8.01e-05,
+    "min": 0.0148,
+    "max": 0.0153,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:1"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                        ampere_sgemm_64x32_sliced1x4_tn         0.00%       0.000us         0.00%       0.000us       0.000us     714.723us        66.25%     714.723us       7.523us            95  
+fused_lse_activations_kernel(float const*, float*, i...         0.00%       0.000us         0.00%       0.000us       0.000us     203.385us        18.85%     203.385us       2.119us            96  
+void cublasLt::splitKreduce_kernel<32, 16, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us     160.705us        14.90%     160.705us       1.692us            95  
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor         4.61%      71.551us         4.61%      71.551us       0.769us       0.000us         0.00%       0.000us       0.000us            93  
+                                       cudaLaunchKernel        80.70%       1.254ms        80.70%       1.254ms       4.494us       0.000us         0.00%       0.000us       0.000us           279  
+                                  cudaDeviceSynchronize        14.69%     228.293us        14.69%     228.293us     228.293us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.554ms
+Self CUDA time total: 1.079ms
+
+=== ROUND 0010 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_kernel_code = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <math.h>
+
+__device__ __forceinline__ float exact_gelu(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));
+}
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void fused_lse_activations_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int num_features
+) {
+    extern __shared__ float smem[];
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    
+    const float* batch_input = input + batch_idx * num_features;
+    const int elements_per_thread = (num_features + blockDim.x - 1) / blockDim.x;
+    const int start_idx = tid * elements_per_thread;
+    const int end_idx = min(start_idx + elements_per_thread, num_features);
+
+    float thread_max = -FLT_MAX;
+    for(int i = start_idx; i < end_idx; ++i) {
+        thread_max = fmaxf(thread_max, __ldg(batch_input + i));
+    }
+
+    float warp_max = warp_reduce_max(thread_max);
+    if(lane_id == 0) smem[warp_id] = warp_max;
+    __syncthreads();
+
+    float block_max = lane_id < blockDim.x/32 ? smem[lane_id] : -FLT_MAX;
+    block_max = warp_reduce_max(block_max);
+    
+    float thread_sum = 0.0f;
+    for(int i = start_idx; i < end_idx; ++i) {
+        thread_sum += expf(__ldg(batch_input + i) - block_max);
+    }
+
+    float warp_sum = warp_reduce_sum(thread_sum);
+    if(lane_id == 0) smem[warp_id] = warp_sum;
+    __syncthreads();
+
+    float block_sum = lane_id < blockDim.x/32 ? smem[lane_id] : 0.0f;
+    block_sum = warp_reduce_sum(block_sum);
+
+    if(tid == 0) {
+        float log_sum = logf(block_sum) + block_max;
+        log_sum = fmaxf(0.0001f * log_sum, log_sum);  // Combined LeakyReLUs
+        log_sum = exact_gelu(exact_gelu(log_sum));    // Fused GELUs
+        output[batch_idx] = log_sum;
+    }
+}
+
+torch::Tensor fused_op_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto output = torch::empty({batch_size, 1}, input.options());
+    
+    int threads = 256;
+    int warps_per_block = threads / 32;
+    size_t shared_size = 2 * warps_per_block * sizeof(float);
+    
+    fused_lse_activations_kernel<<<batch_size, threads, shared_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1)
+    );
+    
+    return output;
+}
+"""
+
+fused_kernel_cpp = "torch::Tensor fused_op_cuda(torch::Tensor input);"
+
+fused_op = load_inline(
+    name='fused_op',
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_code,
+    functions=['fused_op_cuda'],
+    verbose=True,
+    extra_cflags=['-O3', '-ffast-math'],
+    extra_ldflags=['-lcudart']
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_op.fused_op_cuda(x)
+        return x
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: CUDA-capable device(s) is/are busy or unavailable\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+FINAL_RESULT:
+{
+  "context": "You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\n\n        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: \n\n        ``` \n\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n        ``` \n\n        The example new arch with custom CUDA kernels looks like this: \n        ```\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for element-wise addition\nelementwise_add_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add_cpp_source = (\n    \"torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);\"\n)\n\n# Compile the inline CUDA code for element-wise addition\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    cuda_sources=elementwise_add_source,\n    functions=[\"elementwise_add_cuda\"],\n    verbose=True,\n    extra_cflags=[\"\"],\n    extra_ldflags=[\"\"],\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_cuda(a, b)\n\n        ``` \n\n        \n    You are given the following architecture: \n\n    ```\n    import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Model that performs a matrix multiplication (Gemm), followed by LogSumExp, LeakyReLU, \n    LeakyReLU, GELU, and GELU activations.\n    \"\"\"\n    def __init__(self, in_features, out_features, bias=True):\n        super(Model, self).__init__()\n        self.linear = nn.Linear(in_features, out_features, bias=bias)\n\n    def forward(self, x):\n        # Gemm\n        x = self.linear(x)\n        # LogSumExp\n        x = torch.logsumexp(x, dim=1, keepdim=True)\n        # LeakyReLU\n        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)\n        # LeakyReLU\n        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)\n        # GELU\n        x = torch.nn.functional.gelu(x)\n        # GELU\n        x = torch.nn.functional.gelu(x)\n        return x\n\nbatch_size = 128\nin_features = 1024\nout_features = 512\n\ndef get_inputs():\n    return [torch.randn(batch_size, in_features)]\n\ndef get_init_inputs():\n    return [in_features, out_features]\n    ```\n    Here is your latest generation:\n```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nfused_kernel_code = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n#include <ATen/cuda/CUDAContext.h>\n#include <math.h>\n\n__device__ __forceinline__ float exact_gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));\n}\n\n__global__ void fused_lse_activations_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int num_features\n) {\n    extern __shared__ float smem[];\n    float* smax = smem;\n    float* ssum = smem + blockDim.x;\n\n    const int batch_idx = blockIdx.x;\n    const int tid = threadIdx.x;\n    const float* batch_input = input + batch_idx * num_features;\n    \n    float vals[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};\n    int start_idx = tid * 4;\n    \n    if (start_idx < num_features) {\n        int remaining = num_features - start_idx;\n        if (remaining >= 4) {\n            const float4* vec_ptr = reinterpret_cast<const float4*>(batch_input + start_idx);\n            float4 reg = __ldg(vec_ptr);\n            vals[0] = reg.x; vals[1] = reg.y; vals[2] = reg.z; vals[3] = reg.w;\n        } else {\n            for(int i = 0; i < remaining; ++i) {\n                vals[i] = batch_input[start_idx + i];\n            }\n        }\n    }\n\n    float thread_max = fmaxf(fmaxf(vals[0], vals[1]), fmaxf(vals[2], vals[3]));\n    smax[tid] = thread_max;\n    __syncthreads();\n\n    for(int s = blockDim.x/2; s > 0; s >>= 1) {\n        if(tid < s) smax[tid] = fmaxf(smax[tid], smax[tid + s]);\n        __syncthreads();\n    }\n    float global_max = smax[0];\n\n    float thread_sum = 0.0f;\n    for(int i = 0; i < 4; ++i) {\n        if(start_idx + i < num_features)\n            thread_sum += __expf(vals[i] - global_max);\n    }\n\n    ssum[tid] = thread_sum;\n    __syncthreads();\n\n    for(int s = blockDim.x/2; s > 0; s >>= 1) {\n        if(tid < s) ssum[tid] += ssum[tid + s];\n        __syncthreads();\n    }\n    float sum_exp = ssum[0];\n\n    if(tid == 0) {\n        float log_sum = __logf(sum_exp) + global_max;\n        log_sum = fmaxf(0.01f * log_sum, log_sum);\n        log_sum = fmaxf(0.01f * log_sum, log_sum);\n        log_sum = exact_gelu(log_sum);\n        log_sum = exact_gelu(log_sum);\n        output[batch_idx] = log_sum;\n    }\n}\n\ntorch::Tensor fused_op_cuda(torch::Tensor input) {\n    auto batch_size = input.size(0);\n    auto output = torch::empty({batch_size, 1}, input.options());\n    \n    int threads = 256;\n    size_t shared_size = 2 * threads * sizeof(float);\n    \n    auto stream = at::cuda::getCurrentCUDAStream(input.device().index());\n    fused_lse_activations_kernel<<<batch_size, threads, shared_size, stream>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        input.size(1)\n    );\n    \n    return output;\n}\n\"\"\"\n\nfused_kernel_cpp = \"torch::Tensor fused_op_cuda(torch::Tensor input);\"\n\nfused_op = load_inline(\n    name='fused_op',\n    cpp_sources=fused_kernel_cpp,\n    cuda_sources=fused_kernel_code,\n    functions=['fused_op_cuda'],\n    verbose=True,\n    extra_cflags=['-O3', '-ffast-math'],\n    extra_ldflags=['-lcudart']\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, bias=True):\n        super(ModelNew, self).__init__()\n        self.linear = nn.Linear(in_features, out_features, bias=bias)\n        \n    def forward(self, x):\n        x = self.linear(x)\n        x = fused_op.fused_op_cuda(x)\n        return x\n```\nYour generated architecture ModelNew and kernel was evaluated on GPU and checked against the reference architecture Model. \n\nHere is the Evaluation Result: \nYour kernel executed successfully and produced the correct output. \n\nHere is your wall clock time: 0.0149 milliseconds \n\nYour Kernel was profiled with the PyTorch Profiler over many iterations, below is a table breakdown of the CUDA kernel execution time: \n\n```\n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                        ampere_sgemm_64x32_sliced1x4_tn         0.00%       0.000us         0.00%       0.000us       0.000us     714.723us        66.25%     714.723us       7.523us            95  \nfused_lse_activations_kernel(float const*, float*, i...         0.00%       0.000us         0.00%       0.000us       0.000us     203.385us        18.85%     203.385us       2.119us            96  \nvoid cublasLt::splitKreduce_kernel<32, 16, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us     160.705us        14.90%     160.705us       1.692us            95  \n          cudaOccupancyMaxActiveBlocksPerMultiprocessor         4.61%      71.551us         4.61%      71.551us       0.769us       0.000us         0.00%       0.000us       0.000us            93  \n                                       cudaLaunchKernel        80.70%       1.254ms        80.70%       1.254ms       4.494us       0.000us         0.00%       0.000us       0.000us           279  \n                                  cudaDeviceSynchronize        14.69%     228.293us        14.69%     228.293us     228.293us       0.000us         0.00%       0.000us       0.000us             1  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 1.554ms\nSelf CUDA time total: 1.079ms\n\n```\n\nName your new improved output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n\nPlease rewrite the entire kernel to be as fast as possible. \n\n",
+  "model_response": "```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nfused_kernel_code = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n#include <ATen/cuda/CUDAContext.h>\n#include <math.h>\n\n__device__ __forceinline__ float exact_gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));\n}\n\n__device__ __forceinline__ float warp_reduce_max(float val) {\n    for (int offset = 16; offset > 0; offset >>= 1) {\n        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));\n    }\n    return val;\n}\n\n__device__ __forceinline__ float warp_reduce_sum(float val) {\n    for (int offset = 16; offset > 0; offset >>= 1) {\n        val += __shfl_down_sync(0xffffffff, val, offset);\n    }\n    return val;\n}\n\n__global__ void fused_lse_activations_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int num_features\n) {\n    extern __shared__ float smem[];\n    const int batch_idx = blockIdx.x;\n    const int tid = threadIdx.x;\n    const int warp_id = tid / 32;\n    const int lane_id = tid % 32;\n    \n    const float* batch_input = input + batch_idx * num_features;\n    const int elements_per_thread = (num_features + blockDim.x - 1) / blockDim.x;\n    const int start_idx = tid * elements_per_thread;\n    const int end_idx = min(start_idx + elements_per_thread, num_features);\n\n    float thread_max = -FLT_MAX;\n    for(int i = start_idx; i < end_idx; ++i) {\n        thread_max = fmaxf(thread_max, __ldg(batch_input + i));\n    }\n\n    float warp_max = warp_reduce_max(thread_max);\n    if(lane_id == 0) smem[warp_id] = warp_max;\n    __syncthreads();\n\n    float block_max = lane_id < blockDim.x/32 ? smem[lane_id] : -FLT_MAX;\n    block_max = warp_reduce_max(block_max);\n    \n    float thread_sum = 0.0f;\n    for(int i = start_idx; i < end_idx; ++i) {\n        thread_sum += expf(__ldg(batch_input + i) - block_max);\n    }\n\n    float warp_sum = warp_reduce_sum(thread_sum);\n    if(lane_id == 0) smem[warp_id] = warp_sum;\n    __syncthreads();\n\n    float block_sum = lane_id < blockDim.x/32 ? smem[lane_id] : 0.0f;\n    block_sum = warp_reduce_sum(block_sum);\n\n    if(tid == 0) {\n        float log_sum = logf(block_sum) + block_max;\n        log_sum = fmaxf(0.0001f * log_sum, log_sum);  // Combined LeakyReLUs\n        log_sum = exact_gelu(exact_gelu(log_sum));    // Fused GELUs\n        output[batch_idx] = log_sum;\n    }\n}\n\ntorch::Tensor fused_op_cuda(torch::Tensor input) {\n    auto batch_size = input.size(0);\n    auto output = torch::empty({batch_size, 1}, input.options());\n    \n    int threads = 256;\n    int warps_per_block = threads / 32;\n    size_t shared_size = 2 * warps_per_block * sizeof(float);\n    \n    fused_lse_activations_kernel<<<batch_size, threads, shared_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        input.size(1)\n    );\n    \n    return output;\n}\n\"\"\"\n\nfused_kernel_cpp = \"torch::Tensor fused_op_cuda(torch::Tensor input);\"\n\nfused_op = load_inline(\n    name='fused_op',\n    cpp_sources=fused_kernel_cpp,\n    cuda_sources=fused_kernel_code,\n    functions=['fused_op_cuda'],\n    verbose=True,\n    extra_cflags=['-O3', '-ffast-math'],\n    extra_ldflags=['-lcudart']\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, bias=True):\n        super(ModelNew, self).__init__()\n        self.linear = nn.Linear(in_features, out_features, bias=bias)\n        \n    def forward(self, x):\n        x = self.linear(x)\n        x = fused_op.fused_op_cuda(x)\n        return x\n```",
+  "kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nfused_kernel_code = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n#include <ATen/cuda/CUDAContext.h>\n#include <math.h>\n\n__device__ __forceinline__ float exact_gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));\n}\n\n__device__ __forceinline__ float warp_reduce_max(float val) {\n    for (int offset = 16; offset > 0; offset >>= 1) {\n        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));\n    }\n    return val;\n}\n\n__device__ __forceinline__ float warp_reduce_sum(float val) {\n    for (int offset = 16; offset > 0; offset >>= 1) {\n        val += __shfl_down_sync(0xffffffff, val, offset);\n    }\n    return val;\n}\n\n__global__ void fused_lse_activations_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int num_features\n) {\n    extern __shared__ float smem[];\n    const int batch_idx = blockIdx.x;\n    const int tid = threadIdx.x;\n    const int warp_id = tid / 32;\n    const int lane_id = tid % 32;\n    \n    const float* batch_input = input + batch_idx * num_features;\n    const int elements_per_thread = (num_features + blockDim.x - 1) / blockDim.x;\n    const int start_idx = tid * elements_per_thread;\n    const int end_idx = min(start_idx + elements_per_thread, num_features);\n\n    float thread_max = -FLT_MAX;\n    for(int i = start_idx; i < end_idx; ++i) {\n        thread_max = fmaxf(thread_max, __ldg(batch_input + i));\n    }\n\n    float warp_max = warp_reduce_max(thread_max);\n    if(lane_id == 0) smem[warp_id] = warp_max;\n    __syncthreads();\n\n    float block_max = lane_id < blockDim.x/32 ? smem[lane_id] : -FLT_MAX;\n    block_max = warp_reduce_max(block_max);\n    \n    float thread_sum = 0.0f;\n    for(int i = start_idx; i < end_idx; ++i) {\n        thread_sum += expf(__ldg(batch_input + i) - block_max);\n    }\n\n    float warp_sum = warp_reduce_sum(thread_sum);\n    if(lane_id == 0) smem[warp_id] = warp_sum;\n    __syncthreads();\n\n    float block_sum = lane_id < blockDim.x/32 ? smem[lane_id] : 0.0f;\n    block_sum = warp_reduce_sum(block_sum);\n\n    if(tid == 0) {\n        float log_sum = logf(block_sum) + block_max;\n        log_sum = fmaxf(0.0001f * log_sum, log_sum);  // Combined LeakyReLUs\n        log_sum = exact_gelu(exact_gelu(log_sum));    // Fused GELUs\n        output[batch_idx] = log_sum;\n    }\n}\n\ntorch::Tensor fused_op_cuda(torch::Tensor input) {\n    auto batch_size = input.size(0);\n    auto output = torch::empty({batch_size, 1}, input.options());\n    \n    int threads = 256;\n    int warps_per_block = threads / 32;\n    size_t shared_size = 2 * warps_per_block * sizeof(float);\n    \n    fused_lse_activations_kernel<<<batch_size, threads, shared_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        input.size(1)\n    );\n    \n    return output;\n}\n\"\"\"\n\nfused_kernel_cpp = \"torch::Tensor fused_op_cuda(torch::Tensor input);\"\n\nfused_op = load_inline(\n    name='fused_op',\n    cpp_sources=fused_kernel_cpp,\n    cuda_sources=fused_kernel_code,\n    functions=['fused_op_cuda'],\n    verbose=True,\n    extra_cflags=['-O3', '-ffast-math'],\n    extra_ldflags=['-lcudart']\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, bias=True):\n        super(ModelNew, self).__init__()\n        self.linear = nn.Linear(in_features, out_features, bias=bias)\n        \n    def forward(self, x):\n        x = self.linear(x)\n        x = fused_op.fused_op_cuda(x)\n        return x",
+  "feedback": "",
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:1",
+      "max_difference": [
+        "inf",
+        "inf",
+        "inf",
+        "inf",
+        "inf"
+      ],
+      "avg_difference": [
+        "inf",
+        "inf",
+        "inf",
+        "inf",
+        "inf"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)"
+    },
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "profiler_result": ""
+}
