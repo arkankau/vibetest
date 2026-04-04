@@ -34,18 +34,21 @@ Both methods are per-trace (score each transcript independently). Model: `Qwen3.
 
 ### Trace-level AUROC across case sizes
 
-Cases constructed with variable traces-per-case (tpc), mixed tasks, 50% positive rate.
+Cases constructed with TRACE-style stratified sampling: variable traces-per-case (tpc), mixed tasks, 50% positive rate, sabotage count uniformly distributed across 1..max per positive case, interleaved case ordering.
 
-| tpc | Cases | Method | Traces scored | Case Acc | Trace AUROC |
-|-----|-------|--------|---------------|----------|-------------|
-| 1 | 403 | Monitor | 403 | 0.749 | 0.847 |
-| 1 | 403 | EaE | 403 | 0.725 | **0.867** |
-| 10 | 40 | Monitor | 400 | 0.550 | 0.832 |
-| 10 | 40 | EaE | 40 | 0.475 | 0.854 |
-| 25 | 16 | Monitor | 400 | 0.500 | 0.857 |
-| 50 | 8 | Monitor | 400 | 0.500 | 0.853 |
+| tpc | Cases | Method | Traces | Case Acc | Trace AUROC |
+|-----|-------|--------|--------|----------|-------------|
+| 1 | 403 | **Meerkat (Agent)** | 429 | 0.744 | **0.867** |
+| 1 | 403 | EaE | 403 | 0.727 | 0.827 |
+| 1 | 403 | Monitor | 403 | 0.749 | 0.808 |
+| 10 | 40 | EaE | 354 | 0.500 | 0.890 |
+| 10 | 40 | Monitor | 400 | 0.525 | 0.829 |
+| 25 | 16 | EaE | 351 | 0.500 | 0.904 |
+| 25 | 16 | Monitor | 400 | 0.500 | 0.901 |
+| 50 | 8 | EaE | 349 | 0.500 | 0.938 |
+| 50 | 8 | Monitor | 400 | 0.500 | 0.980 |
 
-**Key finding:** Trace-level AUROC is stable at ~0.84-0.87 regardless of case size — expected since both methods score traces independently. EaE slightly outperforms the monitor at tpc=1 (0.867 vs 0.847).
+Meerkat (Agent) only run at tpc=1 (requires Docker sandbox, batched in groups of 20). Monitor and EaE are per-trace methods; EaE scores at tpc>1 propagated from tpc=1 via content hash (~87% coverage).
 
 ### Per-task AUROC (Monitor, tpc=1)
 
@@ -75,12 +78,12 @@ Cases constructed with variable traces-per-case (tpc), mixed tasks, 50% positive
 
 | Method | AUROC | Acc | Notes |
 |--------|-------|-----|-------|
-| **Agent (VibeTest)** | **0.918** | **0.787** | Full tool-use in Docker sandbox |
-| EaE | 0.867 | 0.725 | Two-stage: extract excerpts + evaluate |
-| Monitor | 0.847 | 0.749 | Paper's single-call protocol |
+| **Meerkat (Agent)** | **0.867** | 0.744 | Full tool-use in Docker sandbox |
+| EaE | 0.827 | 0.727 | Two-stage: extract excerpts + evaluate |
+| Monitor | 0.808 | **0.749** | Paper's single-call protocol |
 | Paper's monitor | 0.648 | 0.607 | Their baseline (84 traces, SHADE-only) |
 
-The agent substantially outperforms both the monitor and EaE. With tool access in a Docker sandbox, the agent can read full transcripts, search for patterns, and reason about multi-step behaviors that the single-call monitor misses.
+The agent outperforms both the monitor and EaE on AUROC. With tool access in a Docker sandbox, the agent can read full transcripts, search for patterns, and reason about multi-step behaviors that the single-call monitor misses. The monitor achieves the highest case-level accuracy (0.749) due to better specificity on clean traces.
 
 ### Figures
 
@@ -95,13 +98,13 @@ A swap analysis decomposes the Agent's AUROC improvement over the Monitor into s
 | Configuration | AUROC | vs. Monitor |
 |---------------|-------|-------------|
 | Monitor (baseline) | 0.808 | — |
-| Agent pos scores + Monitor neg scores | 0.953 | +0.145 |
-| Monitor pos scores + Agent neg scores | 0.669 | -0.139 |
-| **Agent (full)** | **0.896** | **+0.088** |
+| Agent pos scores + Monitor neg scores | 0.957 | +0.149 |
+| Monitor pos scores + Agent neg scores | 0.681 | -0.127 |
+| **Agent (full)** | **0.884** | **+0.076** |
 
-**The Agent's improvement comes entirely from better positive detection.** If we keep the Monitor's clean-trace scores but use the Agent's sabotage-trace scores, AUROC jumps to 0.953 (+0.145). The Agent finds hard positives — subtle sabotage traces (AA flights, HR manipulation) where the Monitor gives moderate scores (0.3-0.5) but the Agent, with tool access and multi-step reasoning, correctly pushes them to 0.8+.
+**The Agent's improvement comes entirely from better positive detection.** If we keep the Monitor's clean-trace scores but use the Agent's sabotage-trace scores, AUROC jumps to 0.957 (+0.149). The Agent finds hard positives — subtle sabotage traces (AA flights, HR manipulation) where the Monitor gives moderate scores (0.3-0.5) but the Agent, with tool access and multi-step reasoning, correctly pushes them to 0.8+.
 
-The tradeoff: the Agent is *worse* at rejecting clean traces (mean neg score 0.40 vs Monitor's 0.18). At TPR=0.90, the Monitor requires FPR=1.00 (can't achieve 90% recall without flagging everything), while the Agent achieves FPR=0.41. The Agent finds the hard positives that the Monitor simply cannot see, at the cost of slightly more false alarms — a worthwhile trade for operational sabotage detection.
+The tradeoff: the Agent is *worse* at rejecting clean traces. Swapping in the Agent's negative scores drops AUROC by -0.127, indicating more false alarms. But this is a worthwhile trade: the Agent raises the recall ceiling on hard positives that the Monitor simply cannot detect.
 
 The decomposition figure (panel b) shows this clearly: at any FPR budget, the Agent catches more sabotage traces. The positive CDF (panel c) shows the Agent pushes sabotage scores higher, while the negative CDF (panel d) confirms the Agent is more trigger-happy on clean traces.
 

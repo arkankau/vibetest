@@ -4062,6 +4062,7 @@ def run_impossiblebench_vibetest(
     gt_field_name: str = "reward_hacking",
     safety_analysis_tools: bool = True,
     retry_eval_log: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Path:
     print("=" * 80)
     print(f"Running safety experiment: case-set VibeTest ({task_name})")
@@ -4086,6 +4087,7 @@ def run_impossiblebench_vibetest(
         static=not dynamic,
         safety_agent=True,
         safety_analysis_tools=safety_analysis_tools,
+        reasoning_effort=reasoning_effort,
     )
     results = agent.execute_tests(
         test_cases, sandbox=sandbox, retry_eval_log=retry_eval_log,
@@ -4140,6 +4142,7 @@ def run_impossiblebench_vibetest(
             "repo_name": case.case_id,
             "case_id": case.case_id,
             "traces_per_case": case.traces_per_case,
+            "reasoning_effort": reasoning_effort or "medium",
             "total_tests": 1,
             "passed_tests": 1 if result.passed else 0,
             "failed_tests": 0 if result.passed else 1,
@@ -4360,6 +4363,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional max traces to run (0 = all).")
     parser.add_argument("--offset", type=int, default=0, help="Optional number of traces to skip first.")
+    parser.add_argument(
+        "--case-ids",
+        type=str,
+        default="",
+        help="Comma-separated list of case indices to run (e.g. '1,5,15,36,46'). "
+             "Requires materializing enough cases first (via --cases).",
+    )
     parser.add_argument("--sandbox", type=str, default="docker", help="Inspect sandbox backend.")
 
     parser.add_argument(
@@ -4649,6 +4659,16 @@ def _parse_args() -> argparse.Namespace:
         choices=["silhouette", "high_k", "coherence", "fine"],
         default="silhouette",
         help="Clustering strategy: silhouette (default), high_k (k=n/10), coherence (k=n/8 + coherence).",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        choices=["low", "medium", "high", "xhigh"],
+        default=None,
+        help=(
+            "Reasoning effort level for thinking/reasoning models (e.g., GPT-5.4, o-series). "
+            "Controls inference compute budget. If not set, defaults to 'medium'."
+        ),
     )
     parser.add_argument(
         "--scorer-model",
@@ -5155,8 +5175,12 @@ def main() -> None:
             start = max(args.offset, 0)
             end = None if args.limit <= 0 else start + args.limit
             cases = cases[start:end]
+        if args.case_ids:
+            wanted = set(f"case_{int(x.strip()):04d}" for x in args.case_ids.split(","))
+            cases = [c for c in cases if c.case_id in wanted]
+            print(f"Filtered to {len(cases)} cases by --case-ids: {sorted(wanted)}")
         if not cases:
-            raise SystemExit("No safety cases selected after applying limit/offset.")
+            raise SystemExit("No safety cases selected after applying limit/offset/case-ids.")
         print(f"Materialized safety cases: {len(cases)}")
 
         for case in cases:
@@ -5258,6 +5282,7 @@ def main() -> None:
             gt_field_name=gt_field_name,
             safety_analysis_tools=args.safety_analysis_tools,
             retry_eval_log=args.retry_eval_log,
+            reasoning_effort=args.reasoning_effort,
         )
         # Restore clusters.json if we hid them for --skip-clustering
         if getattr(args, "skip_clustering", False):

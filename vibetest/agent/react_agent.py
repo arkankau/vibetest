@@ -759,14 +759,16 @@ class VibeTestAgent:
         additional_tools: list[Tool] | None = None,
         static: bool = False,
         safety_agent: bool = False,
-        safety_analysis_tools: bool = False,
-        safety_repo_artifacts: bool = True,
+        safety_analysis_tools: bool = True,
+        reasoning_effort: str | None = None,
     ):
         """Initialize the agent.
 
         Args:
             model: Model to use (e.g., "anthropic/claude-3-5-sonnet-20241022")
             additional_tools: Extra tools to add beyond defaults
+            reasoning_effort: Reasoning effort level ("low", "medium", "high") for thinking models.
+                If None, defaults to "medium".
         """
         self.model_name = model or os.getenv(
             "VIBETEST_MODEL", "no-model"
@@ -774,7 +776,7 @@ class VibeTestAgent:
         self.static = static
         self.safety_agent = safety_agent
         self.safety_analysis_tools = safety_analysis_tools
-        self.safety_repo_artifacts = safety_repo_artifacts
+        self.reasoning_effort = reasoning_effort or "medium"
         self.tools = self._setup_tools(additional_tools)
 
     def _setup_tools(self, additional_tools: list[Tool] | None = None) -> list[Tool]:
@@ -970,7 +972,7 @@ class VibeTestAgent:
                     new_results = eval(
                         tasks=resume_task,
                         model=self.model_name,
-                        reasoning_effort="medium",
+                        reasoning_effort=self.reasoning_effort,
                         reasoning_summary="auto",
                         log_dir="./logs",
                         retry_on_error=2,
@@ -1001,7 +1003,7 @@ class VibeTestAgent:
                 results = eval(
                     tasks=task,
                     model=self.model_name,
-                    reasoning_effort="medium",
+                    reasoning_effort=self.reasoning_effort,
                     reasoning_summary="auto",
                     log_dir="./logs",  # Must be string, not Path
                     retry_on_error=2,
