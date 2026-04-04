@@ -1,0 +1,1700 @@
+KernelBench iterative-refinement log.
+DATASET: ScalingIntelligence/kernelbench-samples
+LEVEL: level1
+VARIANT: eval_result_profiler_last_only
+MODEL_SLUG: deepseek-R1
+PROBLEM_ID: 89
+PROBLEM: KernelBenchInternal/KernelBench/level1/89_cumsum.py
+RUN_NAME: run_v0_deepseek_r1_turn
+NUM_ROUNDS: 10
+SOURCE_PATH: iterative_refinement/level1/eval_result_profiler_last_only/deepseek-R1/problem_89/sample_0/log.json
+
+TASK_CONTEXT:
+You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.
+
+You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
+
+
+        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: 
+
+        ``` 
+
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+
+        ``` 
+
+        The example new arch with custom CUDA kernels looks like this: 
+        ```
+        import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+elementwise_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+elementwise_add_cpp_source = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+
+        ``` 
+
+        
+    You are given the following architecture: 
+
+    ```
+    import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A simple model that performs a cumulative sum (prefix sum) operation along a specified dimension.
+
+    Parameters:
+        dim (int): The dimension along which to perform the scan operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the Scan model.
+
+        Args:
+            dim (int): The dimension along which to perform the cumulative sum.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        """
+        Forward pass for the Scan model, computing the cumulative sum along the specified dimension.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape), where `*input_shape` 
+                              can vary depending on the use case.
+
+        Returns:
+            torch.Tensor: Tensor of the same shape as `x` after applying cumulative sum along `dim`.
+        """
+        return torch.cumsum(x, dim=self.dim)
+
+# Define input dimensions and parameters
+batch_size = 128
+input_shape = (4000,)  # Example shape (arbitrary)
+dim = 1
+
+def get_inputs():
+    """
+    Generates random inputs for testing the Scan model.
+
+    Returns:
+        list: A list containing a single randomly generated tensor with shape 
+              (batch_size, *input_shape).
+    """
+    return [torch.randn(batch_size, *input_shape)]
+
+def get_init_inputs():
+    """
+    Returns the initialization parameters for the Scan model.
+
+    Returns:
+        list: A list containing the `dim` parameter for model initialization.
+    """
+    return [dim]
+    ```
+    
+
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code!
+
+=== ROUND 0001 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define BLOCK_SIZE 256
+#define MAX_DIM_SIZE 4096
+
+__global__ void inclusive_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float smem[];
+    float* scan_array = smem;
+    float* original = smem + MAX_DIM_SIZE;
+
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    // Load data into shared memory
+    int offset = batch_idx * stride;
+    for(int i = tid; i < MAX_DIM_SIZE; i += blockDim.x) {
+        if(i < dim_size) {
+            scan_array[i] = input[offset + i];
+            original[i] = scan_array[i];
+        } else {
+            scan_array[i] = 0.0f;
+            original[i] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Blelloch scan implementation
+    // Up-sweep phase
+    for(int d = 0; d < 12; d++) { // log2(4096)
+        int step = 1 << (d + 1);
+        int half_step = 1 << d;
+        
+        for(int i = tid; i < MAX_DIM_SIZE/step; i += blockDim.x) {
+            int idx = (i+1)*step - 1;
+            scan_array[idx] += scan_array[idx - half_step];
+        }
+        __syncthreads();
+    }
+
+    // Down-sweep phase
+    scan_array[MAX_DIM_SIZE-1] = 0;
+    for(int d = 11; d >= 0; d--) {
+        int step = 1 << (d + 1);
+        int half_step = 1 << d;
+        
+        for(int i = tid; i < MAX_DIM_SIZE/step; i += blockDim.x) {
+            int idx = (i+1)*step - 1;
+            float temp = scan_array[idx - half_step];
+            scan_array[idx - half_step] = scan_array[idx];
+            scan_array[idx] += temp;
+        }
+        __syncthreads();
+    }
+
+    // Add original values to get inclusive scan
+    for(int i = tid; i < MAX_DIM_SIZE; i += blockDim.x) {
+        scan_array[i] += original[i];
+    }
+    __syncthreads();
+
+    // Store results
+    for(int i = tid; i < dim_size; i += blockDim.x) {
+        output[offset + i] = scan_array[i];
+    }
+}
+
+torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    int dim_size = input.size(1);
+    int stride = input.stride(0);
+
+    inclusive_scan_kernel<<<batch_size, BLOCK_SIZE, 2*MAX_DIM_SIZE*sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        dim_size,
+        stride
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['inclusive_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.inclusive_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.00966,
+  "runtime_stats": {
+    "mean": 0.00966,
+    "std": 7.46e-05,
+    "min": 0.00954,
+    "max": 0.00986,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:4"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+inclusive_scan_kernel(float const*, float*, int, int...         0.00%       0.000us         0.00%       0.000us       0.000us     706.146us       100.00%     706.146us       7.356us            96  
+                                       cudaLaunchKernel        37.24%       1.017ms        37.24%       1.017ms      10.938us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        62.76%       1.714ms        62.76%       1.714ms       1.714ms       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 2.731ms
+Self CUDA time total: 706.146us
+
+=== ROUND 0002 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define BLOCK_SIZE 512
+#define MAX_DIM_SIZE 4096
+
+__global__ void inclusive_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float scan_array[];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int offset = batch_idx * stride;
+    
+    // Vectorized load
+    const int vec_size = 4;
+    int tid_vec = tid * vec_size;
+    if (tid_vec + vec_size -1 < MAX_DIM_SIZE) {
+        float4 val = *reinterpret_cast<const float4*>(input + offset + tid_vec);
+        scan_array[tid_vec] = (tid_vec < dim_size) ? val.x : 0.0f;
+        scan_array[tid_vec+1] = (tid_vec+1 < dim_size) ? val.y : 0.0f;
+        scan_array[tid_vec+2] = (tid_vec+2 < dim_size) ? val.z : 0.0f;
+        scan_array[tid_vec+3] = (tid_vec+3 < dim_size) ? val.w : 0.0f;
+    } else {
+        for(int i = tid; i < MAX_DIM_SIZE; i += blockDim.x) {
+            scan_array[i] = (i < dim_size) ? input[offset + i] : 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Optimized Blelloch scan with loop unrolling
+    #pragma unroll
+    for(int d = 0; d < 12; d++) {
+        int step = 1 << (d + 1);
+        int half_step = 1 << d;
+        if(tid < MAX_DIM_SIZE/step) {
+            int idx = (tid+1)*step - 1;
+            scan_array[idx] += scan_array[idx - half_step];
+        }
+        __syncthreads();
+    }
+
+    scan_array[MAX_DIM_SIZE-1] = 0;
+    #pragma unroll
+    for(int d = 11; d >= 0; d--) {
+        int step = 1 << (d + 1);
+        int half_step = 1 << d;
+        if(tid < MAX_DIM_SIZE/step) {
+            int idx = (tid+1)*step - 1;
+            float temp = scan_array[idx - half_step];
+            scan_array[idx - half_step] = scan_array[idx];
+            scan_array[idx] += temp;
+        }
+        __syncthreads();
+    }
+
+    // Vectorized store with fused addition
+    if (tid_vec + vec_size -1 < dim_size) {
+        float4 orig_val = *reinterpret_cast<const float4*>(input + offset + tid_vec);
+        float4 res_val;
+        res_val.x = scan_array[tid_vec] + orig_val.x;
+        res_val.y = scan_array[tid_vec+1] + orig_val.y;
+        res_val.z = scan_array[tid_vec+2] + orig_val.z;
+        res_val.w = scan_array[tid_vec+3] + orig_val.w;
+        *reinterpret_cast<float4*>(output + offset + tid_vec) = res_val;
+    } else {
+        for(int i = tid; i < dim_size; i += blockDim.x) {
+            output[offset + i] = scan_array[i] + input[offset + i];
+        }
+    }
+}
+
+torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    int dim_size = input.size(1);
+    
+    inclusive_scan_kernel<<<batch_size, BLOCK_SIZE, MAX_DIM_SIZE*sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        dim_size,
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['inclusive_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.inclusive_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "183.496323",
+      "306.376099",
+      "262.219604",
+      "321.801819",
+      "243.230881"
+    ],
+    "avg_difference": [
+      "25.222071",
+      "36.318439",
+      "37.473923",
+      "37.505756",
+      "33.794430"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0003 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define BLOCK_SIZE 512
+#define MAX_DIM_SIZE 4096
+
+__global__ void inclusive_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float scan_array[];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int offset = batch_idx * stride;
+    
+    // Grid-stride load with boundary checks
+    for(int i = tid; i < MAX_DIM_SIZE; i += blockDim.x) {
+        scan_array[i] = (i < dim_size) ? input[offset + i] : 0.0f;
+    }
+    __syncthreads();
+
+    // Blelloch scan optimized for power-of-two MAX_DIM_SIZE
+    #pragma unroll
+    for(int d = 0; d < 12; d++) {  // 2^12=4096
+        int step = 1 << (d + 1);
+        int half_step = 1 << d;
+        if(tid < MAX_DIM_SIZE/step) {
+            int idx = (tid+1)*step - 1;
+            scan_array[idx] += scan_array[idx - half_step];
+        }
+        __syncthreads();
+    }
+
+    scan_array[MAX_DIM_SIZE-1] = 0;
+    #pragma unroll
+    for(int d = 11; d >= 0; d--) {
+        int step = 1 << (d + 1);
+        int half_step = 1 << d;
+        if(tid < MAX_DIM_SIZE/step) {
+            int idx = (tid+1)*step - 1;
+            float temp = scan_array[idx - half_step];
+            scan_array[idx - half_step] = scan_array[idx];
+            scan_array[idx] += temp;
+        }
+        __syncthreads();
+    }
+
+    // Grid-stride store with fused addition
+    for(int i = tid; i < dim_size; i += blockDim.x) {
+        output[offset + i] = scan_array[i] + input[offset + i];
+    }
+}
+
+torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    int dim_size = input.size(1);
+    TORCH_CHECK(dim_size <= MAX_DIM_SIZE, "Input dimension exceeds MAX_DIM_SIZE");
+    
+    inclusive_scan_kernel<<<batch_size, BLOCK_SIZE, MAX_DIM_SIZE*sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        dim_size,
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['inclusive_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.inclusive_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "180.152237",
+      "190.762314",
+      "169.137360",
+      "176.361679",
+      "180.956680"
+    ],
+    "avg_difference": [
+      "23.840786",
+      "26.925388",
+      "25.374279",
+      "27.746979",
+      "24.186323"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0004 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void inclusive_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float shared_buffers[];
+    float* scan_array = &shared_buffers[0];
+    float* temp_array = &shared_buffers[dim_size];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int offset = batch_idx * stride;
+    
+    // Load data into shared memory
+    for (int i = tid; i < dim_size; i += blockDim.x) {
+        scan_array[i] = input[offset + i];
+    }
+    __syncthreads();
+    
+    // Hillis-Steele inclusive scan with double buffering
+    for (int d = 1; d < dim_size; d *= 2) {
+        for (int i = tid; i < dim_size; i += blockDim.x) {
+            float val = scan_array[i];
+            if (i >= d) {
+                val += scan_array[i - d];
+            }
+            temp_array[i] = val;
+        }
+        __syncthreads();
+        
+        // Swap buffers
+        float* swap = scan_array;
+        scan_array = temp_array;
+        temp_array = swap;
+    }
+    
+    // Store results
+    for (int i = tid; i < dim_size; i += blockDim.x) {
+        output[offset + i] = scan_array[i];
+    }
+}
+
+torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    int dim_size = input.size(1);
+    
+    size_t shared_mem_size = 2 * dim_size * sizeof(float);
+    const int BLOCK_SIZE = 512;
+    
+    inclusive_scan_kernel<<<batch_size, BLOCK_SIZE, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        dim_size,
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['inclusive_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.inclusive_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.00943,
+  "runtime_stats": {
+    "mean": 0.00943,
+    "std": 8.27e-05,
+    "min": 0.00934,
+    "max": 0.00982,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:1"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+inclusive_scan_kernel(float const*, float*, int, int...         0.00%       0.000us         0.00%       0.000us       0.000us     686.885us       100.00%     686.885us       7.155us            96  
+                                       cudaLaunchKernel        32.39%     354.553us        32.39%     354.553us       3.812us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        67.61%     739.943us        67.61%     739.943us     739.943us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.094ms
+Self CUDA time total: 686.885us
+
+=== ROUND 0005 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+const int BLOCK_SIZE = 256;
+const int ELEMENTS_PER_THREAD = 16;
+const int VEC_SIZE = 4;
+
+__device__ __forceinline__ float4 load_vector(const float* ptr) {
+    return *reinterpret_cast<const float4*>(ptr);
+}
+
+__device__ __forceinline__ void store_vector(float* ptr, const float4& val) {
+    *reinterpret_cast<float4*>(ptr) = val;
+}
+
+__global__ void inclusive_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float shared_data[];
+    const int PADDED_DIM = BLOCK_SIZE * ELEMENTS_PER_THREAD;
+    float* warp_sums = &shared_data[PADDED_DIM];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int offset = batch_idx * stride;
+
+    // Vectorized load with padding
+    float4* shared_vec = reinterpret_cast<float4*>(shared_data);
+    int vec_per_thread = ELEMENTS_PER_THREAD / VEC_SIZE;
+    int total_vec = PADDED_DIM / VEC_SIZE;
+    
+    for(int i = 0; i < vec_per_thread; ++i) {
+        int vec_idx = tid * vec_per_thread + i;
+        if(vec_idx < total_vec) {
+            int global_idx = offset + vec_idx * VEC_SIZE;
+            float4 val = (global_idx < offset + dim_size) ? 
+                        load_vector(input + global_idx) : make_float4(0,0,0,0);
+            shared_vec[vec_idx] = val;
+        }
+    }
+    __syncthreads();
+
+    // Warp-level scan with shuffle instructions
+    #pragma unroll
+    for(int i = 0; i < ELEMENTS_PER_THREAD; ++i) {
+        int local_idx = warp_id * 32 * ELEMENTS_PER_THREAD + lane_id * ELEMENTS_PER_THREAD + i;
+        float val = shared_data[local_idx];
+        
+        for(int delta = 1; delta < 32; delta *= 2) {
+            float n = __shfl_up_sync(0xffffffff, val, delta);
+            if(lane_id >= delta) val += n;
+        }
+        shared_data[local_idx] = val;
+    }
+    __syncthreads();
+
+    // Collect and scan warp sums
+    if(lane_id == 31) {
+        int last_idx = warp_id * 32 * ELEMENTS_PER_THREAD + 31 * ELEMENTS_PER_THREAD + (ELEMENTS_PER_THREAD - 1);
+        warp_sums[warp_id] = shared_data[last_idx];
+    }
+    __syncthreads();
+
+    if(tid < 32) {
+        float val = (tid < 8) ? warp_sums[tid] : 0.0f;
+        for(int delta = 1; delta < 32; delta *= 2) {
+            float n = __shfl_up_sync(0xffffffff, val, delta);
+            if(tid >= delta) val += n;
+        }
+        warp_sums[tid] = val;
+    }
+    __syncthreads();
+
+    // Add warp prefix with ILP optimization
+    float warp_prefix = warp_id > 0 ? warp_sums[warp_id - 1] : 0.0f;
+    #pragma unroll
+    for(int i = 0; i < ELEMENTS_PER_THREAD; i += VEC_SIZE) {
+        int local_idx = warp_id * 32 * ELEMENTS_PER_THREAD + lane_id * ELEMENTS_PER_THREAD + i;
+        float4 val = load_vector(&shared_data[local_idx]);
+        val.x += warp_prefix;
+        val.y += warp_prefix;
+        val.z += warp_prefix;
+        val.w += warp_prefix;
+        store_vector(&shared_data[local_idx], val);
+    }
+    __syncthreads();
+
+    // Vectorized store with bounds checking
+    for(int i = 0; i < vec_per_thread; ++i) {
+        int vec_idx = tid * vec_per_thread + i;
+        if(vec_idx < total_vec) {
+            int global_idx = offset + vec_idx * VEC_SIZE;
+            if(global_idx < offset + dim_size) {
+                store_vector(output + global_idx, shared_vec[vec_idx]);
+            }
+        }
+    }
+}
+
+torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    int dim_size = input.size(1);
+    
+    const int PADDED_DIM = ((dim_size + BLOCK_SIZE*ELEMENTS_PER_THREAD - 1) / 
+                          (BLOCK_SIZE*ELEMENTS_PER_THREAD)) * BLOCK_SIZE*ELEMENTS_PER_THREAD;
+    size_t shared_mem = (PADDED_DIM + 8) * sizeof(float);
+    
+    inclusive_scan_kernel<<<batch_size, BLOCK_SIZE, shared_mem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        dim_size,
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['inclusive_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.inclusive_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "191.892426",
+      "192.871460",
+      "166.330338",
+      "171.765930",
+      "191.014542"
+    ],
+    "avg_difference": [
+      "31.260103",
+      "34.147141",
+      "32.587791",
+      "35.394390",
+      "32.299942"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0006 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+const int BLOCK_SIZE = 256;
+const int ELEMENTS_PER_THREAD = 16;
+
+__global__ void inclusive_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float shared_mem[];
+    float* thread_sums = shared_mem;
+    float* scan_buffer = shared_mem + BLOCK_SIZE;
+
+    int tid = threadIdx.x;
+    int batch_idx = blockIdx.x;
+    int start_idx = batch_idx * stride + tid * ELEMENTS_PER_THREAD;
+
+    // Load elements with boundary checking
+    float local_data[ELEMENTS_PER_THREAD] = {0};
+    for(int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+        int global_idx = start_idx + i;
+        if(global_idx < batch_idx * stride + dim_size) {
+            local_data[i] = input[global_idx];
+        }
+    }
+
+    // Compute local inclusive scan
+    float sum = 0;
+    float scanned[ELEMENTS_PER_THREAD];
+    for(int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+        sum += local_data[i];
+        scanned[i] = sum;
+    }
+    thread_sums[tid] = sum;
+    __syncthreads();
+
+    // Block-wide inclusive scan of thread sums
+    scan_buffer[tid] = thread_sums[tid];
+    __syncthreads();
+
+    for(int d = 1; d < BLOCK_SIZE; d *= 2) {
+        if(tid >= d) {
+            scan_buffer[tid] += scan_buffer[tid - d];
+        }
+        __syncthreads();
+    }
+
+    // Calculate exclusive prefix for this thread
+    float exclusive_prefix = (tid > 0) ? scan_buffer[tid - 1] : 0;
+    
+    // Add prefix to local scanned values
+    for(int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+        scanned[i] += exclusive_prefix;
+    }
+
+    // Store results with boundary checking
+    for(int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+        int global_idx = start_idx + i;
+        if(global_idx < batch_idx * stride + dim_size) {
+            output[global_idx] = scanned[i];
+        }
+    }
+}
+
+torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    int dim_size = input.size(1);
+    
+    size_t shared_mem_size = 2 * BLOCK_SIZE * sizeof(float);
+    inclusive_scan_kernel<<<batch_size, BLOCK_SIZE, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        dim_size,
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor inclusive_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['inclusive_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.inclusive_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.0189,
+  "runtime_stats": {
+    "mean": 0.0189,
+    "std": 0.000974,
+    "min": 0.0182,
+    "max": 0.0267,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:2"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+inclusive_scan_kernel(float const*, float*, int, int...         0.00%       0.000us         0.00%       0.000us       0.000us       1.045ms       100.00%       1.045ms      11.237us            93  
+                                       cudaLaunchKernel        97.62%     338.847us        97.62%     338.847us       3.644us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize         2.38%       8.250us         2.38%       8.250us       8.250us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 347.097us
+Self CUDA time total: 1.045ms
+
+=== ROUND 0007 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+const int BLOCK_SIZE = 256;
+const int ELEMENTS_PER_THREAD = 16;
+const int VEC_SIZE = 4;
+
+__device__ __forceinline__ float warp_scan_inclusive(float val, int lane_id) {
+    #pragma unroll
+    for(int offset=1; offset<32; offset*=2) {
+        float tmp = __shfl_up_sync(0xffffffff, val, offset);
+        if(lane_id >= offset) val += tmp;
+    }
+    return val;
+}
+
+__global__ void optimized_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+    const int batch_idx = blockIdx.x;
+    const int start_idx = batch_idx * stride + tid * ELEMENTS_PER_THREAD;
+    
+    float4 local_data[ELEMENTS_PER_THREAD/VEC_SIZE];
+    float scanned[ELEMENTS_PER_THREAD];
+    
+    // Vectorized load
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + (VEC_SIZE-1) < (batch_idx+1)*stride) {
+            local_data[i] = reinterpret_cast<const float4*>(input)[global_idx/VEC_SIZE];
+        } else {
+            local_data[i] = {0};
+            #pragma unroll
+            for(int v=0; v<VEC_SIZE; ++v) {
+                if(global_idx + v < (batch_idx+1)*stride)
+                    local_data[i].x = input[global_idx + v];
+            }
+        }
+    }
+
+    // Local scan and thread sum
+    float sum = 0;
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        sum += local_data[i].x;
+        scanned[i*VEC_SIZE] = sum;
+        sum += local_data[i].y;
+        scanned[i*VEC_SIZE+1] = sum;
+        sum += local_data[i].z;
+        scanned[i*VEC_SIZE+2] = sum;
+        sum += local_data[i].w;
+        scanned[i*VEC_SIZE+3] = sum;
+    }
+    
+    // Warp-level scan
+    int lane_id = tid % 32;
+    int warp_id = tid / 32;
+    float warp_total = warp_scan_inclusive(sum, lane_id);
+    
+    // Store warp totals
+    __shared__ float warp_sums[BLOCK_SIZE/32];
+    if(lane_id == 31) warp_sums[warp_id] = warp_total;
+    __syncthreads();
+    
+    // Scan warp totals
+    if(warp_id == 0) {
+        float val = lane_id < (BLOCK_SIZE/32) ? warp_sums[lane_id] : 0;
+        warp_scan_inclusive(val, lane_id);
+        if(lane_id < (BLOCK_SIZE/32)) warp_sums[lane_id] = val;
+    }
+    __syncthreads();
+    
+    // Calculate final offset
+    float block_offset = warp_id > 0 ? warp_sums[warp_id-1] : 0;
+    float warp_prefix = warp_scan_inclusive(sum, lane_id) - sum;
+    
+    // Apply offsets
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD; ++i) {
+        scanned[i] += block_offset + warp_prefix;
+    }
+    
+    // Vectorized store
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + (VEC_SIZE-1) < (batch_idx+1)*stride) {
+            float4 val = {scanned[i*VEC_SIZE], scanned[i*VEC_SIZE+1],
+                          scanned[i*VEC_SIZE+2], scanned[i*VEC_SIZE+3]};
+            reinterpret_cast<float4*>(output)[global_idx/VEC_SIZE] = val;
+        } else {
+            #pragma unroll
+            for(int v=0; v<VEC_SIZE; ++v) {
+                if(global_idx + v < (batch_idx+1)*stride)
+                    output[global_idx + v] = scanned[i*VEC_SIZE + v];
+            }
+        }
+    }
+}
+
+torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    
+    size_t shared_mem = (BLOCK_SIZE/32)*sizeof(float);
+    optimized_scan_kernel<<<batch_size, BLOCK_SIZE, shared_mem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1),
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['optimized_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.optimized_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": false,
+  "metadata": {
+    "max_difference": [
+      "145.460541",
+      "169.977264",
+      "141.191452",
+      "144.836792",
+      "163.207321"
+    ],
+    "avg_difference": [
+      "22.616755",
+      "25.967833",
+      "23.381876",
+      "26.086401",
+      "23.640036"
+    ],
+    "correctness_issue": "Output mismatch",
+    "correctness_trials": "(0 / 5)"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0008 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+const int BLOCK_SIZE = 256;
+const int ELEMENTS_PER_THREAD = 16;
+const int VEC_SIZE = 4;
+
+__device__ __forceinline__ float warp_scan_inclusive(float val, int lane_id) {
+    #pragma unroll
+    for(int offset=1; offset<32; offset*=2) {
+        float tmp = __shfl_up_sync(0xffffffff, val, offset);
+        if(lane_id >= offset) val += tmp;
+    }
+    return val;
+}
+
+__global__ void optimized_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+    const int batch_idx = blockIdx.x;
+    const int start_idx = batch_idx * stride + tid * ELEMENTS_PER_THREAD;
+    
+    float4 local_data[ELEMENTS_PER_THREAD/VEC_SIZE];
+    float scanned[ELEMENTS_PER_THREAD];
+    
+    // Vectorized load with boundary checks
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + (VEC_SIZE-1) < (batch_idx+1)*stride) {
+            local_data[i] = reinterpret_cast<const float4*>(input)[global_idx/VEC_SIZE];
+        } else {
+            float4 tmp = {0, 0, 0, 0};
+            float* tmp_ptr = reinterpret_cast<float*>(&tmp);
+            for(int v=0; v<VEC_SIZE; ++v) {
+                int elem_idx = global_idx + v;
+                if(elem_idx < (batch_idx+1)*stride)
+                    tmp_ptr[v] = input[elem_idx];
+            }
+            local_data[i] = tmp;
+        }
+    }
+
+    // Local inclusive scan within thread
+    float thread_sum = 0;
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        float* vec_ptr = reinterpret_cast<float*>(&local_data[i]);
+        #pragma unroll
+        for(int v=0; v<VEC_SIZE; ++v) {
+            thread_sum += vec_ptr[v];
+            scanned[i*VEC_SIZE + v] = thread_sum;
+        }
+    }
+    
+    // Warp-level scan
+    int lane_id = tid % 32;
+    int warp_id = tid / 32;
+    float warp_total = warp_scan_inclusive(thread_sum, lane_id);
+    
+    // Store warp totals in shared memory
+    __shared__ float warp_sums[BLOCK_SIZE/32];
+    if(lane_id == 31) warp_sums[warp_id] = warp_total;
+    __syncthreads();
+    
+    // Scan warp totals sequentially
+    if(tid == 0) {
+        float total = 0;
+        for(int i=0; i<(BLOCK_SIZE/32); ++i) {
+            total += warp_sums[i];
+            warp_sums[i] = total;
+        }
+    }
+    __syncthreads();
+    
+    // Calculate final offsets
+    float block_offset = warp_id > 0 ? warp_sums[warp_id-1] : 0;
+    float warp_prefix = warp_scan_inclusive(thread_sum, lane_id) - thread_sum;
+    
+    // Apply offsets to local scanned values
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD; ++i) {
+        scanned[i] += block_offset + warp_prefix;
+    }
+    
+    // Vectorized store with boundary checks
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + (VEC_SIZE-1) < (batch_idx+1)*stride) {
+            float4 val = {scanned[i*VEC_SIZE], scanned[i*VEC_SIZE+1],
+                          scanned[i*VEC_SIZE+2], scanned[i*VEC_SIZE+3]};
+            reinterpret_cast<float4*>(output)[global_idx/VEC_SIZE] = val;
+        } else {
+            float* scanned_ptr = &scanned[i*VEC_SIZE];
+            for(int v=0; v<VEC_SIZE; ++v) {
+                int elem_idx = global_idx + v;
+                if(elem_idx < (batch_idx+1)*stride)
+                    output[elem_idx] = scanned_ptr[v];
+            }
+        }
+    }
+}
+
+torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    int batch_size = input.size(0);
+    
+    size_t shared_mem = (BLOCK_SIZE/32)*sizeof(float);
+    optimized_scan_kernel<<<batch_size, BLOCK_SIZE, shared_mem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1),
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['optimized_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.optimized_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.0194,
+  "runtime_stats": {
+    "mean": 0.0194,
+    "std": 0.00141,
+    "min": 0.0183,
+    "max": 0.0293,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:7"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+optimized_scan_kernel(float const*, float*, int, int...         0.00%       0.000us         0.00%       0.000us       0.000us     352.833us       100.00%     352.833us       3.794us            93  
+                                       cudaLaunchKernel        97.88%     321.273us        97.88%     321.273us       3.455us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize         2.12%       6.960us         2.12%       6.960us       6.960us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 328.233us
+Self CUDA time total: 352.833us
+
+=== ROUND 0009 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+const int BLOCK_SIZE = 128;
+const int ELEMENTS_PER_THREAD = 64;
+const int VEC_SIZE = 4;
+
+__device__ __forceinline__ float warp_scan_inclusive(float val) {
+    const int lane_id = threadIdx.x & 31;
+    #pragma unroll
+    for(int offset=1; offset<32; offset*=2) {
+        float n = __shfl_up_sync(0xffffffff, val, offset);
+        if(lane_id >= offset) val += n;
+    }
+    return val;
+}
+
+__global__ void optimized_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+    const int batch_idx = blockIdx.x;
+    const int start_idx = batch_idx * stride + tid * ELEMENTS_PER_THREAD;
+    
+    float4 local_data[ELEMENTS_PER_THREAD/VEC_SIZE];
+    float scanned[ELEMENTS_PER_THREAD];
+    
+    // Vectorized load with boundary check optimization
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {
+            local_data[i] = reinterpret_cast<const float4*>(input)[global_idx/VEC_SIZE];
+        } else {
+            float* ptr = reinterpret_cast<float*>(&local_data[i]);
+            #pragma unroll
+            for(int v=0; v<VEC_SIZE; ++v) {
+                ptr[v] = (global_idx + v < (batch_idx+1)*stride) ? input[global_idx + v] : 0.0f;
+            }
+        }
+    }
+
+    // Optimized local scan with fused operations
+    float thread_sum = 0;
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        float* vec = reinterpret_cast<float*>(&local_data[i]);
+        #pragma unroll
+        for(int v=0; v<VEC_SIZE; ++v) {
+            thread_sum += vec[v];
+            scanned[i*VEC_SIZE + v] = thread_sum;
+        }
+    }
+
+    // Cooperative warp scan
+    float warp_total = warp_scan_inclusive(thread_sum);
+    const int warp_id = tid >> 5;
+    
+    // Efficient block-level scan using warp leaders
+    __shared__ float warp_sums[BLOCK_SIZE/32];
+    if((tid & 31) == 31) warp_sums[warp_id] = warp_total;
+    __syncthreads();
+
+    if(tid == 0) {
+        float accum = 0;
+        #pragma unroll
+        for(int i=0; i<BLOCK_SIZE/32; ++i) {
+            float tmp = warp_sums[i];
+            warp_sums[i] = accum;
+            accum += tmp;
+        }
+    }
+    __syncthreads();
+
+    // Final offset calculation without redundant warp scan
+    const float block_offset = warp_sums[warp_id];
+    const float warp_prefix = warp_scan_inclusive(thread_sum) - thread_sum;
+
+    // Fused offset application
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD; ++i) {
+        scanned[i] += block_offset + warp_prefix;
+    }
+
+    // Vectorized store with coalesced writes
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {
+            float4 val = {scanned[i*VEC_SIZE], scanned[i*VEC_SIZE+1],
+                          scanned[i*VEC_SIZE+2], scanned[i*VEC_SIZE+3]};
+            reinterpret_cast<float4*>(output)[global_idx/VEC_SIZE] = val;
+        } else {
+            float* ptr = &scanned[i*VEC_SIZE];
+            #pragma unroll
+            for(int v=0; v<VEC_SIZE; ++v) {
+                if(global_idx + v < (batch_idx+1)*stride)
+                    output[global_idx + v] = ptr[v];
+            }
+        }
+    }
+}
+
+torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    const int batch_size = input.size(0);
+    
+    optimized_scan_kernel<<<batch_size, BLOCK_SIZE, (BLOCK_SIZE/32)*sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1),
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['optimized_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.optimized_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": false,
+  "correctness": false,
+  "metadata": {
+    "cuda_error": "CUDA Error: CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "runtime": -1.0,
+  "runtime_stats": {}
+}
+
+=== ROUND 0010 ===
+KERNEL_CODE:
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+scan_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+const int BLOCK_SIZE = 128;
+const int ELEMENTS_PER_THREAD = 64;
+const int VEC_SIZE = 4;
+
+__device__ __forceinline__ float warp_scan_inclusive(float val) {
+    const int lane_id = threadIdx.x & 31;
+    #pragma unroll
+    for(int offset=1; offset<32; offset*=2) {
+        float n = __shfl_up_sync(0xffffffff, val, offset);
+        if(lane_id >= offset) val += n;
+    }
+    return val;
+}
+
+__global__ void optimized_scan_kernel(const float* input, float* output, int dim_size, int stride) {
+    extern __shared__ float smem[];
+    float* warp_sums = smem;
+    
+    const int tid = threadIdx.x;
+    const int batch_idx = blockIdx.x;
+    const int start_in_batch = tid * ELEMENTS_PER_THREAD;
+
+    // Initialize warp_sums to zero
+    if (tid < (BLOCK_SIZE/32)) {
+        warp_sums[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    if (start_in_batch >= dim_size) return;
+    
+    const int start_idx = batch_idx * stride + start_in_batch;
+    const int elements_remaining = dim_size - start_in_batch;
+    const int elements_to_process = min(ELEMENTS_PER_THREAD, elements_remaining);
+    
+    float4 local_data[ELEMENTS_PER_THREAD/VEC_SIZE];
+    float scanned[ELEMENTS_PER_THREAD];
+    
+    // Vectorized load with boundary checks
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {
+            local_data[i] = reinterpret_cast<const float4*>(input)[global_idx/VEC_SIZE];
+        } else {
+            float* ptr = reinterpret_cast<float*>(&local_data[i]);
+            #pragma unroll
+            for(int v=0; v<VEC_SIZE; ++v) {
+                ptr[v] = (global_idx + v < (batch_idx+1)*stride) ? input[global_idx + v] : 0.0f;
+            }
+        }
+    }
+
+    // Local scan
+    float thread_sum = 0;
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        float* vec = reinterpret_cast<float*>(&local_data[i]);
+        #pragma unroll
+        for(int v=0; v<VEC_SIZE; ++v) {
+            if(i*VEC_SIZE + v >= elements_to_process) break;
+            thread_sum += vec[v];
+            scanned[i*VEC_SIZE + v] = thread_sum;
+        }
+    }
+
+    // Warp scan
+    float warp_total = warp_scan_inclusive(thread_sum);
+    const int warp_id = tid >> 5;
+    
+    // Block scan
+    if((tid & 31) == 31) warp_sums[warp_id] = warp_total;
+    __syncthreads();
+
+    if(tid == 0) {
+        float accum = 0;
+        #pragma unroll
+        for(int i=0; i<BLOCK_SIZE/32; ++i) {
+            float tmp = warp_sums[i];
+            warp_sums[i] = accum;
+            accum += tmp;
+        }
+    }
+    __syncthreads();
+
+    // Apply offsets
+    const float block_offset = warp_sums[warp_id];
+    const float warp_prefix = warp_scan_inclusive(thread_sum) - thread_sum;
+    
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD; ++i) {
+        if(i >= elements_to_process) break;
+        scanned[i] += block_offset + warp_prefix;
+    }
+
+    // Vectorized store with boundary checks
+    #pragma unroll
+    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {
+        int global_idx = start_idx + i*VEC_SIZE;
+        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {
+            float4 val = {scanned[i*VEC_SIZE], scanned[i*VEC_SIZE+1],
+                          scanned[i*VEC_SIZE+2], scanned[i*VEC_SIZE+3]};
+            reinterpret_cast<float4*>(output)[global_idx/VEC_SIZE] = val;
+        } else {
+            float* ptr = &scanned[i*VEC_SIZE];
+            #pragma unroll
+            for(int v=0; v<VEC_SIZE; ++v) {
+                if(global_idx + v < (batch_idx+1)*stride)
+                    output[global_idx + v] = ptr[v];
+            }
+        }
+    }
+}
+
+torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim) {
+    TORCH_CHECK(dim == 1, "Only dim=1 supported");
+    auto output = torch::empty_like(input);
+    const int batch_size = input.size(0);
+    
+    optimized_scan_kernel<<<batch_size, BLOCK_SIZE, (BLOCK_SIZE/32)*sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        input.size(1),
+        input.stride(0)
+    );
+    
+    return output;
+}
+"""
+
+scan_cpp_source = "torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim);"
+
+scan_extension = load_inline(
+    name='scan_extension',
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=['optimized_scan_cuda'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return scan_extension.optimized_scan_cuda(x, self.dim)
+EVAL_RESULT:
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 0.00795,
+  "runtime_stats": {
+    "mean": 0.00795,
+    "std": 4.8e-05,
+    "min": 0.00774,
+    "max": 0.00822,
+    "num_trials": 100,
+    "hardware": "NVIDIA L40S",
+    "device": "cuda:3"
+  }
+}
+PROFILER_RESULT:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+optimized_scan_kernel(float const*, float*, int, int...         0.00%       0.000us         0.00%       0.000us       0.000us     542.945us       100.00%     542.945us       5.656us            96  
+                                       cudaLaunchKernel        30.70%     359.306us        30.70%     359.306us       3.864us       0.000us         0.00%       0.000us       0.000us            93  
+                                  cudaDeviceSynchronize        69.30%     810.893us        69.30%     810.893us     810.893us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.170ms
+Self CUDA time total: 542.945us
+
+FINAL_RESULT:
+{
+  "context": "You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\n\n        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: \n\n        ``` \n\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n        ``` \n\n        The example new arch with custom CUDA kernels looks like this: \n        ```\n        import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for element-wise addition\nelementwise_add_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add_cpp_source = (\n    \"torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);\"\n)\n\n# Compile the inline CUDA code for element-wise addition\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    cuda_sources=elementwise_add_source,\n    functions=[\"elementwise_add_cuda\"],\n    verbose=True,\n    extra_cflags=[\"\"],\n    extra_ldflags=[\"\"],\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_cuda(a, b)\n\n        ``` \n\n        \n    You are given the following architecture: \n\n    ```\n    import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    A simple model that performs a cumulative sum (prefix sum) operation along a specified dimension.\n\n    Parameters:\n        dim (int): The dimension along which to perform the scan operation.\n    \"\"\"\n\n    def __init__(self, dim):\n        \"\"\"\n        Initialize the Scan model.\n\n        Args:\n            dim (int): The dimension along which to perform the cumulative sum.\n        \"\"\"\n        super(Model, self).__init__()\n        self.dim = dim\n\n    def forward(self, x):\n        \"\"\"\n        Forward pass for the Scan model, computing the cumulative sum along the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape), where `*input_shape` \n                              can vary depending on the use case.\n\n        Returns:\n            torch.Tensor: Tensor of the same shape as `x` after applying cumulative sum along `dim`.\n        \"\"\"\n        return torch.cumsum(x, dim=self.dim)\n\n# Define input dimensions and parameters\nbatch_size = 128\ninput_shape = (4000,)  # Example shape (arbitrary)\ndim = 1\n\ndef get_inputs():\n    \"\"\"\n    Generates random inputs for testing the Scan model.\n\n    Returns:\n        list: A list containing a single randomly generated tensor with shape \n              (batch_size, *input_shape).\n    \"\"\"\n    return [torch.randn(batch_size, *input_shape)]\n\ndef get_init_inputs():\n    \"\"\"\n    Returns the initialization parameters for the Scan model.\n\n    Returns:\n        list: A list containing the `dim` parameter for model initialization.\n    \"\"\"\n    return [dim]\n    ```\n    Here is your latest generation:\n```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nscan_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n\nconst int BLOCK_SIZE = 128;\nconst int ELEMENTS_PER_THREAD = 64;\nconst int VEC_SIZE = 4;\n\n__device__ __forceinline__ float warp_scan_inclusive(float val) {\n    const int lane_id = threadIdx.x & 31;\n    #pragma unroll\n    for(int offset=1; offset<32; offset*=2) {\n        float n = __shfl_up_sync(0xffffffff, val, offset);\n        if(lane_id >= offset) val += n;\n    }\n    return val;\n}\n\n__global__ void optimized_scan_kernel(const float* input, float* output, int dim_size, int stride) {\n    extern __shared__ float smem[];\n    const int tid = threadIdx.x;\n    const int batch_idx = blockIdx.x;\n    const int start_idx = batch_idx * stride + tid * ELEMENTS_PER_THREAD;\n    \n    float4 local_data[ELEMENTS_PER_THREAD/VEC_SIZE];\n    float scanned[ELEMENTS_PER_THREAD];\n    \n    // Vectorized load with boundary check optimization\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        int global_idx = start_idx + i*VEC_SIZE;\n        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {\n            local_data[i] = reinterpret_cast<const float4*>(input)[global_idx/VEC_SIZE];\n        } else {\n            float* ptr = reinterpret_cast<float*>(&local_data[i]);\n            #pragma unroll\n            for(int v=0; v<VEC_SIZE; ++v) {\n                ptr[v] = (global_idx + v < (batch_idx+1)*stride) ? input[global_idx + v] : 0.0f;\n            }\n        }\n    }\n\n    // Optimized local scan with fused operations\n    float thread_sum = 0;\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        float* vec = reinterpret_cast<float*>(&local_data[i]);\n        #pragma unroll\n        for(int v=0; v<VEC_SIZE; ++v) {\n            thread_sum += vec[v];\n            scanned[i*VEC_SIZE + v] = thread_sum;\n        }\n    }\n\n    // Cooperative warp scan\n    float warp_total = warp_scan_inclusive(thread_sum);\n    const int warp_id = tid >> 5;\n    \n    // Efficient block-level scan using warp leaders\n    __shared__ float warp_sums[BLOCK_SIZE/32];\n    if((tid & 31) == 31) warp_sums[warp_id] = warp_total;\n    __syncthreads();\n\n    if(tid == 0) {\n        float accum = 0;\n        #pragma unroll\n        for(int i=0; i<BLOCK_SIZE/32; ++i) {\n            float tmp = warp_sums[i];\n            warp_sums[i] = accum;\n            accum += tmp;\n        }\n    }\n    __syncthreads();\n\n    // Final offset calculation without redundant warp scan\n    const float block_offset = warp_sums[warp_id];\n    const float warp_prefix = warp_scan_inclusive(thread_sum) - thread_sum;\n\n    // Fused offset application\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD; ++i) {\n        scanned[i] += block_offset + warp_prefix;\n    }\n\n    // Vectorized store with coalesced writes\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        int global_idx = start_idx + i*VEC_SIZE;\n        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {\n            float4 val = {scanned[i*VEC_SIZE], scanned[i*VEC_SIZE+1],\n                          scanned[i*VEC_SIZE+2], scanned[i*VEC_SIZE+3]};\n            reinterpret_cast<float4*>(output)[global_idx/VEC_SIZE] = val;\n        } else {\n            float* ptr = &scanned[i*VEC_SIZE];\n            #pragma unroll\n            for(int v=0; v<VEC_SIZE; ++v) {\n                if(global_idx + v < (batch_idx+1)*stride)\n                    output[global_idx + v] = ptr[v];\n            }\n        }\n    }\n}\n\ntorch::Tensor optimized_scan_cuda(torch::Tensor input, int dim) {\n    TORCH_CHECK(dim == 1, \"Only dim=1 supported\");\n    auto output = torch::empty_like(input);\n    const int batch_size = input.size(0);\n    \n    optimized_scan_kernel<<<batch_size, BLOCK_SIZE, (BLOCK_SIZE/32)*sizeof(float)>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        input.size(1),\n        input.stride(0)\n    );\n    \n    return output;\n}\n\"\"\"\n\nscan_cpp_source = \"torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim);\"\n\nscan_extension = load_inline(\n    name='scan_extension',\n    cpp_sources=scan_cpp_source,\n    cuda_sources=scan_source,\n    functions=['optimized_scan_cuda'],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        \n    def forward(self, x):\n        return scan_extension.optimized_scan_cuda(x, self.dim)\n```\nYour generated architecture ModelNew and kernel was evaluated on GPU and checked against the reference architecture Model. \n\nHere is the Evaluation Result: \nYour kernel failed to compile.\n\nHere is the compiler logs\n\n:\n\ncuda_error: CUDA Error: CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\nName your new improved output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n\nPlease fix the errors and try again.   ",
+  "model_response": "```\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nscan_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n\nconst int BLOCK_SIZE = 128;\nconst int ELEMENTS_PER_THREAD = 64;\nconst int VEC_SIZE = 4;\n\n__device__ __forceinline__ float warp_scan_inclusive(float val) {\n    const int lane_id = threadIdx.x & 31;\n    #pragma unroll\n    for(int offset=1; offset<32; offset*=2) {\n        float n = __shfl_up_sync(0xffffffff, val, offset);\n        if(lane_id >= offset) val += n;\n    }\n    return val;\n}\n\n__global__ void optimized_scan_kernel(const float* input, float* output, int dim_size, int stride) {\n    extern __shared__ float smem[];\n    float* warp_sums = smem;\n    \n    const int tid = threadIdx.x;\n    const int batch_idx = blockIdx.x;\n    const int start_in_batch = tid * ELEMENTS_PER_THREAD;\n\n    // Initialize warp_sums to zero\n    if (tid < (BLOCK_SIZE/32)) {\n        warp_sums[tid] = 0.0f;\n    }\n    __syncthreads();\n\n    if (start_in_batch >= dim_size) return;\n    \n    const int start_idx = batch_idx * stride + start_in_batch;\n    const int elements_remaining = dim_size - start_in_batch;\n    const int elements_to_process = min(ELEMENTS_PER_THREAD, elements_remaining);\n    \n    float4 local_data[ELEMENTS_PER_THREAD/VEC_SIZE];\n    float scanned[ELEMENTS_PER_THREAD];\n    \n    // Vectorized load with boundary checks\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        int global_idx = start_idx + i*VEC_SIZE;\n        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {\n            local_data[i] = reinterpret_cast<const float4*>(input)[global_idx/VEC_SIZE];\n        } else {\n            float* ptr = reinterpret_cast<float*>(&local_data[i]);\n            #pragma unroll\n            for(int v=0; v<VEC_SIZE; ++v) {\n                ptr[v] = (global_idx + v < (batch_idx+1)*stride) ? input[global_idx + v] : 0.0f;\n            }\n        }\n    }\n\n    // Local scan\n    float thread_sum = 0;\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        float* vec = reinterpret_cast<float*>(&local_data[i]);\n        #pragma unroll\n        for(int v=0; v<VEC_SIZE; ++v) {\n            if(i*VEC_SIZE + v >= elements_to_process) break;\n            thread_sum += vec[v];\n            scanned[i*VEC_SIZE + v] = thread_sum;\n        }\n    }\n\n    // Warp scan\n    float warp_total = warp_scan_inclusive(thread_sum);\n    const int warp_id = tid >> 5;\n    \n    // Block scan\n    if((tid & 31) == 31) warp_sums[warp_id] = warp_total;\n    __syncthreads();\n\n    if(tid == 0) {\n        float accum = 0;\n        #pragma unroll\n        for(int i=0; i<BLOCK_SIZE/32; ++i) {\n            float tmp = warp_sums[i];\n            warp_sums[i] = accum;\n            accum += tmp;\n        }\n    }\n    __syncthreads();\n\n    // Apply offsets\n    const float block_offset = warp_sums[warp_id];\n    const float warp_prefix = warp_scan_inclusive(thread_sum) - thread_sum;\n    \n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD; ++i) {\n        if(i >= elements_to_process) break;\n        scanned[i] += block_offset + warp_prefix;\n    }\n\n    // Vectorized store with boundary checks\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        int global_idx = start_idx + i*VEC_SIZE;\n        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {\n            float4 val = {scanned[i*VEC_SIZE], scanned[i*VEC_SIZE+1],\n                          scanned[i*VEC_SIZE+2], scanned[i*VEC_SIZE+3]};\n            reinterpret_cast<float4*>(output)[global_idx/VEC_SIZE] = val;\n        } else {\n            float* ptr = &scanned[i*VEC_SIZE];\n            #pragma unroll\n            for(int v=0; v<VEC_SIZE; ++v) {\n                if(global_idx + v < (batch_idx+1)*stride)\n                    output[global_idx + v] = ptr[v];\n            }\n        }\n    }\n}\n\ntorch::Tensor optimized_scan_cuda(torch::Tensor input, int dim) {\n    TORCH_CHECK(dim == 1, \"Only dim=1 supported\");\n    auto output = torch::empty_like(input);\n    const int batch_size = input.size(0);\n    \n    optimized_scan_kernel<<<batch_size, BLOCK_SIZE, (BLOCK_SIZE/32)*sizeof(float)>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        input.size(1),\n        input.stride(0)\n    );\n    \n    return output;\n}\n\"\"\"\n\nscan_cpp_source = \"torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim);\"\n\nscan_extension = load_inline(\n    name='scan_extension',\n    cpp_sources=scan_cpp_source,\n    cuda_sources=scan_source,\n    functions=['optimized_scan_cuda'],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        \n    def forward(self, x):\n        return scan_extension.optimized_scan_cuda(x, self.dim)\n```",
+  "kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nscan_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda.h>\n#include <cuda_runtime.h>\n\nconst int BLOCK_SIZE = 128;\nconst int ELEMENTS_PER_THREAD = 64;\nconst int VEC_SIZE = 4;\n\n__device__ __forceinline__ float warp_scan_inclusive(float val) {\n    const int lane_id = threadIdx.x & 31;\n    #pragma unroll\n    for(int offset=1; offset<32; offset*=2) {\n        float n = __shfl_up_sync(0xffffffff, val, offset);\n        if(lane_id >= offset) val += n;\n    }\n    return val;\n}\n\n__global__ void optimized_scan_kernel(const float* input, float* output, int dim_size, int stride) {\n    extern __shared__ float smem[];\n    float* warp_sums = smem;\n    \n    const int tid = threadIdx.x;\n    const int batch_idx = blockIdx.x;\n    const int start_in_batch = tid * ELEMENTS_PER_THREAD;\n\n    // Initialize warp_sums to zero\n    if (tid < (BLOCK_SIZE/32)) {\n        warp_sums[tid] = 0.0f;\n    }\n    __syncthreads();\n\n    if (start_in_batch >= dim_size) return;\n    \n    const int start_idx = batch_idx * stride + start_in_batch;\n    const int elements_remaining = dim_size - start_in_batch;\n    const int elements_to_process = min(ELEMENTS_PER_THREAD, elements_remaining);\n    \n    float4 local_data[ELEMENTS_PER_THREAD/VEC_SIZE];\n    float scanned[ELEMENTS_PER_THREAD];\n    \n    // Vectorized load with boundary checks\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        int global_idx = start_idx + i*VEC_SIZE;\n        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {\n            local_data[i] = reinterpret_cast<const float4*>(input)[global_idx/VEC_SIZE];\n        } else {\n            float* ptr = reinterpret_cast<float*>(&local_data[i]);\n            #pragma unroll\n            for(int v=0; v<VEC_SIZE; ++v) {\n                ptr[v] = (global_idx + v < (batch_idx+1)*stride) ? input[global_idx + v] : 0.0f;\n            }\n        }\n    }\n\n    // Local scan\n    float thread_sum = 0;\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        float* vec = reinterpret_cast<float*>(&local_data[i]);\n        #pragma unroll\n        for(int v=0; v<VEC_SIZE; ++v) {\n            if(i*VEC_SIZE + v >= elements_to_process) break;\n            thread_sum += vec[v];\n            scanned[i*VEC_SIZE + v] = thread_sum;\n        }\n    }\n\n    // Warp scan\n    float warp_total = warp_scan_inclusive(thread_sum);\n    const int warp_id = tid >> 5;\n    \n    // Block scan\n    if((tid & 31) == 31) warp_sums[warp_id] = warp_total;\n    __syncthreads();\n\n    if(tid == 0) {\n        float accum = 0;\n        #pragma unroll\n        for(int i=0; i<BLOCK_SIZE/32; ++i) {\n            float tmp = warp_sums[i];\n            warp_sums[i] = accum;\n            accum += tmp;\n        }\n    }\n    __syncthreads();\n\n    // Apply offsets\n    const float block_offset = warp_sums[warp_id];\n    const float warp_prefix = warp_scan_inclusive(thread_sum) - thread_sum;\n    \n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD; ++i) {\n        if(i >= elements_to_process) break;\n        scanned[i] += block_offset + warp_prefix;\n    }\n\n    // Vectorized store with boundary checks\n    #pragma unroll\n    for(int i=0; i<ELEMENTS_PER_THREAD/VEC_SIZE; ++i) {\n        int global_idx = start_idx + i*VEC_SIZE;\n        if(global_idx + VEC_SIZE <= (batch_idx+1)*stride) {\n            float4 val = {scanned[i*VEC_SIZE], scanned[i*VEC_SIZE+1],\n                          scanned[i*VEC_SIZE+2], scanned[i*VEC_SIZE+3]};\n            reinterpret_cast<float4*>(output)[global_idx/VEC_SIZE] = val;\n        } else {\n            float* ptr = &scanned[i*VEC_SIZE];\n            #pragma unroll\n            for(int v=0; v<VEC_SIZE; ++v) {\n                if(global_idx + v < (batch_idx+1)*stride)\n                    output[global_idx + v] = ptr[v];\n            }\n        }\n    }\n}\n\ntorch::Tensor optimized_scan_cuda(torch::Tensor input, int dim) {\n    TORCH_CHECK(dim == 1, \"Only dim=1 supported\");\n    auto output = torch::empty_like(input);\n    const int batch_size = input.size(0);\n    \n    optimized_scan_kernel<<<batch_size, BLOCK_SIZE, (BLOCK_SIZE/32)*sizeof(float)>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        input.size(1),\n        input.stride(0)\n    );\n    \n    return output;\n}\n\"\"\"\n\nscan_cpp_source = \"torch::Tensor optimized_scan_cuda(torch::Tensor input, int dim);\"\n\nscan_extension = load_inline(\n    name='scan_extension',\n    cpp_sources=scan_cpp_source,\n    cuda_sources=scan_source,\n    functions=['optimized_scan_cuda'],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        \n    def forward(self, x):\n        return scan_extension.optimized_scan_cuda(x, self.dim)",
+  "feedback": "",
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:3",
+      "correctness_trials": "(5 / 5)"
+    },
+    "runtime": 0.00794,
+    "runtime_stats": {
+      "mean": 0.00794,
+      "std": 4.43e-05,
+      "min": 0.00778,
+      "max": 0.0081,
+      "num_trials": 100,
+      "hardware": "NVIDIA L40S",
+      "device": "cuda:3"
+    }
+  },
+  "profiler_result": ""
+}

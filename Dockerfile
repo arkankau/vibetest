@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime
+FROM python:3.12-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -22,10 +22,8 @@ RUN pip install --no-cache-dir \
     scikit-learn \
     scipy \
     plotly \
-    ipywidgets
-
-# Install Codex CLI
-RUN npm i -g @openai/codex
+    ipywidgets \
+    openai
 
 # install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
