@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 
-from vibetest import TestCase, VibeTestAgent
+from meerkat import MeerkatAgent, TestCase
+from meerkat.search_aids import prepare_search_aids
 
 
 def _parse_args() -> argparse.Namespace:
@@ -47,7 +48,19 @@ def _parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default=None,
-        help="Inspect model identifier. Falls back to VIBETEST_MODEL.",
+        help="Inspect model identifier for the main audit. Falls back to MEERKAT_MODEL.",
+    )
+    parser.add_argument(
+        "--search-model",
+        type=str,
+        default=None,
+        help="Optional model for per-trace scoring and cluster labeling. Defaults to --model.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="text-embedding-3-small",
+        help="Embedding model used for trace clustering.",
     )
     parser.add_argument(
         "--output",
@@ -61,18 +74,6 @@ def _parse_args() -> argparse.Namespace:
         default="docker",
         help="Sandbox mode for the audit run.",
     )
-    parser.add_argument(
-        "--analysis-tools",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable the embedding, clustering, and parallel scanner tools.",
-    )
-    parser.add_argument(
-        "--search-aids",
-        choices=["auto", "on", "off"],
-        default="auto",
-        help="Whether to tell Meerkat to expect search_aids/ artifacts.",
-    )
     return parser.parse_args()
 
 
@@ -85,29 +86,10 @@ def _load_property_text(args: argparse.Namespace) -> str:
 
 
 def _resolve_model(args: argparse.Namespace) -> str:
-    model = args.model or os.getenv("VIBETEST_MODEL")
+    model = args.model or os.getenv("MEERKAT_MODEL")
     if not model:
-        raise SystemExit("Provide --model or set VIBETEST_MODEL.")
+        raise SystemExit("Provide --model or set MEERKAT_MODEL.")
     return model
-
-
-def _detect_search_aids(repo_path: Path) -> bool:
-    search_aids_dir = repo_path / "search_aids"
-    return any(
-        path.exists()
-        for path in (
-            search_aids_dir / "initial_scores.tsv",
-            search_aids_dir / "clusters.json",
-        )
-    )
-
-
-def _resolve_search_aids_mode(args: argparse.Namespace) -> bool:
-    if args.search_aids == "on":
-        return True
-    if args.search_aids == "off":
-        return False
-    return _detect_search_aids(args.repo)
 
 
 def _build_test_case(args: argparse.Namespace, property_text: str) -> TestCase:
@@ -149,15 +131,27 @@ def main() -> None:
     if not property_text:
         raise SystemExit("The safety property is empty.")
 
-    model = _resolve_model(args)
-    search_aids_enabled = _resolve_search_aids_mode(args)
-    test_case = _build_test_case(args, property_text)
+    audit_model = _resolve_model(args)
+    search_model = args.search_model or audit_model
 
-    agent = VibeTestAgent(
-        model=model,
+    artifacts = prepare_search_aids(
+        args.repo.resolve(),
+        property_text,
+        scoring_model=search_model,
+        labeling_model=search_model,
+        embedding_model=args.embedding_model,
+    )
+    print(
+        "Prepared search aids: "
+        f"{artifacts['directory']} "
+        f"({artifacts['trace_count']} traces)"
+    )
+
+    test_case = _build_test_case(args, property_text)
+    agent = MeerkatAgent(
+        model=audit_model,
         safety_agent=True,
-        safety_analysis_tools=args.analysis_tools,
-        safety_repo_artifacts=search_aids_enabled,
+        safety_repo_artifacts=True,
     )
     sandbox = None if args.sandbox == "none" else args.sandbox
 

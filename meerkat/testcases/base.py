@@ -34,8 +34,8 @@ class Evidence(BaseModel):
 class TestCase(BaseModel):
     """A test case specification.
 
-    This is simply a container for test metadata - all execution logic
-    is handled by the VibeTestAgent.
+    This is simply a container for test metadata. All execution logic
+    is handled by the MeerkatAgent.
     """
 
     name: str = Field(
