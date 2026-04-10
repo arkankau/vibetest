@@ -1,6 +1,6 @@
 # Meerkat
 
-![Meerkat logo](meerkat.png)
+<img src="meerkat.png" alt="Meerkat logo" width="220" />
 
 Meerkat audits repositories of traces against a natural-language safety property.
 
