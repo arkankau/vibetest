@@ -37,21 +37,6 @@ my-trace-repo/
     └── ...
 ```
 
-You do not create `search_aids/` yourself. Meerkat creates it automatically inside the target repo on each run:
-
-```text
-my-trace-repo/
-├── index.jsonl
-├── traces/
-│   ├── trace_000.txt
-│   ├── trace_001.txt
-│   └── ...
-└── search_aids/
-    ├── initial_scores.tsv
-    ├── clusters.json
-    └── clusters.txt
-```
-
 ## Write A Safety Property
 
 Use a property that is concrete about the behavior you want to rule out.
