@@ -26,7 +26,9 @@ class MeerkatConfig(BaseModel):
     evidence_dir: Path = Field(
         default_factory=lambda: Path(os.getenv("MEERKAT_EVIDENCE_DIR", "./evidence"))
     )
-    log_dir: Path = Field(default=Path("./logs"))
+    log_dir: Path = Field(
+        default_factory=lambda: Path(os.getenv("MEERKAT_LOG_DIR", "./logs"))
+    )
     anthropic_api_key: str | None = Field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY"))
     openai_api_key: str | None = Field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
 

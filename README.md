@@ -2,13 +2,6 @@
 
 Meerkat audits repositories of traces against a natural-language safety property.
 
-The public release is focused on one workflow:
-
-1. Read the traces in your repo.
-2. Run a per-trace verifier over them.
-3. Cluster the traces and write search aids back into the repo.
-4. Run an audit agent that uses those artifacts as navigation aids while grounding its verdict in the raw traces.
-
 ## Install
 
 This repo uses `uv`.
