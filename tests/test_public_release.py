@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from meerkat.agent.react_agent import _parse_submission_output, build_agent_instructions
+from meerkat.agent.meerkat_agent import _parse_submission_output, build_agent_instructions
 from meerkat.search_aids import list_trace_files, prepare_search_aids
 from meerkat.testcases.base import TestCase as AuditCase
 
@@ -23,11 +23,7 @@ EVIDENCE: concrete trace evidence
 
 
 def test_safety_prompt_includes_repository_layout_and_search_aids() -> None:
-    prompt = build_agent_instructions(
-        static=False,
-        safety_agent=True,
-        safety_repo_artifacts=True,
-    )
+    prompt = build_agent_instructions()
 
     assert "## Repository Layout" in prompt
     assert "## Workflow and Guidance" in prompt

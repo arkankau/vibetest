@@ -150,8 +150,6 @@ def main() -> None:
     test_case = _build_test_case(args, property_text)
     agent = MeerkatAgent(
         model=audit_model,
-        safety_agent=True,
-        safety_repo_artifacts=True,
     )
     sandbox = None if args.sandbox == "none" else args.sandbox
 

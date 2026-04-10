@@ -1,5 +1,7 @@
 # Meerkat
 
+![Meerkat logo](meerkat.png)
+
 Meerkat audits repositories of traces against a natural-language safety property.
 
 ## Install
@@ -113,8 +115,6 @@ prepare_search_aids(
 
 agent = MeerkatAgent(
     model="openai/gpt-5",
-    safety_agent=True,
-    safety_repo_artifacts=True,
 )
 
 test_case = TestCase(

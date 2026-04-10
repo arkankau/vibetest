@@ -11,7 +11,7 @@ __all__ = ["Evidence", "MeerkatAgent", "TestCase", "TestResult", "prepare_search
 
 def __getattr__(name: str):
     if name == "MeerkatAgent":
-        from meerkat.agent.react_agent import MeerkatAgent
+        from meerkat.agent.meerkat_agent import MeerkatAgent
 
         return MeerkatAgent
     if name == "prepare_search_aids":

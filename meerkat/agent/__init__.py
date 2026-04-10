@@ -1,5 +1,5 @@
 """Agent implementations for the public Meerkat release."""
 
-from meerkat.agent.react_agent import MeerkatAgent
+from meerkat.agent.meerkat_agent import MeerkatAgent
 
 __all__ = ["MeerkatAgent"]
