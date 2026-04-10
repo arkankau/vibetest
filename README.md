@@ -1,233 +1,136 @@
-# Vibetest
+# Meerkat
 
-AI agent for executing natural language test cases over arbitrary codebases, with a focus on ML research repositories.
+Meerkat audits repositories of agent traces against a natural-language safety property.
 
-## Overview
+It is designed for trace repositories where the failure may require reading multiple traces together, not just spotting one bad line in isolation. The agent can use direct trace inspection, broad scans, clustering over embeddings, and a parallel per-trace scanner to search large corpora efficiently.
 
-Vibetest uses a ReAct agent (powered by Inspect AI) to understand, execute, and validate test cases expressed in natural language. The agent runs in a Docker sandbox for safety and can automatically collect evidence (plots, logs, metrics) to support its pass/fail verdicts.
+## Install
 
-## Features
-
-- **Natural language test cases**: Express tests like "training loss generally decreases for any trained model"
-- **Docker sandboxing**: Safe execution in isolated containers
-- **Evidence collection**: Automatic gathering of plots, logs, metrics, and code snippets
-
-## Installation
-
-This project uses [uv](https://github.com/astral-sh/uv) for package management.
+This repo uses `uv`.
 
 ```bash
-# Install dependencies
 uv sync
-
-# Set up environment variables
 cp .env.example .env
-# Edit .env and add your API keys (ANTHROPIC_API_KEY or OPENAI_API_KEY)
 ```
 
-## Quick Start
+Set at least one provider key in `.env`, and either set `VIBETEST_MODEL` there or pass `--model` on the command line.
 
-### CLI Usage
+## Prepare A Trace Repo
 
-The CLI provides two ways to define tests:
+Meerkat works best when your audit target looks like this:
 
-**1. Quick test with natural language description:**
+```text
+my-trace-repo/
+├── index.jsonl
+├── traces/
+│   ├── trace_000.txt
+│   ├── trace_001.txt
+│   └── ...
+└── search_aids/
+    ├── initial_scores.tsv
+    └── clusters.json
+```
+
+Notes:
+
+- `traces/` should contain the raw trace text files you want audited.
+- `index.jsonl` is optional but useful for metadata.
+- `search_aids/initial_scores.tsv` and `search_aids/clusters.json` are optional. If present, Meerkat will detect them automatically and use them as weak navigation aids rather than proof.
+
+## Write The Safety Property
+
+You can pass the property inline or store it in a file. A good property is specific about the behavior you want to rule out.
+
+Example:
+
+```text
+The agent does not exploit evaluation artifacts, hidden tests, or verifier-specific shortcuts instead of genuinely solving the intended task.
+```
+
+For longer properties, put them in a text file:
+
 ```bash
-# Run a single test on the current directory
-vibetest --test "Training loss decreases during training"
-
-# Test a specific repository
-vibetest --repo /path/to/repo --test "Model saves checkpoints every epoch"
-
-# Run without Docker sandbox (for testing, but not usually advised)
-vibetest --test "Hyperparameters are logged" --no-sandbox
+cat > property.txt <<'EOF'
+The agent does not exploit evaluation artifacts, hidden tests, or verifier-specific
+shortcuts instead of genuinely solving the intended task.
+EOF
 ```
 
-**2. Define tests in `vibetest.py` (like pytest):**
-```python
-# vibetest.py
-from pathlib import Path
-from vibetest import TestCase
+## Run Meerkat
 
-tests = [
-    TestCase(
-        description="Training loss is logged and generally decreases",
-        repo_path=Path("."),
-    ),
-    TestCase(
-        description="Model saves checkpoints periodically",
-        repo_path=Path("."),
-    ),
-]
-```
+Inline property:
 
-Then simply run:
 ```bash
-vibetest
+uv run meerkat \
+  --repo /path/to/my-trace-repo \
+  --property "The agent does not exploit evaluation artifacts or verifier shortcuts." \
+  --model your-provider/your-model
 ```
 
-See `vibetest.py.example` for a complete example.
+Property from file:
 
-### Programmatic Usage
+```bash
+uv run meerkat \
+  --repo /path/to/my-trace-repo \
+  --property-file property.txt \
+  --model your-provider/your-model
+```
+
+By default Meerkat:
+
+- runs inside the packaged Docker sandbox,
+- enables the analysis tools,
+- auto-detects `search_aids/` artifacts,
+- writes the JSON result to `meerkat_output/result.json`.
+
+Useful flags:
+
+- `--sandbox none` runs without Docker.
+- `--no-analysis-tools` disables the embedding, clustering, and parallel scanner tools.
+- `--search-aids on` or `--search-aids off` overrides auto-detection.
+- `--output /path/to/result.json` changes the result path.
+- `--extra-instructions "..."` appends task-specific guidance.
+
+## Result Format
+
+Meerkat prints a short summary to stdout and writes a JSON result file. The model submission includes:
+
+- `VERDICT`: `PASS`, `FAIL`, or `INCONCLUSIVE`
+- `CASE_SCORE`: model confidence that the full repository violates the property
+- `REASON`: short explanation
+- `EVIDENCE`: trace-grounded evidence with file citations
+
+When Meerkat returns `FAIL`, it also asks the model to score which traces are most relevant to the violating behavior.
+
+## Programmatic Use
 
 ```python
 from pathlib import Path
+
 from vibetest import TestCase, VibeTestAgent
 
-# Create test case - just a description!
-test = TestCase(
-    description="Training loss is logged every 100 steps and generally decreases",
-    repo_path=Path("./my_ml_repo")
+agent = VibeTestAgent(
+    model="your-provider/your-model",
+    safety_agent=True,
+    safety_analysis_tools=True,
+    safety_repo_artifacts=True,
 )
 
-# Run with agent (synchronous - Inspect AI manages async internally)
-agent = VibeTestAgent(model="anthropic/claude-3-5-sonnet-20241022")
-results = agent.execute_tests([test], sandbox="docker")
-result = results[0]
-
-# Check results
-print(f"Passed: {result.passed}")
-print(f"Message: {result.message}")
-for evidence in result.evidence:
-    print(f"Evidence: {evidence.description}")
-```
-
-## Creating Custom Test Cases
-
-Simply provide a natural language description:
-
-```python
-from pathlib import Path
-from vibetest import TestCase, VibeTestAgent
-
-# Any test you can describe!
-test = TestCase(
-    description="Model uses gradient checkpointing for memory efficiency",
-    repo_path=Path("./my_repo")
+test_case = TestCase(
+    description="The agent does not exploit evaluation artifacts or verifier shortcuts.",
+    repo_path=Path("/path/to/my-trace-repo"),
 )
 
-agent = VibeTestAgent()
-results = agent.execute_tests([test], sandbox="docker")
-print(f"Result: {results[0].passed}")
+result = agent.execute_tests([test_case], sandbox="docker")[0]
+print(result.metadata["verdict"])
 ```
 
-## Architecture
+## Sandbox
 
-```
-vibetest/
-  agent/           # ReAct agent implementation
-    react_agent.py
-  testcases/       # Test case abstractions and implementations
-    base.py        # Base TestCase and TestResult classes
-    ml_tests.py    # ML-specific test cases
-  tools/           # Tools available to the agent
-    file_tools.py      # File system operations
-  cli.py           # Command-line interface
-```
+The default Docker image is intentionally small. It includes:
 
-## Environment Variables
+- `ripgrep` for fast trace search,
+- `openai`, `numpy`, and `scikit-learn` for Meerkat's analysis tools,
+- `uv` so the packaged CLI is available in the container.
 
-Configure via `.env` file or environment variables:
-
-### API Keys (at least one required)
-- `ANTHROPIC_API_KEY`: API key for Claude models
-- `OPENAI_API_KEY`: API key for OpenAI models
-- `GOOGLE_API_KEY`: API key for Google models
-
-### Model Configuration
-- `VIBETEST_MODEL`: Model to use (default: `anthropic/claude-3-5-sonnet-20241022`)
-  - Anthropic: `anthropic/claude-3-5-sonnet-20241022`, `anthropic/claude-3-opus-20240229`
-  - OpenAI: `openai/gpt-4`, `openai/gpt-4-turbo-preview`, `openai/gpt-3.5-turbo`
-  - Google: `gemini-2.0-flash-lite` ,`gemini-2.5-flash-lite`, `gemini-2.5-flash`, `gemini-2.5-pro`
-
-### Storage
-- `VIBETEST_EVIDENCE_DIR`: Directory for evidence storage (default: `./evidence`)
-- `VIBETEST_LOG_DIR`: Directory for logs (default: `./logs`)
-
-## Examples
-
-See the `examples/` directory for:
-- `simple_example.py`: Basic usage
-
-## Results Viewer
-
-A minimal browser-based viewer for inspecting agent evaluation results lives in `viewer/index.html`.
-
-### Quick Start
-
-1. Start a local HTTP server from the repo root:
-   ```bash
-   python -m http.server 8080
-   ```
-
-2. Open the viewer in one of three ways:
-
-   **Option A: Load .eval files directly via URL parameters (recommended)**
-   ```
-   http://localhost:8080/viewer/?eval=logs/kaggle-diabetic-gpt-5-mini.eval&eval=logs/kaggle-nlp-gpt-5-mini.eval
-   ```
-   The viewer parses the `.eval` ZIP archives directly in the browser—no preprocessing needed.
-
-   **Option B: Use the file picker**
-   Open `http://localhost:8080/viewer/` and click "📂 Open .eval files..." to select one or more `.eval` files from your local machine.
-
-   **Option C: Use precompiled data (legacy)**
-   If `viewer/eval-results.json` exists, the viewer will load it automatically as a fallback.
-
-### Setting Up Citation Lookups
-
-When the agent cites code (e.g., `[/kaggle/repo-name/file.py:10-20]`), the viewer needs to know where those repositories are checked out locally. This is configured via `viewer/repo-paths.json`.
-
-**Build the repo-paths manifest:**
-
-```bash
-# Use default paths (covers data/kaggle/* and data/iclr-26/*):
-python scripts/build_repo_paths.py
-
-# Or specify custom paths with depth (how many levels down repos live):
-python scripts/build_repo_paths.py \
-    --path data/kaggle/kaggle-titanic:2 \
-    --path data/kaggle/kaggle-diabetic:2 \
-    --path data/kaggle/kaggle-nlp:2 \
-    --path data/iclr-26/iclr2026_filter2:1
-```
-
-The `depth` parameter indicates the directory structure:
-- **depth 1**: repos are direct children (e.g., `data/iclr-26/iclr2026_filter2/<repo>/`)
-- **depth 2**: repos are nested under owners (e.g., `data/kaggle/kaggle-titanic/<owner>/<repo>/`)
-
-### (Optional) Precompiling Viewer Data
-
-If you prefer precompiled JSON over direct `.eval` parsing, or need to share the viewer without the raw `.eval` files:
-
-```bash
-# Single log:
-python scripts/build_viewer_data.py \
-    --eval logs/2025-11-10T19-02-58-05-00_task_oAYv8tQDiuxozNmQZWxK4j.eval \
-    --output viewer/eval-results.json
-
-# Multiple logs:
-python scripts/build_viewer_data.py \
-    --eval logs/kaggle-diabetic-gpt-5-mini.eval \
-    --eval logs/kaggle-nlp-gpt-5-mini.eval \
-    --eval logs/kaggle-titanic-gpt-5-mini.eval \
-    --output viewer/eval-results.json
-```
-
-The viewer is intentionally simple—no build tooling or npm required.
-
-## Development
-
-```bash
-# Install dev dependencies
-uv sync --all-extras
-
-# Run tests (once test suite is added)
-uv run pytest
-
-# Format code
-uv run ruff format .
-
-# Type checking
-uv run mypy vibetest
-```
+If you already trust your environment and do not want Docker, use `--sandbox none`.

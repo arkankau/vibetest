@@ -1,7 +1,7 @@
-"""Agent implementations."""
+"""Agent implementations for the public Meerkat release."""
 
 from vibetest.agent.react_agent import VibeTestAgent
-from vibetest.agent.baseline_agent import BaselineAgent
-from vibetest.agent.codex_agent import CodexReviewAgent, CodexVibeTestAgent
 
-__all__ = ["VibeTestAgent", "BaselineAgent", "CodexReviewAgent", "CodexVibeTestAgent"]
+MeerkatAgent = VibeTestAgent
+
+__all__ = ["VibeTestAgent", "MeerkatAgent"]

@@ -1,5 +1,6 @@
 """Base classes for test cases and results."""
 
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -37,7 +38,10 @@ class TestCase(BaseModel):
     is handled by the VibeTestAgent.
     """
 
-    name: str = Field(..., description="A unique name for the test case")
+    name: str = Field(
+        default_factory=lambda: f"audit-{uuid.uuid4().hex[:8]}",
+        description="A unique name for the test case",
+    )
     description: str = Field(..., description="Natural language description of what to test")
     extra_instructions: Optional[str] = Field(
         default=None, description="Additional instructions for the agent"

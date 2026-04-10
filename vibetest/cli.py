@@ -1,189 +1,181 @@
-"""Command-line interface for vibetest."""
+"""Command-line interface for the public Meerkat release."""
 
-import importlib.util
+from __future__ import annotations
+
+import argparse
 import json
-import sys
+import os
 from pathlib import Path
 
 from vibetest import TestCase, VibeTestAgent
 
 
-def run_test(
-    test_case: TestCase, output_dir: Path, use_sandbox: bool = True
-) -> None:
-    """Run a single test case.
-
-    Args:
-        test_case: Test case to run
-        output_dir: Directory for outputs
-        use_sandbox: Whether to use Docker sandbox
-    """
-    print(f"\n{'='*80}")
-    print(f"Running test: {test_case.description}")
-    print(f"Repository: {test_case.repo_path}")
-    print(f"{'='*80}\n")
-
-    # Execute test (synchronous - Inspect AI manages its own event loop)
-    agent = VibeTestAgent()
-    sandbox = "docker" if use_sandbox else None
-    tests = [test_case]
-    results = agent.execute_tests(tests, sandbox=sandbox)
-
-    print("\n" + "=" * 80)
-    print("VIBETEST RESULTS")
-    print("=" * 80)
-
-    passed_count = sum(1 for r in results if r.passed)
-    failed_count = len(results) - passed_count
-
-    for i, result in enumerate(results, 1):
-        status = "PASSED" if result.passed else "FAILED"
-        status_symbol = "." if result.passed else "F"
-        print(f"\n{tests[i-1].description} ... {status}")
-
-        if not result.passed or result.evidence:
-            print(f"  {result.message}")
-
-            if result.evidence:
-                print("  Evidence:")
-                for evidence in result.evidence:
-                    print(f"    - {evidence.description}")
-                    print(f"      Type: {evidence.type}")
-                    if evidence.data:
-                        print(f"      Data: {evidence.data}")
-
-    print("\n" + "=" * 80)
-    print(f"{passed_count} passed, {failed_count} failed")
-    print("=" * 80)
-
-    # Save result
-    output_dir.mkdir(parents=True, exist_ok=True)
-    result_file = output_dir / "test_result.json"
-    result_file.write_text(json.dumps(result.to_dict(), indent=2, default=str))
-    print(f"\nFull results saved to: {result_file}")
-
-
-def load_tests_from_file(file_path: Path) -> list[TestCase]:
-    """Load test cases from a vibetest.py file.
-
-    Args:
-        file_path: Path to vibetest.py file
-
-    Returns:
-        List of TestCase objects
-
-    The file should define a variable named 'tests' which is a list of TestCase objects.
-    """
-    spec = importlib.util.spec_from_file_location("vibetest_config", file_path)
-    if spec is None or spec.loader is None:
-        print(f"Error: Could not load {file_path}")
-        sys.exit(1)
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    if not hasattr(module, "tests"):
-        print(f"Error: {file_path} must define a 'tests' variable containing a list of TestCase objects")
-        sys.exit(1)
-
-    tests = module.tests
-    if not isinstance(tests, list):
-        print(f"Error: 'tests' must be a list of TestCase objects")
-        sys.exit(1)
-
-    return tests
-
-
-def main():
-    """Main CLI entry point."""
-    import argparse
-
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Vibetest: AI agent for natural language test execution",
-        epilog="""
-Examples:
-  # Run a test with a natural language description
-  vibetest --test "Training loss decreases during training"
-
-  # Run tests defined in vibetest.py
-  vibetest
-
-  # Specify repo path (defaults to current directory)
-  vibetest --repo /path/to/repo --test "Model saves checkpoints"
-        """,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Meerkat: audit a repository of traces against a natural-language safety property.",
     )
     parser.add_argument(
         "--repo",
         type=Path,
-        default=Path.cwd(),
-        help="Path to repository to test (default: current directory)",
+        required=True,
+        help="Path to the trace repository to audit.",
     )
     parser.add_argument(
-        "--test",
+        "--property",
+        dest="property_text",
         type=str,
-        help="Natural language test description",
+        help="Safety property to audit for.",
     )
     parser.add_argument(
-        "--config",
+        "--property-file",
         type=Path,
-        default=Path("vibetest.py"),
-        help="Path to test configuration file (default: ./vibetest.py)",
+        help="Path to a text file containing the safety property.",
     )
     parser.add_argument(
-        "--output-dir",
+        "--extra-instructions",
+        type=str,
+        default=None,
+        help="Optional extra instructions appended to the audit prompt.",
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Optional audit name used in logs and result files.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Inspect model identifier. Falls back to VIBETEST_MODEL.",
+    )
+    parser.add_argument(
+        "--output",
         type=Path,
-        default=Path("./vibetest_output"),
-        help="Output directory for results",
+        default=Path("meerkat_output/result.json"),
+        help="Path to write the JSON result.",
     )
     parser.add_argument(
-        "--no-sandbox",
-        action="store_true",
-        help="Disable Docker sandbox",
+        "--sandbox",
+        choices=["docker", "none"],
+        default="docker",
+        help="Sandbox mode for the audit run.",
+    )
+    parser.add_argument(
+        "--analysis-tools",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the embedding, clustering, and parallel scanner tools.",
+    )
+    parser.add_argument(
+        "--search-aids",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Whether to tell Meerkat to expect search_aids/ artifacts.",
+    )
+    return parser.parse_args()
+
+
+def _load_property_text(args: argparse.Namespace) -> str:
+    if bool(args.property_text) == bool(args.property_file):
+        raise SystemExit("Specify exactly one of --property or --property-file.")
+    if args.property_text:
+        return args.property_text.strip()
+    return args.property_file.read_text(encoding="utf-8").strip()
+
+
+def _resolve_model(args: argparse.Namespace) -> str:
+    model = args.model or os.getenv("VIBETEST_MODEL")
+    if not model:
+        raise SystemExit("Provide --model or set VIBETEST_MODEL.")
+    return model
+
+
+def _detect_search_aids(repo_path: Path) -> bool:
+    search_aids_dir = repo_path / "search_aids"
+    return any(
+        path.exists()
+        for path in (
+            search_aids_dir / "initial_scores.tsv",
+            search_aids_dir / "clusters.json",
+        )
     )
 
-    args = parser.parse_args()
 
-    # Determine test cases to run
-    test_cases = []
+def _resolve_search_aids_mode(args: argparse.Namespace) -> bool:
+    if args.search_aids == "on":
+        return True
+    if args.search_aids == "off":
+        return False
+    return _detect_search_aids(args.repo)
 
-    if args.test:
-        # Use test description from command line
-        test_cases = [TestCase(
-            description=args.test,
-            repo_path=args.repo,
-        )]
-    elif args.config.exists():
-        # Load tests from config file
-        print(f"Loading tests from {args.config}")
-        test_cases = load_tests_from_file(args.config)
-    else:
-        print(f"Error: No test specified and {args.config} not found")
-        print("\nUsage:")
-        print("  1. Provide --test with a natural language description")
-        print("  2. Create a vibetest.py file with test definitions")
-        print("\nExample vibetest.py:")
-        print("  from pathlib import Path")
-        print("  from vibetest import TestCase")
-        print("")
-        print("  tests = [")
-        print('      TestCase(description="Training loss decreases", repo_path=Path(".")),')
-        print('      TestCase(description="Model saves checkpoints", repo_path=Path(".")),')
-        print("  ]")
-        sys.exit(1)
 
-    # Run tests
+def _build_test_case(args: argparse.Namespace, property_text: str) -> TestCase:
+    return TestCase(
+        name=args.name or f"audit-{args.repo.name}",
+        description=property_text,
+        extra_instructions=args.extra_instructions,
+        repo_path=args.repo.resolve(),
+    )
+
+
+def _result_payload(result) -> dict:
+    return result.to_dict()
+
+
+def _print_summary(result, output_path: Path) -> None:
+    metadata = result.metadata or {}
+    verdict = metadata.get("verdict", "INCONCLUSIVE")
+    print(f"Verdict: {verdict}")
+    case_score = metadata.get("case_score")
+    if case_score is not None:
+        print(f"Case score: {case_score:.3f}")
+    reason_text = (metadata.get("reason_text") or "").strip()
+    if reason_text:
+        print(f"Reason: {reason_text}")
+    usage_totals = metadata.get("usage_totals") or {}
+    total_tokens = usage_totals.get("total_tokens")
+    if total_tokens:
+        print(f"Total tokens: {total_tokens}")
+    print(f"Result JSON: {output_path}")
+
+
+def main() -> None:
+    args = _parse_args()
+    if not args.repo.is_dir():
+        raise SystemExit(f"Repository not found: {args.repo}")
+
+    property_text = _load_property_text(args)
+    if not property_text:
+        raise SystemExit("The safety property is empty.")
+
+    model = _resolve_model(args)
+    search_aids_enabled = _resolve_search_aids_mode(args)
+    test_case = _build_test_case(args, property_text)
+
+    agent = VibeTestAgent(
+        model=model,
+        safety_agent=True,
+        safety_analysis_tools=args.analysis_tools,
+        safety_repo_artifacts=search_aids_enabled,
+    )
+    sandbox = None if args.sandbox == "none" else args.sandbox
+
     try:
-        for test_case in test_cases:
-            run_test(test_case, args.output_dir, not args.no_sandbox)
+        results = agent.execute_tests([test_case], sandbox=sandbox)
     except KeyboardInterrupt:
-        print("\n\nTest interrupted by user")
-        sys.exit(130)
-    except Exception as e:
-        print(f"\n\nError running test: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        raise SystemExit(130) from None
+
+    if not results:
+        raise SystemExit("Meerkat did not return any results.")
+
+    result = results[0]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(_result_payload(result), indent=2, default=str),
+        encoding="utf-8",
+    )
+    _print_summary(result, args.output)
 
 
 if __name__ == "__main__":

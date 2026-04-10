@@ -25,9 +25,7 @@ class VibeTestConfig(BaseModel):
 
     # Model configuration
     default_model: str = Field(
-        default_factory=lambda: os.getenv(
-            "VIBETEST_MODEL", "anthropic/claude-3-5-sonnet-20241022"
-        )
+        default_factory=lambda: os.getenv("VIBETEST_MODEL", "no-model")
     )
     max_attempts: int = Field(default=20, description="Max ReAct iterations")
 
