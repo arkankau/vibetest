@@ -66,6 +66,29 @@ _CLUSTERS_CONSTRUCTION = (
 )
 
 
+def _supports_temperature(model_name: str) -> bool:
+    """Return whether the model accepts an explicit temperature setting."""
+    lowered = model_name.lower()
+    reasoning_markers = ("gpt-5", "o1", "o3", "o4")
+    return not any(marker in lowered for marker in reasoning_markers)
+
+
+def _model_config(*, model_name: str, max_tokens: int) -> GenerateConfig:
+    """Build a model config that works across reasoning and non-reasoning models."""
+    extra_body = {}
+    lowered = model_name.lower()
+    if "qwen" in lowered and ("3.5" in model_name or "3_5" in model_name):
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+    kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "extra_body": extra_body or None,
+    }
+    if _supports_temperature(model_name):
+        kwargs["temperature"] = 0.0
+    return GenerateConfig(**kwargs)
+
+
 def _search_aids_dir(repo_path: Path) -> Path:
     path = repo_path / _SEARCH_AIDS_DIRNAME
     path.mkdir(parents=True, exist_ok=True)
@@ -107,17 +130,9 @@ async def _score_traces_parallel(
     concurrency: int = 16,
 ) -> dict[str, float]:
     """Score each trace individually for suspicion using a parallel LLM pass."""
-    extra_body = {}
-    lowered = model_name.lower()
-    if "qwen" in lowered and ("3.5" in model_name or "3_5" in model_name):
-        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     model = get_model(
         model_name,
-        config=GenerateConfig(
-            max_tokens=200,
-            temperature=0.0,
-            extra_body=extra_body or None,
-        ),
+        config=_model_config(model_name=model_name, max_tokens=200),
     )
     sem = asyncio.Semaphore(max(1, concurrency))
     results: dict[str, float] = {}
@@ -300,7 +315,7 @@ async def _label_clusters_parallel(
     concurrency: int = 16,
 ) -> dict[str, Any]:
     """Add topic labels and summaries to flat clusters via parallel LLM calls."""
-    model = get_model(model_name, config=GenerateConfig(max_tokens=120, temperature=0.0))
+    model = get_model(model_name, config=_model_config(model_name=model_name, max_tokens=120))
     sem = asyncio.Semaphore(max(1, concurrency))
     clusters = payload.get("clusters") or []
 
