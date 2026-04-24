@@ -185,6 +185,7 @@ class AdaptiveBayesianDetector:
         n_bootstraps: int = 5,
         prior_benign: float = 0.5,
         use_cluster_features: bool = False,
+        random_seed: int | None = None,
     ):
         if r_values is None:
             r_values = [0.0, 0.005, 0.01, 0.02, 0.05, 0.1]
@@ -206,6 +207,7 @@ class AdaptiveBayesianDetector:
         self.n_bootstraps = n_bootstraps
         self.prior_benign = prior_benign
         self.use_cluster_features = use_cluster_features
+        self._rng = random.Random(random_seed)
 
         self.reference: ReferenceDistribution | None = None
         self._fitted = False
@@ -272,17 +274,17 @@ class AdaptiveBayesianDetector:
             for _ in range(n_synthetic):
                 if beta >= 1.0:
                     # Maximally sneaky: sample from benign distribution
-                    synthetic_score = random.choice(all_scores)
+                    synthetic_score = self._rng.choice(all_scores)
                 elif beta <= 0.0:
                     # Not sneaky: high scores
-                    synthetic_score = min(1.0, 0.7 + random.random() * 0.3)
+                    synthetic_score = min(1.0, 0.7 + self._rng.random() * 0.3)
                 else:
                     # Interpolate: with prob (1-β), draw from "obvious" (high score)
                     # with prob β, draw from benign
-                    if random.random() < beta:
-                        synthetic_score = random.choice(all_scores)
+                    if self._rng.random() < beta:
+                        synthetic_score = self._rng.choice(all_scores)
                     else:
-                        synthetic_score = min(1.0, 0.5 + random.random() * 0.5)
+                        synthetic_score = min(1.0, 0.5 + self._rng.random() * 0.5)
                 ref.add_malicious(synthetic_score, beta)
 
         self.reference = ref
@@ -382,7 +384,7 @@ class AdaptiveBayesianDetector:
         for boot_idx in range(self.n_bootstraps):
             # Score with a perturbed reference (add noise to smoothing)
             # Following the paper: resample reference distribution
-            perturbed_smoothing = self.smoothing * (0.5 + random.random())
+            perturbed_smoothing = self.smoothing * (0.5 + self._rng.random())
             orig_smoothing = self.smoothing
             self.smoothing = perturbed_smoothing
 

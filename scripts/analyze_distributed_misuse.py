@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import random
@@ -30,7 +31,7 @@ DM_METHOD_COLORS = {
     "Monitor": "#CC79A7",
     "Bayesian": "#0072B2",
     "Buffer": "#009E73",
-    "Naive Agent": "#666666",
+    "Naive Agent": "#8A8A8A",
 }
 DM_METHOD_LINESTYLES = {
     "Meerkat": "-",
@@ -44,6 +45,9 @@ DM_MODEL_COLORS = {
     "Qwen-3.5": "#CC79A7",
 }
 _DM_MISSING_RESULT_WARNINGS: set[tuple[str, str, str, int, str]] = set()
+_TRACE_SCORES_BLOCK_RE = re.compile(r"TRACE_SCORES_START\s*\n(.*?)\nTRACE_SCORES_END", re.S | re.I)
+_TRACE_SCORES_SECTION_RE = re.compile(r"^\s*TRACE_SCORES(?:\s*:)?\s*$\n?(.*)\Z", re.S | re.I | re.M)
+_DM_BOOTSTRAP_CACHE_VERSION = 4
 
 
 def _dm_rc_context() -> dict[str, Any]:
@@ -115,10 +119,10 @@ def _dm_meerkat_result_path(results_dir: Path, *, domain: str, bg: int, model_la
         ("cyber", 100, "gpt-5.4-mini"): "dm_cyber_d6_bg100_n15.jsonl",
         ("cyber", 20, "qwen35"): "dm_cyber_d6_bg20_qwen35_n20.jsonl",
         ("cyber", 100, "qwen35"): "dm_cyber_d6_bg100_qwen35_n50.jsonl",
-        ("bio", 20, "gpt-5.4-mini"): "dm_bio_d6_bg20_v6.jsonl",
-        ("bio", 100, "gpt-5.4-mini"): "dm_bio_d6_bg100_v6.jsonl",
+        ("bio", 20, "gpt-5.4-mini"): "dm_bio_d6_bg20_n20.jsonl",
+        ("bio", 100, "gpt-5.4-mini"): "dm_bio_d6_bg100_n50.jsonl",
         ("bio", 20, "qwen35"): "dm_bio_d6_bg20_qwen35_n20.jsonl",
-        ("bio", 100, "qwen35"): "dm_bio_d6_bg100_qwen35_v4_n50.jsonl",
+        ("bio", 100, "qwen35"): "dm_bio_d6_bg100_qwen35_n50.jsonl",
     }
     filename = mapping.get((domain, bg, slug))
     if filename is None:
@@ -203,6 +207,76 @@ class PaperCurveRun:
     precision_upper: list[float]
 
 
+@dataclass
+class PaperRocRun:
+    path: Path
+    model_label: str
+    method_label: str
+    background_multiplier: int
+    case_count: int
+    roc_auc: float | None
+    roc_auc_bootstrap_se: float | None
+    fpr_grid: list[float]
+    tpr_curve: list[float]
+    tpr_lower: list[float]
+    tpr_upper: list[float]
+
+
+def _path_signature(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {"path": str(path.resolve()), "exists": False}
+    return {
+        "path": str(path.resolve()),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _bootstrap_cache_path(cache_dir: Path, *, kind: str, payload: dict[str, Any]) -> Path:
+    serialized = json.dumps(
+        {
+            "version": _DM_BOOTSTRAP_CACHE_VERSION,
+            "kind": kind,
+            "payload": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return cache_dir / f"{kind}_{digest}.json"
+
+
+def _read_bootstrap_cache(cache_dir: Path | None, *, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if cache_dir is None:
+        return None
+    cache_path = _bootstrap_cache_path(cache_dir, kind=kind, payload=payload)
+    if not cache_path.is_file():
+        return None
+    try:
+        return json.loads(cache_path.read_text())
+    except Exception:
+        return None
+
+
+def _write_bootstrap_cache(
+    cache_dir: Path | None,
+    *,
+    kind: str,
+    payload: dict[str, Any],
+    value: dict[str, Any],
+) -> None:
+    if cache_dir is None:
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = _bootstrap_cache_path(cache_dir, kind=kind, payload=payload)
+    cache_path.write_text(json.dumps(value, sort_keys=True))
+
+
 def _display_model_name(model_name: str | None, *, path: Path | None = None) -> str:
     text = str(model_name or "").strip()
     lowered = text.lower()
@@ -264,6 +338,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Number of bootstrap resamples for PR bands and AP standard errors.",
+    )
+    parser.add_argument(
+        "--bootstrap-cache-dir",
+        default="results/dm_bootstrap_cache",
+        help="Directory to cache bootstrap-derived PR bands and AP/ROC summary standard errors.",
     )
     return parser.parse_args()
 
@@ -551,8 +630,12 @@ def _average_curves(
 
 
 def _load_stage1_scores_from_repo(repo_path: Path) -> dict[str, float] | None:
-    initial_scores_tsv_path = repo_path / "initial_scores.tsv"
-    if initial_scores_tsv_path.exists():
+    initial_scores_tsv_candidates = [
+        repo_path / "search_aids" / "initial_scores.tsv",
+        repo_path / "initial_scores.tsv",
+    ]
+    initial_scores_tsv_path = next((path for path in initial_scores_tsv_candidates if path.exists()), None)
+    if initial_scores_tsv_path is not None:
         scores: dict[str, float] = {}
         for line in initial_scores_tsv_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -708,10 +791,7 @@ def _collect_setting_metrics(
         gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
         gt_case_label = 1 if bool(row.get("ground_truth", {}).get("has_distributed_misuse")) else 0
         case_id = str(row.get("case_id") or row.get("repo_name") or "")
-        stage2_scores = {
-            _normalize_trace_path(k): float(v)
-            for k, v in ((row.get("scoring", {}).get("trace_scores") or {}).items())
-        }
+        stage2_scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=bool(gt))
         if stage2_scores:
             stage2_cases.append((stage2_scores, gt))
             stage2_case_pairs.append((gt_case_label, max(stage2_scores.values())))
@@ -735,6 +815,8 @@ def _collect_setting_metrics(
             gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
             case_id = str(row.get("case_id") or row.get("repo_name") or "")
             scores = recomputed.get(case_id) or {}
+            if not scores and gt:
+                scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=True)
             if scores:
                 stage1_cases.append((scores, gt))
                 gt_case_label = 1 if bool(row.get("ground_truth", {}).get("has_distributed_misuse")) else 0
@@ -803,13 +885,12 @@ def _load_stage_cases(
 
     for row in rows:
         gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
-        stage2_scores = {
-            _normalize_trace_path(k): float(v)
-            for k, v in ((row.get("scoring", {}).get("trace_scores") or {}).items())
-        }
+        stage2_scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=bool(gt))
         if stage2_scores:
             stage2_cases.append((stage2_scores, gt))
         stage1_scores = _load_stage1_scores_from_repo(Path(row["repo"]))
+        if not stage1_scores and gt:
+            stage1_scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=True)
         if stage1_scores:
             stage1_cases.append((stage1_scores, gt))
         elif recompute_stage1_if_missing:
@@ -826,6 +907,8 @@ def _load_stage_cases(
             gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
             case_id = str(row.get("case_id") or row.get("repo_name") or "")
             scores = recomputed.get(case_id) or {}
+            if not scores and gt:
+                scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=True)
             if scores:
                 stage1_cases.append((scores, gt))
 
@@ -854,6 +937,111 @@ def _interp_precision_at_recalls(curve: list[dict[str, float]], recall_grid: lis
                 break
         out.append(chosen)
     return out
+
+
+def _precision_recall_curve_for_case(scores: dict[str, float], gt: set[str]) -> list[dict[str, float]]:
+    if not scores or not gt:
+        return []
+    normalized_scores = {_normalize_trace_path(k): float(v) for k, v in scores.items()}
+    gt_norm = {_normalize_trace_path(x) for x in gt}
+    if not gt_norm:
+        return []
+    thresholds = [float("inf")] + sorted({float(score) for score in normalized_scores.values()}, reverse=True)
+    curve: list[dict[str, float]] = []
+    for threshold in thresholds:
+        point = _case_precision_recall(normalized_scores, gt_norm, threshold)
+        if point is None:
+            continue
+        precision, recall = point
+        curve.append({"threshold": threshold, "precision": precision, "recall": recall})
+    return curve
+
+
+def _mean_precision_at_recalls(
+    per_case_scores: list[tuple[dict[str, float], set[str]]],
+    recall_grid: list[float],
+) -> list[float]:
+    valid_cases = [(scores, gt) for scores, gt in per_case_scores if scores and gt]
+    if not valid_cases:
+        return [0.0 for _ in recall_grid]
+    per_case_interp: list[list[float]] = []
+    for scores, gt in valid_cases:
+        curve = _precision_recall_curve_for_case(scores, gt)
+        if not curve:
+            continue
+        per_case_interp.append(_interp_precision_at_recalls(curve, recall_grid))
+    if not per_case_interp:
+        return [0.0 for _ in recall_grid]
+    return [sum(sample[idx] for sample in per_case_interp) / len(per_case_interp) for idx in range(len(recall_grid))]
+
+
+def _interp_tpr_at_fprs(curve: list[dict[str, float]], fpr_grid: list[float]) -> list[float]:
+    if not curve:
+        return [0.0 for _ in fpr_grid]
+    fpr_to_tpr: dict[float, float] = {}
+    for point in curve:
+        fpr = max(0.0, min(1.0, float(point.get("fpr", 0.0))))
+        tpr = max(0.0, min(1.0, float(point.get("tpr", 0.0))))
+        fpr_to_tpr[fpr] = max(fpr_to_tpr.get(fpr, 0.0), tpr)
+    points = sorted(fpr_to_tpr.items())
+    fprs = [point[0] for point in points]
+    tprs = [point[1] for point in points]
+    out: list[float] = []
+    for target in fpr_grid:
+        if target <= fprs[0]:
+            out.append(tprs[0])
+            continue
+        if target >= fprs[-1]:
+            out.append(tprs[-1])
+            continue
+        upper_idx = 1
+        while upper_idx < len(fprs) and fprs[upper_idx] < target:
+            upper_idx += 1
+        lower_idx = upper_idx - 1
+        lower_fpr = fprs[lower_idx]
+        upper_fpr = fprs[upper_idx]
+        lower_tpr = tprs[lower_idx]
+        upper_tpr = tprs[upper_idx]
+        if upper_fpr <= lower_fpr:
+            out.append(max(lower_tpr, upper_tpr))
+            continue
+        weight = (target - lower_fpr) / (upper_fpr - lower_fpr)
+        out.append(lower_tpr + weight * (upper_tpr - lower_tpr))
+    return out
+
+
+def _roc_curve_for_case(scores: dict[str, float], gt: set[str]) -> list[dict[str, float]]:
+    if not scores or not gt:
+        return []
+    normalized_scores = {_normalize_trace_path(k): float(v) for k, v in scores.items()}
+    gt_norm = {_normalize_trace_path(x) for x in gt}
+    thresholds = [float("inf")] + sorted({float(score) for score in normalized_scores.values()}, reverse=True) + [float("-inf")]
+    curve: list[dict[str, float]] = []
+    for threshold in thresholds:
+        point = _case_roc_point(normalized_scores, gt_norm, threshold)
+        if point is None:
+            continue
+        tpr, fpr = point
+        curve.append({"threshold": threshold, "tpr": tpr, "fpr": fpr})
+    return curve
+
+
+def _mean_tpr_at_fprs(
+    per_case_scores: list[tuple[dict[str, float], set[str]]],
+    fpr_grid: list[float],
+) -> list[float]:
+    valid_cases = [(scores, gt) for scores, gt in per_case_scores if scores and gt]
+    if not valid_cases:
+        return [0.0 for _ in fpr_grid]
+    per_case_interp: list[list[float]] = []
+    for scores, gt in valid_cases:
+        curve = _roc_curve_for_case(scores, gt)
+        if not curve:
+            continue
+        per_case_interp.append(_interp_tpr_at_fprs(curve, fpr_grid))
+    if not per_case_interp:
+        return [0.0 for _ in fpr_grid]
+    return [sum(sample[idx] for sample in per_case_interp) / len(per_case_interp) for idx in range(len(fpr_grid))]
 
 
 def _average_precision_from_pr_curve(curve: list[dict[str, float]] | None) -> float | None:
@@ -932,26 +1120,23 @@ def _bootstrap_pr_band(
     *,
     n_bootstrap: int = 100,
     seed: int = 0,
-) -> tuple[list[float], list[float], list[float], float | None]:
+) -> tuple[list[float], list[float], list[float], list[float], float | None]:
     valid_cases = [(scores, gt) for scores, gt in per_case_scores if scores and gt]
     if not valid_cases:
         grid = [i / 20.0 for i in range(21)]
         zeros = [0.0 for _ in grid]
-        return grid, zeros, zeros, None
-    ap, curve, _, _ = _average_curves(valid_cases)
+        return grid, zeros, zeros, zeros, None
+    ap, _, _, _ = _average_curves(valid_cases)
     recall_grid = [i / 20.0 for i in range(21)]
+    mean_precision = _mean_precision_at_recalls(valid_cases, recall_grid)
     rng = random.Random(seed)
     samples: list[list[float]] = []
     n = len(valid_cases)
     for _ in range(n_bootstrap):
         sampled = [valid_cases[rng.randrange(n)] for _ in range(n)]
-        _, sample_curve, _, _ = _average_curves(sampled)
-        if not sample_curve:
-            continue
-        samples.append(_interp_precision_at_recalls(sample_curve, recall_grid))
+        samples.append(_mean_precision_at_recalls(sampled, recall_grid))
     if not samples:
-        zeros = [0.0 for _ in recall_grid]
-        return recall_grid, zeros, zeros, ap
+        return recall_grid, mean_precision, mean_precision[:], mean_precision[:], ap
     lower: list[float] = []
     upper: list[float] = []
     for idx in range(len(recall_grid)):
@@ -960,7 +1145,39 @@ def _bootstrap_pr_band(
         hi_idx = min(len(vals) - 1, int(0.975 * len(vals)))
         lower.append(vals[lo_idx])
         upper.append(vals[hi_idx])
-    return recall_grid, lower, upper, ap
+    return recall_grid, mean_precision, lower, upper, ap
+
+
+def _bootstrap_roc_band(
+    per_case_scores: list[tuple[dict[str, float], set[str]]],
+    *,
+    n_bootstrap: int = 100,
+    seed: int = 0,
+) -> tuple[list[float], list[float], list[float], float | None]:
+    valid_cases = [(scores, gt) for scores, gt in per_case_scores if scores and gt]
+    fpr_grid = [i / 20.0 for i in range(21)]
+    if not valid_cases:
+        zeros = [0.0 for _ in fpr_grid]
+        return fpr_grid, zeros, zeros, None
+    _, _, roc_auc, _ = _average_curves(valid_cases)
+    rng = random.Random(seed)
+    samples: list[list[float]] = []
+    n = len(valid_cases)
+    for _ in range(n_bootstrap):
+        sampled = [valid_cases[rng.randrange(n)] for _ in range(n)]
+        samples.append(_mean_tpr_at_fprs(sampled, fpr_grid))
+    if not samples:
+        zeros = [0.0 for _ in fpr_grid]
+        return fpr_grid, zeros, zeros, roc_auc
+    lower: list[float] = []
+    upper: list[float] = []
+    for idx in range(len(fpr_grid)):
+        vals = sorted(sample[idx] for sample in samples)
+        lo_idx = max(0, int(0.025 * len(vals)) - 1)
+        hi_idx = min(len(vals) - 1, int(0.975 * len(vals)))
+        lower.append(vals[lo_idx])
+        upper.append(vals[hi_idx])
+    return fpr_grid, lower, upper, roc_auc
 
 
 def _row_trace_scores(row: dict[str, Any]) -> dict[str, float]:
@@ -973,6 +1190,106 @@ def _row_trace_scores(row: dict[str, Any]) -> dict[str, float]:
         if meta_scores:
             return {_normalize_trace_path(k): float(v) for k, v in meta_scores.items()}
     return {}
+
+
+def _row_explicit_trace_scores(row: dict[str, Any]) -> dict[str, float]:
+    tests = row.get("tests") or []
+    test = tests[0] if tests else {}
+    metadata = test.get("metadata") or {}
+    meta_scores = metadata.get("trace_scores") or {}
+    if meta_scores:
+        return {
+            _normalize_trace_path(str(path)): max(0.0, min(1.0, float(score)))
+            for path, score in meta_scores.items()
+        }
+    evidence_text = (
+        metadata.get("evidence_text")
+        or (test.get("evidence") if isinstance(test.get("evidence"), str) else "")
+        or ""
+    )
+    raw_text = str(evidence_text)
+    match = _TRACE_SCORES_BLOCK_RE.search(raw_text)
+    block = match.group(1) if match else ""
+    if not block:
+        match = _TRACE_SCORES_SECTION_RE.search(raw_text)
+        block = match.group(1) if match else ""
+    if not block:
+        return {}
+    scores: dict[str, float] = {}
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            parts = line.rsplit(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            score = float(parts[-1].strip())
+        except ValueError:
+            continue
+        scores[_normalize_trace_path(parts[0].strip())] = max(0.0, min(1.0, score))
+    return scores
+
+
+def _row_all_trace_files(row: dict[str, Any]) -> list[str]:
+    gt = row.get("ground_truth") or {}
+    trace_files = gt.get("trace_files") or gt.get("harmful_trace_files") or []
+    normalized = [_normalize_trace_path(str(path)) for path in trace_files if str(path).strip()]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for path in normalized:
+        if path not in seen:
+            seen.add(path)
+            ordered.append(path)
+    return ordered
+
+
+def _row_trace_scores_for_metrics(
+    row: dict[str, Any],
+    *,
+    zero_fill_if_missing: bool,
+) -> dict[str, float]:
+    scores = _row_trace_scores(row)
+    if scores or not zero_fill_if_missing:
+        return scores
+    return {trace_path: 0.0 for trace_path in _row_all_trace_files(row)}
+
+
+def _row_zero_unmentioned_trace_scores(
+    row: dict[str, Any],
+    *,
+    fallback_scores: dict[str, float] | None = None,
+) -> dict[str, float]:
+    explicit_scores = _row_explicit_trace_scores(row)
+    all_trace_files = _row_all_trace_files(row)
+    if not explicit_scores and not fallback_scores and not all_trace_files:
+        return {}
+    zero_filled = {trace_path: 0.0 for trace_path in all_trace_files}
+    if explicit_scores:
+        zero_filled.update(explicit_scores)
+    elif fallback_scores:
+        zero_filled.update({_normalize_trace_path(k): float(v) for k, v in fallback_scores.items()})
+    return zero_filled
+
+
+def _meerkat_fallback_scores_by_case(
+    agent_path: Path,
+    monitor_path: Path | None,
+) -> dict[str, dict[str, float]]:
+    if monitor_path is not None and monitor_path.is_file():
+        monitor_cases, _ = _collect_case_rows(monitor_path)
+        return {case_id: scores for case_id, scores, _ in monitor_cases}
+
+    rows = _load_rows(agent_path)
+    fallback: dict[str, dict[str, float]] = {}
+    for idx, row in enumerate(rows):
+        case_id = _row_case_id(row, idx)
+        repo_scores = _load_stage1_scores_from_repo(Path(str(row.get("repo") or ""))) or {}
+        if repo_scores:
+            fallback[case_id] = repo_scores
+    return fallback
 
 
 def _collect_stage2_case_curves(path: Path) -> tuple[list[list[dict[str, float]]], int]:
@@ -990,17 +1307,50 @@ def _collect_stage2_cases(path: Path) -> tuple[list[tuple[dict[str, float], set[
     stage2_cases: list[tuple[dict[str, float], set[str]]] = []
     for row in rows:
         gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
-        scores = _row_trace_scores(row)
+        scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=bool(gt))
         if scores and gt:
             stage2_cases.append((scores, gt))
     return stage2_cases, len(rows)
+
+
+def _collect_meerkat_zero_unmentioned_cases(
+    path: Path,
+    monitor_path: Path | None = None,
+) -> tuple[list[tuple[dict[str, float], set[str]]], int]:
+    rows = _load_rows(path)
+    fallback_by_case = _meerkat_fallback_scores_by_case(path, monitor_path)
+    cases: list[tuple[dict[str, float], set[str]]] = []
+    for idx, row in enumerate(rows):
+        case_id = _row_case_id(row, idx)
+        gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
+        scores = _row_zero_unmentioned_trace_scores(row, fallback_scores=fallback_by_case.get(case_id))
+        if scores and gt:
+            cases.append((scores, gt))
+    return cases, len(rows)
 
 
 def _collect_case_score_pairs(path: Path) -> tuple[list[tuple[int, float]], int]:
     rows = _load_rows(path)
     pairs: list[tuple[int, float]] = []
     for row in rows:
-        scores = _row_trace_scores(row)
+        scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=True)
+        if not scores:
+            continue
+        gt_case_label = 1 if bool(row.get("ground_truth", {}).get("has_distributed_misuse")) else 0
+        pairs.append((gt_case_label, max(scores.values())))
+    return pairs, len(rows)
+
+
+def _collect_meerkat_zero_unmentioned_case_pairs(
+    path: Path,
+    monitor_path: Path | None = None,
+) -> tuple[list[tuple[int, float]], int]:
+    rows = _load_rows(path)
+    fallback_by_case = _meerkat_fallback_scores_by_case(path, monitor_path)
+    pairs: list[tuple[int, float]] = []
+    for idx, row in enumerate(rows):
+        case_id = _row_case_id(row, idx)
+        scores = _row_zero_unmentioned_trace_scores(row, fallback_scores=fallback_by_case.get(case_id))
         if not scores:
             continue
         gt_case_label = 1 if bool(row.get("ground_truth", {}).get("has_distributed_misuse")) else 0
@@ -1017,9 +1367,25 @@ def _collect_case_rows(path: Path) -> tuple[list[tuple[str, dict[str, float], se
     cases: list[tuple[str, dict[str, float], set[str]]] = []
     for idx, row in enumerate(rows):
         gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
-        scores = _row_trace_scores(row)
+        scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=bool(gt))
         if scores and gt:
             cases.append((_row_case_id(row, idx), scores, gt))
+    return cases, len(rows)
+
+
+def _collect_meerkat_zero_unmentioned_case_rows(
+    path: Path,
+    monitor_path: Path | None = None,
+) -> tuple[list[tuple[str, dict[str, float], set[str]]], int]:
+    rows = _load_rows(path)
+    fallback_by_case = _meerkat_fallback_scores_by_case(path, monitor_path)
+    cases: list[tuple[str, dict[str, float], set[str]]] = []
+    for idx, row in enumerate(rows):
+        case_id = _row_case_id(row, idx)
+        gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
+        scores = _row_zero_unmentioned_trace_scores(row, fallback_scores=fallback_by_case.get(case_id))
+        if scores and gt:
+            cases.append((case_id, scores, gt))
     return cases, len(rows)
 
 
@@ -1050,7 +1416,10 @@ def _merged_case_score_pairs_with_monitor(
     pairs: list[tuple[int, float]] = []
     for idx, row in enumerate(rows):
         case_id = _row_case_id(row, idx)
-        agent_scores = _row_trace_scores(row)
+        agent_scores = _row_trace_scores_for_metrics(
+            row,
+            zero_fill_if_missing=True,
+        )
         merged_scores = dict(agent_scores)
         for trace_key, score in (monitor_by_case.get(case_id) or {}).items():
             merged_scores[trace_key] = max(float(merged_scores.get(trace_key, 0.0)), float(score))
@@ -1067,6 +1436,8 @@ def _collect_stage1_case_rows(path: Path) -> tuple[list[tuple[str, dict[str, flo
     for idx, row in enumerate(rows):
         gt = {_normalize_trace_path(x) for x in (row.get("ground_truth", {}).get("harmful_trace_files") or [])}
         scores = _load_stage1_scores_from_repo(Path(str(row.get("repo") or ""))) or {}
+        if not scores and gt:
+            scores = _row_trace_scores_for_metrics(row, zero_fill_if_missing=True)
         if scores and gt:
             cases.append((_row_case_id(row, idx), scores, gt))
     return cases, len(rows)
@@ -1243,9 +1614,9 @@ def _paper_curve_runs(
     *,
     domain: str = "cyber",
     bootstrap_samples: int = 100,
+    bootstrap_cache_dir: Path | None = None,
 ) -> list[PaperCurveRun]:
     candidates = _paper_curve_candidates(results_dir, explicit_inputs, domain=domain)
-
     monitor_paths: dict[tuple[str, int], Path] = {}
     for candidate_path, model_label, method_label, bg in candidates:
         if method_label == "Monitor":
@@ -1254,22 +1625,61 @@ def _paper_curve_runs(
     runs: list[PaperCurveRun] = []
     recall_grid = [i / 20.0 for i in range(21)]
     for path, model_label, method_label, bg in candidates:
+        monitor_path = monitor_paths.get((model_label, bg))
+        cache_payload = {
+            "domain": domain,
+            "path": _path_signature(path),
+            "method_label": method_label,
+            "model_label": model_label,
+            "background_multiplier": bg,
+            "bootstrap_samples": bootstrap_samples,
+            "seed": bg + len(runs) * 17,
+            "ap_seed": bg + len(runs) * 31,
+            "monitor_path": _path_signature(monitor_path),
+        }
+        cached = _read_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="paper_curve_run",
+            payload=cache_payload,
+        )
+        if cached is not None:
+            runs.append(
+                PaperCurveRun(
+                    path=path,
+                    model_label=model_label,
+                    method_label=method_label,
+                    background_multiplier=bg,
+                    case_count=int(cached["case_count"]),
+                    average_precision=(None if cached["average_precision"] is None else float(cached["average_precision"])),
+                    average_precision_bootstrap_se=(
+                        None
+                        if cached["average_precision_bootstrap_se"] is None
+                        else float(cached["average_precision_bootstrap_se"])
+                    ),
+                    recall_grid=[float(x) for x in cached["recall_grid"]],
+                    precision_curve=[float(x) for x in cached["precision_curve"]],
+                    precision_lower=[float(x) for x in cached["precision_lower"]],
+                    precision_upper=[float(x) for x in cached["precision_upper"]],
+                )
+            )
+            continue
         if method_label == "Meerkat":
-            per_case_scores, case_count = _merged_cases_with_monitor(path, monitor_paths.get((model_label, bg)))
+            per_case_scores, case_count = _collect_meerkat_zero_unmentioned_cases(
+                path,
+                monitor_path,
+            )
         else:
             per_case_scores, case_count = _collect_stage2_cases(path)
         if not per_case_scores:
             continue
         ap_values = [_average_precision_for_case(scores, gt) for scores, gt in per_case_scores]
         ap_values = [float(ap) for ap in ap_values if ap is not None]
-        _, curve, _, _ = _average_curves(per_case_scores)
-        recall_grid, lower, upper, ap = _bootstrap_pr_band(
+        recall_grid, mean_precision, lower, upper, ap = _bootstrap_pr_band(
             per_case_scores,
             n_bootstrap=bootstrap_samples,
             seed=bg + len(runs) * 17,
         )
         ap_bootstrap_se = _bootstrap_mean_se(ap_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 31)
-        precision_curve = _interp_precision_at_recalls(curve or [], recall_grid)
         runs.append(
             PaperCurveRun(
                 path=path,
@@ -1280,10 +1690,127 @@ def _paper_curve_runs(
                 average_precision=ap,
                 average_precision_bootstrap_se=ap_bootstrap_se,
                 recall_grid=recall_grid,
-                precision_curve=precision_curve,
+                precision_curve=mean_precision,
                 precision_lower=lower,
                 precision_upper=upper,
             )
+        )
+        _write_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="paper_curve_run",
+            payload=cache_payload,
+            value={
+                "case_count": case_count,
+                "average_precision": ap,
+                "average_precision_bootstrap_se": ap_bootstrap_se,
+                "recall_grid": recall_grid,
+                "precision_curve": mean_precision,
+                "precision_lower": lower,
+                "precision_upper": upper,
+            },
+        )
+    return runs
+
+
+def _paper_roc_runs(
+    results_dir: Path,
+    explicit_inputs: list[Path] | None = None,
+    *,
+    domain: str = "cyber",
+    bootstrap_samples: int = 100,
+    bootstrap_cache_dir: Path | None = None,
+) -> list[PaperRocRun]:
+    candidates = _paper_curve_candidates(results_dir, explicit_inputs, domain=domain)
+    monitor_paths: dict[tuple[str, int], Path] = {}
+    for candidate_path, model_label, method_label, bg in candidates:
+        if method_label == "Monitor":
+            monitor_paths[(model_label, bg)] = candidate_path
+
+    runs: list[PaperRocRun] = []
+    fpr_grid = [i / 20.0 for i in range(21)]
+    for path, model_label, method_label, bg in candidates:
+        monitor_path = monitor_paths.get((model_label, bg))
+        cache_payload = {
+            "domain": domain,
+            "path": _path_signature(path),
+            "method_label": method_label,
+            "model_label": model_label,
+            "background_multiplier": bg,
+            "bootstrap_samples": bootstrap_samples,
+            "seed": bg + len(runs) * 19,
+            "auc_seed": bg + len(runs) * 37,
+            "monitor_path": _path_signature(monitor_path),
+        }
+        cached = _read_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="paper_roc_run",
+            payload=cache_payload,
+        )
+        if cached is not None:
+            runs.append(
+                PaperRocRun(
+                    path=path,
+                    model_label=model_label,
+                    method_label=method_label,
+                    background_multiplier=bg,
+                    case_count=int(cached["case_count"]),
+                    roc_auc=None if cached["roc_auc"] is None else float(cached["roc_auc"]),
+                    roc_auc_bootstrap_se=(
+                        None if cached["roc_auc_bootstrap_se"] is None else float(cached["roc_auc_bootstrap_se"])
+                    ),
+                    fpr_grid=[float(x) for x in cached["fpr_grid"]],
+                    tpr_curve=[float(x) for x in cached["tpr_curve"]],
+                    tpr_lower=[float(x) for x in cached["tpr_lower"]],
+                    tpr_upper=[float(x) for x in cached["tpr_upper"]],
+                )
+            )
+            continue
+        if method_label == "Meerkat":
+            per_case_scores, case_count = _collect_meerkat_zero_unmentioned_cases(
+                path,
+                monitor_path,
+            )
+        else:
+            per_case_scores, case_count = _collect_stage2_cases(path)
+        if not per_case_scores:
+            continue
+        roc_values = [_roc_auc_for_case(scores, gt) for scores, gt in per_case_scores]
+        roc_values = [float(auc) for auc in roc_values if auc is not None]
+        fpr_grid, lower, upper, roc_auc = _bootstrap_roc_band(
+            per_case_scores,
+            n_bootstrap=bootstrap_samples,
+            seed=bg + len(runs) * 19,
+        )
+        roc_auc_bootstrap_se = _bootstrap_mean_se(roc_values, n_bootstrap=bootstrap_samples, seed=bg + len(runs) * 37)
+        tpr_curve = _mean_tpr_at_fprs(per_case_scores, fpr_grid)
+        runs.append(
+            PaperRocRun(
+                path=path,
+                model_label=model_label,
+                method_label=method_label,
+                background_multiplier=bg,
+                case_count=case_count,
+                roc_auc=roc_auc,
+                roc_auc_bootstrap_se=roc_auc_bootstrap_se,
+                fpr_grid=fpr_grid,
+                tpr_curve=tpr_curve,
+                tpr_lower=lower,
+                tpr_upper=upper,
+            )
+        )
+        _write_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="paper_roc_run",
+            payload=cache_payload,
+            value={
+                "case_count": case_count,
+                "roc_auc": roc_auc,
+                "roc_auc_bootstrap_se": roc_auc_bootstrap_se,
+                "fpr_grid": fpr_grid,
+                "tpr_curve": tpr_curve,
+                "tpr_lower": lower,
+                "tpr_upper": upper,
+            },
         )
     return runs
 
@@ -1303,15 +1830,15 @@ def _meerkat_vs_monitor_rocauc_points(
             if method_label != "Meerkat":
                 continue
             monitor_path = monitor_paths.get((model_label, bg))
-            merged_cases, _ = _merged_case_rows_with_monitor(path, monitor_path)
+            meerkat_cases, _ = _collect_meerkat_zero_unmentioned_case_rows(path, monitor_path)
             monitor_cases, _ = _collect_monitor_case_rows(path, monitor_path)
             monitor_by_case = {case_id: scores for case_id, scores, _ in monitor_cases}
-            for case_id, merged_scores, gt in merged_cases:
+            for case_id, meerkat_scores, gt in meerkat_cases:
                 monitor_scores = monitor_by_case.get(case_id)
                 if not monitor_scores or not gt:
                     continue
                 monitor_rocauc = _roc_auc_for_case(monitor_scores, gt)
-                meerkat_rocauc = _roc_auc_for_case(merged_scores, gt)
+                meerkat_rocauc = _roc_auc_for_case(meerkat_scores, gt)
                 if monitor_rocauc is None or meerkat_rocauc is None:
                     continue
                 points.append(
@@ -1335,10 +1862,30 @@ def _method_metric_summary(
     metric_key: str,
     bootstrap_samples: int,
     seed: int,
+    bootstrap_cache_dir: Path | None = None,
 ) -> tuple[float | None, float | None]:
+    cache_payload = {
+        "path": _path_signature(path),
+        "method_label": method_label,
+        "monitor_path": _path_signature(monitor_path),
+        "metric_key": metric_key,
+        "bootstrap_samples": bootstrap_samples,
+        "seed": seed,
+    }
+    cached = _read_bootstrap_cache(
+        bootstrap_cache_dir,
+        kind="method_metric_summary",
+        payload=cache_payload,
+    )
+    if cached is not None:
+        return (
+            None if cached["mean_value"] is None else float(cached["mean_value"]),
+            None if cached["se_value"] is None else float(cached["se_value"]),
+        )
+
     if metric_key == "trace_ap":
         if method_label == "Meerkat":
-            per_case_scores, _ = _merged_cases_with_monitor(path, monitor_path)
+            per_case_scores, _ = _collect_meerkat_zero_unmentioned_cases(path, monitor_path)
         else:
             per_case_scores, _ = _collect_stage2_cases(path)
         if not per_case_scores:
@@ -1348,11 +1895,18 @@ def _method_metric_summary(
         if not values:
             return None, None
         mean_value = sum(values) / len(values)
-        return mean_value, _bootstrap_mean_se(values, n_bootstrap=bootstrap_samples, seed=seed)
+        se_value = _bootstrap_mean_se(values, n_bootstrap=bootstrap_samples, seed=seed)
+        _write_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="method_metric_summary",
+            payload=cache_payload,
+            value={"mean_value": mean_value, "se_value": se_value},
+        )
+        return mean_value, se_value
 
     if metric_key == "trace_roc_auc":
         if method_label == "Meerkat":
-            per_case_scores, _ = _merged_cases_with_monitor(path, monitor_path)
+            per_case_scores, _ = _collect_meerkat_zero_unmentioned_cases(path, monitor_path)
         else:
             per_case_scores, _ = _collect_stage2_cases(path)
         if not per_case_scores:
@@ -1362,11 +1916,18 @@ def _method_metric_summary(
         if not values:
             return None, None
         mean_value = sum(values) / len(values)
-        return mean_value, _bootstrap_mean_se(values, n_bootstrap=bootstrap_samples, seed=seed)
+        se_value = _bootstrap_mean_se(values, n_bootstrap=bootstrap_samples, seed=seed)
+        _write_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="method_metric_summary",
+            payload=cache_payload,
+            value={"mean_value": mean_value, "se_value": se_value},
+        )
+        return mean_value, se_value
 
     if metric_key == "case_ap":
         if method_label == "Meerkat":
-            case_pairs, _ = _merged_case_score_pairs_with_monitor(path, monitor_path)
+            case_pairs, _ = _collect_meerkat_zero_unmentioned_case_pairs(path, monitor_path)
         else:
             case_pairs, _ = _collect_case_score_pairs(path)
         if not case_pairs:
@@ -1374,16 +1935,23 @@ def _method_metric_summary(
         mean_value = _flat_average_precision(case_pairs)
         if mean_value is None:
             return None, None
-        return mean_value, _bootstrap_flat_metric_se(
+        se_value = _bootstrap_flat_metric_se(
             case_pairs,
             _flat_average_precision,
             n_bootstrap=bootstrap_samples,
             seed=seed,
         )
+        _write_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="method_metric_summary",
+            payload=cache_payload,
+            value={"mean_value": mean_value, "se_value": se_value},
+        )
+        return mean_value, se_value
 
     if metric_key == "case_roc_auc":
         if method_label == "Meerkat":
-            case_pairs, _ = _merged_case_score_pairs_with_monitor(path, monitor_path)
+            case_pairs, _ = _collect_meerkat_zero_unmentioned_case_pairs(path, monitor_path)
         else:
             case_pairs, _ = _collect_case_score_pairs(path)
         if not case_pairs:
@@ -1391,12 +1959,19 @@ def _method_metric_summary(
         mean_value = _flat_roc_auc(case_pairs)
         if mean_value is None:
             return None, None
-        return mean_value, _bootstrap_flat_metric_se(
+        se_value = _bootstrap_flat_metric_se(
             case_pairs,
             _flat_roc_auc,
             n_bootstrap=bootstrap_samples,
             seed=seed,
         )
+        _write_bootstrap_cache(
+            bootstrap_cache_dir,
+            kind="method_metric_summary",
+            payload=cache_payload,
+            value={"mean_value": mean_value, "se_value": se_value},
+        )
+        return mean_value, se_value
 
     raise ValueError(f"Unsupported metric_key: {metric_key}")
 
@@ -1684,8 +2259,14 @@ def _plot_main_paper_pr_figure(
     stage1_concurrency: int,
     stage1_cache_dir: Path,
     bootstrap_samples: int,
+    bootstrap_cache_dir: Path | None,
 ) -> list[Path]:
-    runs = _paper_curve_runs(results_dir, input_paths, bootstrap_samples=bootstrap_samples)
+    runs = _paper_curve_runs(
+        results_dir,
+        input_paths,
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
+    )
     if not runs:
         return []
     with mpl.rc_context(
@@ -1809,8 +2390,15 @@ def _plot_bio_paper_pr_figure(
     figure_formats: list[str],
     input_paths: list[Path],
     bootstrap_samples: int,
+    bootstrap_cache_dir: Path | None,
 ) -> list[Path]:
-    runs = _paper_curve_runs(results_dir, input_paths, domain="bio", bootstrap_samples=bootstrap_samples)
+    runs = _paper_curve_runs(
+        results_dir,
+        input_paths,
+        domain="bio",
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
+    )
     if not runs:
         return []
     with mpl.rc_context(
@@ -1934,10 +2522,23 @@ def _plot_combined_paper_pr_figure(
     figure_formats: list[str],
     input_paths: list[Path],
     bootstrap_samples: int,
+    bootstrap_cache_dir: Path | None,
 ) -> list[Path]:
-    cyber_runs = _paper_curve_runs(results_dir, input_paths, domain="cyber", bootstrap_samples=bootstrap_samples)
-    bio_runs = _paper_curve_runs(results_dir, input_paths, domain="bio", bootstrap_samples=bootstrap_samples)
-    runs = cyber_runs + bio_runs
+    cyber_runs = _paper_curve_runs(
+        results_dir,
+        input_paths,
+        domain="cyber",
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
+    )
+    bio_runs = _paper_curve_runs(
+        results_dir,
+        input_paths,
+        domain="bio",
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
+    )
+    runs = list(cyber_runs + bio_runs)
     if not runs:
         return []
     with mpl.rc_context(_dm_rc_context()):
@@ -1971,20 +2572,38 @@ def _plot_combined_paper_pr_figure(
             if not panel_runs:
                 ax.axis("off")
                 continue
+            panel_ap_by_method = {run.method_label: run.average_precision for run in panel_runs}
             for run in panel_runs:
                 color = DM_METHOD_COLORS.get(run.method_label, "#555555")
                 linestyle = DM_METHOD_LINESTYLES.get(run.method_label, "-")
-                recall_grid = _clip_recall_for_log(run.recall_grid)
-                lower = _clip_precision_for_log(run.precision_lower)
-                upper = _clip_precision_for_log(run.precision_upper)
-                precision_curve = _clip_precision_for_log(run.precision_curve)
+                recall_grid = [float(x) for x in run.recall_grid]
+                lower = [float(x) for x in run.precision_lower]
+                upper = [float(x) for x in run.precision_upper]
+                precision_curve = [float(x) for x in run.precision_curve]
                 layer_zorder = method_zorder.get(run.method_label, 1)
+                line_width = 1.8
+                marker = None
+                markevery = None
+                band_alpha = 0.10
+                if run.method_label == "Meerkat":
+                    line_width = 2.3
+                    marker = "o"
+                    markevery = 4
+                    band_alpha = 0.12
+                elif run.method_label == "Naive Agent":
+                    line_width = 1.9
+                    marker = "s"
+                    markevery = 4
+                    band_alpha = 0.08
+                else:
+                    line_width = 1.5
+                    band_alpha = 0.05
                 ax.fill_between(
                     recall_grid,
                     lower,
                     upper,
                     color=color,
-                    alpha=0.14,
+                    alpha=band_alpha,
                     linewidth=0.0,
                     zorder=layer_zorder,
                 )
@@ -1993,21 +2612,18 @@ def _plot_combined_paper_pr_figure(
                     precision_curve,
                     color=color,
                     linestyle=linestyle,
-                    linewidth=1.8,
+                    linewidth=line_width,
+                    marker=marker,
+                    markersize=2.6 if marker else 0,
+                    markevery=markevery,
                     zorder=10 + layer_zorder,
                 )
             _, domain, bg = panel_key
             domain_label = "Cyber" if domain == "cyber" else "Bio"
-            ax.set_xscale("log")
-            ax.set_xlim(RECALL_LOG_FLOOR, 1.0)
-            ax.set_yscale("log")
-            ax.set_ylim(PR_LOG_FLOOR, 1.02)
-            ax.set_xticks([RECALL_LOG_FLOOR, 0.1, 1.0])
-            ax.set_xticklabels([f"{RECALL_LOG_FLOOR:.2f}", "0.1", "1.0"])
-            ax.set_yticks([PR_LOG_FLOOR, 0.1, 1.0])
-            ax.set_yticklabels([f"{PR_LOG_FLOOR:.2f}", "0.1", "1.0"])
-            ax.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
-            ax.yaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.02)
+            ax.set_xticks([0.0, 0.5, 1.0])
+            ax.set_yticks([0.0, 0.5, 1.0])
             ax.tick_params(labelsize=TICK_LABEL_FONTSIZE)
             x_label = "Recall" if panel_key[0] == "Qwen-3.5" else None
             y_label = None
@@ -2015,6 +2631,127 @@ def _plot_combined_paper_pr_figure(
                 y_label = "gpt-5.4-mini\nPrecision"
             elif panel_key == ("Qwen-3.5", "cyber", 20):
                 y_label = "Qwen-3.5\nPrecision"
+            title = f"{domain_label} (bg={bg}x)"
+            _style_dm_axis(ax, x_label=x_label, y_label=y_label, title=title)
+            if panel_key not in (("gpt-5.4-mini", "cyber", 20), ("Qwen-3.5", "cyber", 20)):
+                ax.tick_params(labelleft=False)
+
+        fig.legend(
+            shared_legend_handles,
+            present_methods,
+            loc="upper center",
+            ncol=max(1, len(present_methods)),
+            frameon=False,
+            fontsize=LEGEND_FONTSIZE,
+            handlelength=1.7,
+            columnspacing=0.9,
+            bbox_to_anchor=(0.5, 1.01),
+        )
+        fig.subplots_adjust(top=0.84, left=0.10, right=0.985, bottom=0.16)
+
+        output_paths: list[Path] = []
+        out_base = figures_dir / "dm_combined_paper_pr_curves"
+        for fmt in figure_formats:
+            out_path = out_base.with_suffix(f".{fmt}")
+            fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
+            output_paths.append(out_path)
+        plt.close(fig)
+        return output_paths
+
+
+def _plot_combined_paper_roc_figure(
+    *,
+    results_dir: Path,
+    figures_dir: Path,
+    figure_formats: list[str],
+    input_paths: list[Path],
+    bootstrap_samples: int,
+    bootstrap_cache_dir: Path | None,
+) -> list[Path]:
+    cyber_runs = _paper_roc_runs(
+        results_dir,
+        input_paths,
+        domain="cyber",
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
+    )
+    bio_runs = _paper_roc_runs(
+        results_dir,
+        input_paths,
+        domain="bio",
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
+    )
+    runs = cyber_runs + bio_runs
+    if not runs:
+        return []
+    with mpl.rc_context(_dm_rc_context()):
+        fig = plt.figure(figsize=(5.55, 2.95))
+        grid = fig.add_gridspec(2, 4, hspace=0.34, wspace=0.22)
+        axes = {
+            ("gpt-5.4-mini", "cyber", 20): fig.add_subplot(grid[0, 0]),
+            ("gpt-5.4-mini", "cyber", 100): fig.add_subplot(grid[0, 1]),
+            ("gpt-5.4-mini", "bio", 20): fig.add_subplot(grid[0, 2]),
+            ("gpt-5.4-mini", "bio", 100): fig.add_subplot(grid[0, 3]),
+            ("Qwen-3.5", "cyber", 20): fig.add_subplot(grid[1, 0]),
+            ("Qwen-3.5", "cyber", 100): fig.add_subplot(grid[1, 1]),
+            ("Qwen-3.5", "bio", 20): fig.add_subplot(grid[1, 2]),
+            ("Qwen-3.5", "bio", 100): fig.add_subplot(grid[1, 3]),
+        }
+        runs_by_panel: dict[tuple[str, str, int], list[PaperRocRun]] = {}
+        for run in cyber_runs:
+            runs_by_panel.setdefault((run.model_label, "cyber", run.background_multiplier), []).append(run)
+        for run in bio_runs:
+            runs_by_panel.setdefault((run.model_label, "bio", run.background_multiplier), []).append(run)
+        present_methods = [method for method in DM_METHOD_ORDER if any(run.method_label == method for run in runs)]
+        shared_legend_handles = _dm_legend_handles(linewidth=1.8, method_order=present_methods)
+        method_layer_order = [method for method in DM_METHOD_ORDER if method != "Meerkat"] + ["Meerkat"]
+        method_zorder = {method: idx for idx, method in enumerate(method_layer_order, start=1)}
+
+        for panel_key, ax in axes.items():
+            panel_runs = sorted(
+                runs_by_panel.get(panel_key, []),
+                key=lambda run: DM_METHOD_ORDER.index(run.method_label) if run.method_label in DM_METHOD_ORDER else 99,
+            )
+            if not panel_runs:
+                ax.axis("off")
+                continue
+            ax.plot([0.0, 1.0], [0.0, 1.0], color="#999999", linewidth=0.8, linestyle=":", zorder=0)
+            for run in panel_runs:
+                color = DM_METHOD_COLORS.get(run.method_label, "#555555")
+                linestyle = DM_METHOD_LINESTYLES.get(run.method_label, "-")
+                layer_zorder = method_zorder.get(run.method_label, 1)
+                ax.fill_between(
+                    run.fpr_grid,
+                    run.tpr_lower,
+                    run.tpr_upper,
+                    color=color,
+                    alpha=0.14,
+                    linewidth=0.0,
+                    zorder=layer_zorder,
+                )
+                ax.plot(
+                    run.fpr_grid,
+                    run.tpr_curve,
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=1.8,
+                    zorder=10 + layer_zorder,
+                )
+            _, domain, bg = panel_key
+            domain_label = "Cyber" if domain == "cyber" else "Bio"
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.02)
+            ax.set_xticks([0.0, 0.5, 1.0])
+            ax.set_yticks([0.0, 0.5, 1.0])
+            ax.tick_params(labelsize=TICK_LABEL_FONTSIZE)
+            ax.grid(alpha=0.25)
+            x_label = "False Positive Rate" if panel_key[0] == "Qwen-3.5" else None
+            y_label = None
+            if panel_key == ("gpt-5.4-mini", "cyber", 20):
+                y_label = "gpt-5.4-mini\nTrue Positive Rate"
+            elif panel_key == ("Qwen-3.5", "cyber", 20):
+                y_label = "Qwen-3.5\nTrue Positive Rate"
             _style_dm_axis(ax, x_label=x_label, y_label=y_label, title=f"{domain_label} (bg={bg}x)")
             if panel_key not in (("gpt-5.4-mini", "cyber", 20), ("Qwen-3.5", "cyber", 20)):
                 ax.tick_params(labelleft=False)
@@ -2024,17 +2761,17 @@ def _plot_combined_paper_pr_figure(
             legend_ax.legend(
                 shared_legend_handles,
                 present_methods,
-                loc="lower left",
+                loc="lower right",
                 frameon=False,
                 fontsize=LEGEND_FONTSIZE,
                 handlelength=1.7,
                 borderaxespad=0.15,
                 labelspacing=0.18,
             )
-        fig.subplots_adjust(top=0.92, left=0.10, right=0.985, bottom=0.16)
+        fig.subplots_adjust(top=0.92, left=0.12, right=0.985, bottom=0.16)
 
         output_paths: list[Path] = []
-        out_base = figures_dir / "dm_combined_paper_pr_curves"
+        out_base = figures_dir / "dm_combined_paper_roc_curves"
         for fmt in figure_formats:
             out_path = out_base.with_suffix(f".{fmt}")
             fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
@@ -2140,6 +2877,7 @@ def _write_paper_metric_tables(
     output_dir: Path,
     *,
     bootstrap_samples: int,
+    bootstrap_cache_dir: Path | None,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_paths: list[Path] = []
@@ -2211,6 +2949,7 @@ def _write_paper_metric_tables(
                     metric_key=metric_key,
                     bootstrap_samples=bootstrap_samples,
                     seed=bg + len(rows) * 31 + (17 if model_label == "Qwen-3.5" else 0),
+                    bootstrap_cache_dir=bootstrap_cache_dir,
                 )
             domain_label = "DM-Cyber" if domain == "cyber" else "DM-Bio"
             bg_order = sorted({bg for _, bg in rows})
@@ -2273,9 +3012,21 @@ def _write_paper_metric_tables(
     return output_paths
 
 
-def _print_paper_run_summary(results_dir: Path, input_paths: list[Path]) -> None:
+def _print_paper_run_summary(
+    results_dir: Path,
+    input_paths: list[Path],
+    *,
+    bootstrap_samples: int,
+    bootstrap_cache_dir: Path | None,
+) -> None:
     for domain in ("cyber", "bio"):
-        runs = _paper_curve_runs(results_dir, input_paths, domain=domain)
+        runs = _paper_curve_runs(
+            results_dir,
+            input_paths,
+            domain=domain,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_cache_dir=bootstrap_cache_dir,
+        )
         if not runs:
             continue
         print(f"\n| {domain} model | bg | method | cases | trace_ap | file |")
@@ -2310,6 +3061,7 @@ def main() -> None:
     figures_dir.mkdir(parents=True, exist_ok=True)
     figure_formats = [fmt.strip() for fmt in args.figure_formats.split(",") if fmt.strip()]
     stage1_cache_dir = Path(args.stage1_cache_dir)
+    bootstrap_cache_dir = Path(args.bootstrap_cache_dir)
 
     metrics: list[SettingMetrics] = []
     for path in input_paths:
@@ -2328,7 +3080,12 @@ def main() -> None:
         raise SystemExit("No matching distributed-misuse JSONL files to analyze.")
 
     _print_summary_table(metrics)
-    _print_paper_run_summary(Path(args.results_dir), explicit_input_paths or [])
+    _print_paper_run_summary(
+        Path(args.results_dir),
+        explicit_input_paths or [],
+        bootstrap_samples=args.bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
+    )
     figure_paths: list[Path] = []
     figure_paths.extend(
         _plot_main_paper_pr_figure(
@@ -2340,6 +3097,7 @@ def main() -> None:
             stage1_concurrency=args.stage1_concurrency,
             stage1_cache_dir=stage1_cache_dir,
             bootstrap_samples=args.bootstrap_samples,
+            bootstrap_cache_dir=bootstrap_cache_dir,
         )
     )
     figure_paths.extend(
@@ -2349,6 +3107,7 @@ def main() -> None:
             figure_formats=figure_formats,
             input_paths=explicit_input_paths or [],
             bootstrap_samples=args.bootstrap_samples,
+            bootstrap_cache_dir=bootstrap_cache_dir,
         )
     )
     figure_paths.extend(
@@ -2358,6 +3117,17 @@ def main() -> None:
             figure_formats=figure_formats,
             input_paths=explicit_input_paths or [],
             bootstrap_samples=args.bootstrap_samples,
+            bootstrap_cache_dir=bootstrap_cache_dir,
+        )
+    )
+    figure_paths.extend(
+        _plot_combined_paper_roc_figure(
+            results_dir=Path(args.results_dir),
+            figures_dir=figures_dir,
+            figure_formats=figure_formats,
+            input_paths=explicit_input_paths or [],
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_cache_dir=bootstrap_cache_dir,
         )
     )
     figure_paths.extend(
@@ -2373,6 +3143,7 @@ def main() -> None:
         explicit_input_paths or [],
         figures_dir,
         bootstrap_samples=args.bootstrap_samples,
+        bootstrap_cache_dir=bootstrap_cache_dir,
     )
 
     print("\nWrote outputs:")

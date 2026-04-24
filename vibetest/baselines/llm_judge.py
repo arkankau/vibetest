@@ -15,7 +15,6 @@ from inspect_ai.model import ChatMessageUser
 from inspect_ai.scorer import includes
 from inspect_ai.solver import Generate, TaskState, solver
 
-from vibetest.agent.react_agent import cleanup_docker_sandbox, setup_docker_sandbox
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.usage import usage_payload_from_sample
 
@@ -49,6 +48,30 @@ _SCORE_RE = re.compile(
 def _default_judge_model() -> str:
     return os.getenv("VIBETEST_LLM_JUDGE_MODEL", "openai/gpt-5-mini")
 
+
+
+
+def _judge_prefers_disable_thinking(model_name: str | None) -> bool:
+    name = str(model_name or "").lower()
+    return "qwen" in name and ("3.5" in name or "3_5" in name)
+
+
+def _effective_judge_disable_thinking(model_name: str | None, disable_thinking: bool | None) -> bool:
+    if disable_thinking is not None:
+        return disable_thinking
+    return _judge_prefers_disable_thinking(model_name)
+
+
+def _effective_judge_reasoning_effort(
+    model_name: str | None,
+    reasoning_effort: str | None,
+    disable_thinking: bool | None,
+) -> str | None:
+    if reasoning_effort is not None:
+        return reasoning_effort
+    if _effective_judge_disable_thinking(model_name, disable_thinking):
+        return None
+    return "low"
 
 def render_impossiblebench_judge_prompt(
     transcript_dump: str,
@@ -152,14 +175,25 @@ async def _run_llm_judge_async(
     max_tokens: int,
     temperature: float,
     timeout_s: int,
+    max_connections: int | None = None,
     prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
+    reasoning_effort: str | None = None,
+    disable_thinking: bool | None = None,
 ) -> dict[str, Any]:
     prompt = render_impossiblebench_judge_prompt(transcript_dump, prompt_template=prompt_template)
+    resolved_disable_thinking = _effective_judge_disable_thinking(model_name, disable_thinking)
+    resolved_reasoning_effort = _effective_judge_reasoning_effort(model_name, reasoning_effort, disable_thinking)
+    extra_body: dict[str, Any] | None = None
+    if resolved_disable_thinking:
+        extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
     model = get_model(
         model_name,
         config=GenerateConfig(
             temperature=temperature,
             max_tokens=max_tokens,
+            max_connections=max_connections,
+            reasoning_effort=resolved_reasoning_effort,
+            extra_body=extra_body,
         ),
     )
     try:
@@ -212,10 +246,19 @@ def run_llm_judge(
     max_tokens: int = 1200,
     temperature: float = 0.0,
     timeout_s: int = 180,
+    max_connections: int | None = None,
     prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
+    reasoning_effort: str | None = None,
+    disable_thinking: bool | None = None,
 ) -> dict[str, Any]:
     """Run the safety/property judge over a transcript dump."""
     chosen_model = model_name or _default_judge_model()
+    resolved_reasoning_effort = _effective_judge_reasoning_effort(
+        chosen_model,
+        reasoning_effort,
+        disable_thinking,
+    )
+    resolved_disable_thinking = _effective_judge_disable_thinking(chosen_model, disable_thinking)
     return _run_async(
         _run_llm_judge_async(
             transcript_dump,
@@ -223,7 +266,10 @@ def run_llm_judge(
             max_tokens=max_tokens,
             temperature=temperature,
             timeout_s=timeout_s,
+            max_connections=max_connections,
             prompt_template=prompt_template,
+            reasoning_effort=resolved_reasoning_effort,
+            disable_thinking=resolved_disable_thinking,
         )
     )
 
@@ -233,7 +279,10 @@ def impossiblebench_judge_solver(
     *,
     max_tokens: int = 1200,
     temperature: float = 0.0,
+    max_connections: int | None = None,
     prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
+    reasoning_effort: str | None = None,
+    disable_thinking: bool | None = None,
 ) -> Any:
     """Inspect solver that applies the safety/property judge prompt."""
 
@@ -241,10 +290,18 @@ def impossiblebench_judge_solver(
         transcript_dump = str(state.input_text or state.input or "")
         prompt = render_impossiblebench_judge_prompt(transcript_dump, prompt_template=prompt_template)
         state.messages = [ChatMessageUser(content=prompt)]
+        resolved_disable_thinking = _effective_judge_disable_thinking(None, disable_thinking)
+        resolved_reasoning_effort = _effective_judge_reasoning_effort(None, reasoning_effort, disable_thinking)
+        extra_body: dict[str, Any] | None = None
+        if resolved_disable_thinking:
+            extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
         return await generate(
             state,
             max_tokens=max_tokens,
             temperature=temperature,
+            max_connections=max_connections,
+            reasoning_effort=resolved_reasoning_effort,
+            extra_body=extra_body,
         )
 
     return solve
@@ -264,20 +321,29 @@ class LLMJudgeBaseline:
         temperature: float = 0.0,
         log_dir: str = "./logs",
         retry_on_error: int = 1,
+        concurrency: int = 50,
         prompt_template: str = IMPOSSIBLEBENCH_JUDGE_PROMPT,
+        reasoning_effort: str | None = None,
+        disable_thinking: bool | None = None,
     ) -> None:
         self.model_name = model or _default_judge_model()
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.log_dir = log_dir
         self.retry_on_error = retry_on_error
+        self.concurrency = max(1, int(concurrency))
         self.prompt_template = prompt_template
+        self.reasoning_effort = _effective_judge_reasoning_effort(self.model_name, reasoning_effort, disable_thinking)
+        self.disable_thinking = _effective_judge_disable_thinking(self.model_name, disable_thinking)
 
     def _create_solver(self):
         return impossiblebench_judge_solver(
             max_tokens=self.max_tokens,
             temperature=self.temperature,
+            max_connections=self.concurrency,
             prompt_template=self.prompt_template,
+            reasoning_effort=self.reasoning_effort,
+            disable_thinking=self.disable_thinking,
         )
 
     @staticmethod
@@ -326,13 +392,6 @@ class LLMJudgeBaseline:
         sandbox: str | None = None,
     ) -> list[TestResult]:
         """Run Inspect eval over transcript samples and return parsed TestResults."""
-        sandbox_config = None
-        temp_dir_to_cleanup = None
-        if sandbox == "docker":
-            sandbox_config, temp_dir_to_cleanup = setup_docker_sandbox()
-        elif sandbox is not None:
-            sandbox_config = sandbox
-
         id_to_test_case: dict[str, TestCase] = {}
         samples: list[Sample] = []
 
@@ -352,20 +411,28 @@ class LLMJudgeBaseline:
             dataset=samples,
             solver=self._create_solver(),
             scorer=includes(),
-            sandbox=sandbox_config,
+            config=GenerateConfig(
+                max_connections=self.concurrency,
+                reasoning_effort=self.reasoning_effort,
+                extra_body=(
+                    {"chat_template_kwargs": {"enable_thinking": False}}
+                    if self.disable_thinking
+                    else None
+                ),
+            ),
+            # The judge solver is a single model call over in-memory transcript text and
+            # does not need filesystem/tools access, so avoid per-sample sandbox setup.
+            sandbox=None,
         )
-        try:
-            results = eval(
-                tasks=task,
-                model=self.model_name,
-                log_dir=self.log_dir,
-                retry_on_error=self.retry_on_error,
-                fail_on_error=False,
-            )
-            return self._parse_results(results, id_to_test_case)
-        finally:
-            if sandbox == "docker" and temp_dir_to_cleanup is not None:
-                cleanup_docker_sandbox(temp_dir_to_cleanup)
+        results = eval(
+            tasks=task,
+            model=self.model_name,
+            log_dir=self.log_dir,
+            retry_on_error=self.retry_on_error,
+            fail_on_error=False,
+            max_samples=self.concurrency,
+        )
+        return self._parse_results(results, id_to_test_case)
 
     def _parse_results(
         self,
