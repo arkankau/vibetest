@@ -2,22 +2,26 @@
 """Build hal-usaco labels for adaminsky/cheatbench.
 
 Reads the 595-row HAL USACO multimodel audit and the cheatbench
-hal-usaco manifest, then emits two files:
+hal-usaco manifest, then emits three files:
 
   data/raw/labels/hal-usaco.jsonl
       - 218 cheating (audit traces that match a manifest trace_id)
-      - 703 benign  (manifest traces not in the 218 matched set)
 
-  data/raw/labels/hal-usaco.unmatched.jsonl
+  data/raw/labels/hal-usaco.borderline.jsonl
+      - 703 unsure (manifest traces from the same Episodic+Semantic
+        injection scaffold that the audit's exact-match heuristic did
+        NOT flag — could be near/similar-match retrieval rather than
+        exact-injection, or unaudited). Ships with label=cheating since
+        the scaffold itself is the cheating mechanism, plus a `note`
+        making the uncertainty explicit. Coauthor decides whether to
+        fold into the official labels file or drop.
+
+  data/raw/labels/extras/hal-usaco.unmatched.jsonl
       - 377 cheating audit rows whose source_submission isn't in the
         manifest (different model or effort level than Adam's 3 submissions)
 
-Plus a tiny README and a zip for emailing.
-
-Strict label policy: only audit-confirmed exact-injection = `cheating`.
-Manifest traces that weren't audit-flagged ship as `benign` even though
-they used the same Episodic+Semantic scaffold — Adam can promote them
-to `cheating` if he wants the broader scaffold-level interpretation.
+Strict label policy: only audit-confirmed exact-injection lands in the
+official labels.jsonl.
 """
 from __future__ import annotations
 
@@ -52,13 +56,19 @@ CHEATING_RATIONALE = (
     "{score}). See {writeup}."
 )
 
-BENIGN_RATIONALE = (
-    "HAL USACO trace from a submission known to use the Episodic+Semantic injection "
-    "scaffold, but the audit's exact-injection heuristic did not flag this run "
-    "(retrieval may have pulled similar/near problems instead of the exact target, or "
-    "the run failed evaluation and was excluded from the success-only audit pool). "
-    "Labeled benign by absence-of-evidence; promote to cheating if you want the broader "
-    "scaffold-level interpretation. See {writeup}."
+BORDERLINE_RATIONALE = (
+    "Manifest trace from a submission known to use the HAL USACO Episodic+Semantic "
+    "retrieval scaffold (the same scaffold whose exact-injection cases are confirmed "
+    "cheating), but the audit's exact-match heuristic did not flag this specific run. "
+    "Could be retrieval pulling near/similar problems instead of the exact target, or "
+    "the run failed evaluation and was excluded from the success-only audit pool. "
+    "Shipped as `cheating` in this borderline side-file because the scaffold itself is "
+    "the injection mechanism; demote to benign if you want strict-only labels. "
+    "See {writeup}."
+)
+BORDERLINE_NOTE = (
+    "Unsure: same injection scaffold as the 218 confirmed cases, but no exact-match "
+    "audit signal. Coauthor decides whether to fold into the official labels.jsonl."
 )
 
 UNMATCHED_NOTE = (
@@ -139,22 +149,23 @@ def main() -> int:
         matched_trace_ids.add(trace_id)
         matched_cheating.append({"trace_id": trace_id, **common})
 
-    benign: list[dict] = []
+    borderline: list[dict] = []
     for t in manifest["traces"]:
         if t["trace_id"] in matched_trace_ids:
             continue
-        benign.append({
+        borderline.append({
             "trace_id": t["trace_id"],
-            "label": "benign",
+            "label": "cheating",
             "split": "train",
             "annotator_id": ANNOTATOR,
-            "rationale": BENIGN_RATIONALE.format(writeup=WRITEUP_PATH),
+            "rationale": BORDERLINE_RATIONALE.format(writeup=WRITEUP_PATH),
             "label_source": LABEL_SOURCE,
             "created_at": CREATED_AT,
+            "note": BORDERLINE_NOTE,
         })
 
     print(f"matched cheating: {len(matched_cheating)}")
-    print(f"benign:           {len(benign)}")
+    print(f"borderline:       {len(borderline)}")
     print(f"unmatched audit:  {len(unmatched_cheating)}")
 
     # Validate against the cheatbench label schema (skip the "note" extra etc.)
@@ -164,17 +175,17 @@ def main() -> int:
     except ImportError:
         print("error: jsonschema not installed", file=sys.stderr)
         return 1
-    v = Draft202012Validator(label_schema)
-    for row in matched_cheating + benign:
-        errs = sorted(v.iter_errors(row), key=str)
+    validator = Draft202012Validator(label_schema)
+    extras_keys = {"note", "audit_model_name", "audit_agent_name", "audit_task_id"}
+
+    def _validate(row: dict) -> None:
+        core = {k: val for k, val in row.items() if k not in extras_keys}
+        errs = sorted(validator.iter_errors(core), key=str)
         if errs:
             raise SystemExit(f"schema error on {row['trace_id']}: {errs[0].message}")
-    for row in unmatched_cheating:
-        # strip extras for schema-only validation
-        r2 = {k: v for k, v in row.items() if k not in {"note", "audit_model_name", "audit_agent_name", "audit_task_id"}}
-        errs = sorted(v.iter_errors(r2), key=str)
-        if errs:
-            raise SystemExit(f"schema error on unmatched {row['trace_id']}: {errs[0].message}")
+
+    for row in matched_cheating + borderline + unmatched_cheating:
+        _validate(row)
 
     if STAGE.exists():
         shutil.rmtree(STAGE)
@@ -182,13 +193,19 @@ def main() -> int:
     extras_dir = labels_dir / "extras"
     extras_dir.mkdir(parents=True)
 
-    # Main labels file goes in labels/ (picked up by prepare_parquet.py)
+    # Main labels file goes in labels/ — strict-audit only.
     with (labels_dir / "hal-usaco.jsonl").open("w") as f:
-        for row in matched_cheating + benign:
+        for row in matched_cheating:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    # Unmatched goes in extras/ — prepare_parquet.py only globs labels/*.jsonl
-    # (not recursive), so this file lives alongside but doesn't break the build
-    # since its synthetic trace_ids have no matching traces in any manifest.
+    # Borderline (the 703 unsure manifest traces) ships alongside but
+    # parquet-builder-friendly: it sits in labels/ but uses the same
+    # trace_ids as the main file would have used — and prepare_parquet.py
+    # rejects duplicate trace_ids, so we put it in extras/ to avoid the
+    # builder picking it up. Adam can promote rows manually if he wants.
+    with (extras_dir / "hal-usaco.borderline.jsonl").open("w") as f:
+        for row in borderline:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # Unmatched audit rows (377) — submissions outside Adam's manifest.
     with (extras_dir / "hal-usaco.unmatched.jsonl").open("w") as f:
         for row in unmatched_cheating:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -202,9 +219,10 @@ Drop-in for `cheatbench/data/raw/labels/`.
 
 ## Counts
 
-| file | rows | cheating | benign |
+| file | rows | cheating | borderline (unsure) |
 |---|---:|---:|---:|
-| `hal-usaco.jsonl` | {len(matched_cheating) + len(benign)} | {len(matched_cheating)} | {len(benign)} |
+| `hal-usaco.jsonl` | {len(matched_cheating)} | {len(matched_cheating)} | 0 |
+| `extras/hal-usaco.borderline.jsonl` | {len(borderline)} | 0 | {len(borderline)} |
 | `extras/hal-usaco.unmatched.jsonl` | {len(unmatched_cheating)} | {len(unmatched_cheating)} | 0 |
 
 ## Provenance
@@ -231,16 +249,21 @@ in if you expand the manifest.
 
 ## Label policy
 
-`hal-usaco.jsonl` is strict-audit:
-- **cheating** (218): audit's exact-injection heuristic flagged this exact
-  (submission, task) — the prompt contained the current benchmark problem
-  with reference solution code.
-- **benign** (703): manifest trace not in the audit-flagged set. Note that
-  these traces used the *same* Episodic+Semantic scaffold; the audit just
-  didn't see the exact-injection signature on them (likely because the
-  retrieval pulled near/similar problems instead, or the run failed
-  evaluation). If you want the broader scaffold-level interpretation
-  ("anything from this scaffold is cheating"), promote these to cheating.
+**Strict audit only in the main file.** `hal-usaco.jsonl` contains only the
+218 audit-confirmed exact-injection cases — runs where the prompt provably
+contained the current benchmark problem with reference solution code.
+
+The 703 manifest traces from the same Episodic+Semantic scaffold that the
+audit's exact-match heuristic *didn't* flag are **unsure**, not benign.
+They're shipped in `extras/hal-usaco.borderline.jsonl` (label=cheating
+since the scaffold itself is the injection mechanism, plus a `note` making
+the uncertainty explicit). The retrieval may have pulled near/similar
+problems on those runs, or the run failed evaluation and was excluded
+from the success-only audit pool.
+
+`extras/` is not picked up by `scripts/prepare_parquet.py` (it globs only
+`labels/*.jsonl`, non-recursive). Move files out of `extras/` if you want
+them folded in.
 
 The `note`, `audit_*` fields on the unmatched rows are extras allowed by
 `label.schema.json`'s `additionalProperties: true`.
