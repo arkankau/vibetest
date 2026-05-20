@@ -48,26 +48,9 @@ score merely because the repository lacks an optional best practice, framework
 feature, helper, explicit policy, or diagnostic check. A FAIL verdict needs
 positive evidence that the property is violated, or clear evidence that the
 property explicitly requires something and the repository's stated behavior
-omits it. If the evidence only shows "no DataLoader", "no shuffle=True",
-"no .to(device)", "no CUDA/autocast", "no explicit dtype policy", "no baseline
-comparison", "no loss logging", or similar absence-only findings, score it low
+omits it. Absence-only or best-practice-only findings should receive a low score
 unless the original reason also demonstrates why that absence creates an actual
 property failure in this repository.
-
-Be especially careful with best-practice-shaped ML properties:
-- Full-batch training has no minibatch order to shuffle; absence of a DataLoader
-  or shuffle setting alone does not establish that training data is improperly
-  ordered.
-- CPU-only/default-device tensor code can be internally consistent; absence of
-  explicit device or mixed-precision policy alone does not establish a device or
-  dtype failure.
-- A missing optional sanity check, baseline, overfit test, or logging trace is
-  weaker than evidence that the implemented training/evaluation behavior fails
-  the property.
-- A statement that a more sophisticated model does not beat another model is not
-  automatically evidence that the final training procedure fails a simple
-  baseline property unless the claimed baseline and evaluation comparison are
-  clearly established.
 
 Use the repository only to check the cited evidence and the local context needed
 to understand it. Prefer direct file inspection over speculation.

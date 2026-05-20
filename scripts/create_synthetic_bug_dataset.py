@@ -137,11 +137,28 @@ def _build_bug_examples_text(examples: list[dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
+def _build_property_catalog_text(properties: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for prop in properties:
+        if not isinstance(prop, dict):
+            continue
+        pid = str(prop.get("property_id") or "").strip()
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        text = _normalize_whitespace(str(prop.get("property_text") or ""))
+        lines.append(f"- {pid}: {text}" if text else f"- {pid}")
+    return "\n".join(lines).strip() or "(not provided)"
+
+
 def _build_injection_prompt(plan_row: dict[str, Any], *, sandbox_repo_path: str = "/workspace/repo") -> str:
     selected_examples = plan_row.get("selected_bug_examples") or []
     selected_props = plan_row.get("selected_property_ids") or []
+    available_properties = plan_row.get("available_properties") or []
     k = int(plan_row.get("k") or 0)
     examples_text = _build_bug_examples_text(selected_examples)
+    property_catalog_text = _build_property_catalog_text(available_properties)
     domain = str(plan_row.get("domain") or "")
     return (
         "You are an expert software security/ML engineer. Modify the repository to inject synthetic bugs corresponding to failures of listed properties.\n\n"
@@ -149,6 +166,8 @@ def _build_injection_prompt(plan_row: dict[str, Any], *, sandbox_repo_path: str 
         f"Repository path: {sandbox_repo_path}\n"
         f"Number of target property failures to inject (k): {k}\n"
         f"Target property IDs which injected bugs should violate: {selected_props}\n\n"
+        "Full property catalog for this dataset:\n"
+        f"{property_catalog_text}\n\n"
         "Injection goals:\n"
         "1. Inject ONLY bugs corresponding to failures of the target properties.\n"
         "2. Edit existing repository files in place.\n"
@@ -157,7 +176,14 @@ def _build_injection_prompt(plan_row: dict[str, Any], *, sandbox_repo_path: str 
         "4. Keep edits minimal and realistic.\n"
         "5. Do not add obvious markers like 'TODO bug' or 'synthetic bug'.\n"
         "6. Do not intentionally corrupt unrelated functionality.\n"
-        "7. If k=0, keep code behavior unchanged and only produce the report/artifacts.\n\n"
+        "7. Preserve all non-target properties in the full property catalog as passing.\n"
+        "   Before editing, review that catalog and choose an injection that is specific\n"
+        "   to the target property IDs. Do not use an injection if it would also\n"
+        "   make any non-target property fail.\n"
+        "8. After editing, audit the modified repository against non-target properties. If\n"
+        "   a non-target property would fail, revise the edit or report that the requested\n"
+        "   isolated injection is not feasible.\n"
+        "9. If k=0, keep code behavior unchanged and only produce the report/artifacts.\n\n"
         "Bug exemplars to imitate:\n"
         f"{examples_text}\n\n"
         "Required artifacts (must be created before submit):\n"
@@ -1285,6 +1311,15 @@ def _plan(args: argparse.Namespace) -> None:
             repo_dataset = str(repo.get("dataset") or "").strip()
             dataset_props = by_dataset_prop.get(repo_dataset) or fallback_props
             prop_ids = sorted([p for p in dataset_props.keys() if p])
+            available_properties = []
+            for pid in prop_ids:
+                first_example = dataset_props[pid][0] if dataset_props.get(pid) else {}
+                available_properties.append(
+                    {
+                        "property_id": pid,
+                        "property_text": first_example.get("property_text"),
+                    }
+                )
             max_k = min(len(prop_ids), max(int(args.max_properties_per_repo), 0))
             k = rng.randint(0, max_k)
             chosen_props = rng.sample(prop_ids, k) if k > 0 else []
@@ -1300,6 +1335,7 @@ def _plan(args: argparse.Namespace) -> None:
                 "k": k,
                 "selected_property_ids": chosen_props,
                 "selected_bug_examples": chosen_examples,
+                "available_properties": available_properties,
             }
 
         samples_per_subdataset = int(args.samples_per_subdataset or 0)
@@ -1383,6 +1419,16 @@ def _inject(args: argparse.Namespace) -> None:
                         "reason_text": "<reason>",
                         "evidence_text": "<evidence>",
                     }
+                ],
+                "available_properties": [
+                    {
+                        "property_id": "<property_id>",
+                        "property_text": "<property_text>",
+                    },
+                    {
+                        "property_id": "<other_property_id>",
+                        "property_text": "<other_property_text>",
+                    },
                 ],
             }
         )
