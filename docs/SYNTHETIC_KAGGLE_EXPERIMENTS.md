@@ -164,6 +164,30 @@ Kaggle VibeTest results the original sample IDs are reconstructed as
 if the model folder differs from the result metadata, or
 `--fail-on-missing-evidence` to require every FAIL item to have a bundle.
 
+## Iterative VibeTest + Verifier
+
+The standard synthetic experiment runs VibeTest once. To enable iterative
+feedback, add `--iterative-verifier` to the `experiments/synthetic.py` VibeTest
+command:
+
+```sh
+uv run --active python experiments/synthetic.py \
+  --method vibetest \
+  --labels-path synth-data/injected/labels_kaggle_titanic.jsonl \
+  --datasets kaggle_titanic \
+  --model openai/gpt-5-mini \
+  --iterative-verifier \
+  --max-iterations 3 \
+  --verifier-threshold 0.7
+```
+
+In this mode, each VibeTest FAIL is checked by the clean-context verifier. If
+the verifier score is below the threshold, VibeTest is rerun for that property
+with the verifier's feedback in `extra_instructions`. `--max-iterations` is the
+maximum number of total VibeTest attempts, including the initial attempt. The
+default is 3, and iterative behavior is disabled unless `--iterative-verifier`
+is passed.
+
 ## Regenerating Injections
 
 The current shared archive already contains injected repos and labels. To create

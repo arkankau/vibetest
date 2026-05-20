@@ -18,6 +18,9 @@ import argparse
 import asyncio
 import json
 import re
+import shutil
+import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,7 +29,7 @@ import jsonlines
 from inspect_ai.model import GenerateConfig, get_model
 
 from vibetest import TestCase, VibeTestAgent
-from vibetest.agent import ClaudeCodeVibeTestAgent, CodexReviewAgent, CodexVibeTestAgent
+from vibetest.agent import ClaudeCodeVibeTestAgent, CodexReviewAgent, CodexVibeTestAgent, EvidenceVerifierAgent
 from vibetest.baselines import (
     analyze_repo_with_codeql,
     map_review_to_hallucination_tests,
@@ -97,6 +100,44 @@ def _normalize_verdict(raw: Any, *, passed: Any = None) -> str:
     if text.startswith("I"):
         return "INCONCLUSIVE"
     return "INCONCLUSIVE"
+
+
+def _model_suffix(model_name: str) -> str:
+    return model_name.split("/")[-1] if model_name else "unknown-model"
+
+
+def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
+    dest_root = dest_dir.resolve()
+    with tarfile.open(tar_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            member_path = (dest_root / member.name).resolve()
+            if not str(member_path).startswith(str(dest_root) + "/") and member_path != dest_root:
+                raise ValueError(f"Unsafe path in evidence tar: {member.name}")
+        tf.extractall(dest_root, filter="data")
+
+
+def _prepare_evidence_bundle(
+    *,
+    sample_id: str,
+    model_name: str,
+    evidence_root: Path,
+    temp_dirs: list[Path],
+) -> tuple[dict[str, str], str, str]:
+    evidence_tar = evidence_root / _model_suffix(model_name) / f"evidence-{sample_id}.tar.gz"
+    if not evidence_tar.exists():
+        return {}, str(evidence_tar), f"Evidence tar not found: {evidence_tar}"
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="synthetic-verifier-evidence-"))
+    temp_dirs.append(temp_dir)
+    try:
+        _safe_extract_tar(evidence_tar, temp_dir)
+    except Exception as exc:
+        return {}, str(evidence_tar), f"Failed to extract evidence tar {evidence_tar}: {exc}"
+
+    evidence_dir = temp_dir / "evidence"
+    if not evidence_dir.exists():
+        return {}, str(evidence_tar), f"Evidence tar has no evidence/ directory: {evidence_tar}"
+    return {str(evidence_dir): "/"}, str(evidence_tar), ""
 
 
 def _property_sort_key(pid: str) -> tuple[int, int | str, str]:
@@ -406,6 +447,113 @@ def _serialize_test_result(result, prop: PropertyGT, prop_idx: int) -> dict[str,
     }
 
 
+def _verdict_from_result(result) -> str:
+    metadata = result.metadata or {}
+    return _normalize_verdict(metadata.get("verdict"), passed=result.passed)
+
+
+def _verifier_score(result) -> float | None:
+    metadata = result.metadata or {}
+    raw_score = metadata.get("evidence_support_score")
+    try:
+        return float(raw_score)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_verifier_feedback(verifier_result, threshold: float) -> str:
+    metadata = verifier_result.metadata or {}
+    score = _verifier_score(verifier_result)
+    score_text = "unparseable" if score is None else f"{score:.3f}"
+    reason = str(metadata.get("reason_text") or "").strip()
+    assessment = str(metadata.get("evidence_assessment") or "").strip()
+    raw = str(verifier_result.message or "").strip()
+    return f"""Previous VibeTest FAIL evidence was judged insufficient by an independent clean-context verifier.
+Verifier support score: {score_text} (required >= {threshold:.3f}).
+Verifier reason:
+{reason or "(not provided)"}
+
+Verifier evidence assessment:
+{assessment or raw[:4000] or "(not provided)"}
+
+When rerunning, do not simply repeat the prior unsupported FAIL evidence. Re-check the repository and either provide concrete, independently checkable evidence for FAIL with valid citations/artifacts, or return PASS/INCONCLUSIVE if the evidence does not support a high-confidence FAIL."""
+
+
+def _make_vibetest_case(
+    case: SyntheticCase,
+    prop: PropertyGT,
+    prop_idx: int,
+    *,
+    attempt: int,
+    feedback: str = "",
+) -> TestCase:
+    base_name = f"row{case.row_index}_{prop.property_id}"
+    name = base_name if attempt == 1 else f"{base_name}_iter{attempt}"
+    return TestCase(
+        name=name,
+        description=prop.property_text,
+        extra_instructions=feedback or None,
+        repo_path=case.repo_path,
+        sandbox_path="/workspace",
+        metadata={
+            "property_id": prop.property_id,
+            "property_index": prop_idx,
+            "iteration": attempt,
+            "base_sample_id": base_name,
+        },
+    )
+
+
+def _make_verifier_case(
+    *,
+    source_result,
+    source_case: TestCase,
+    verifier_sample_id: str,
+    model_name: str,
+    evidence_root: Path,
+    temp_dirs: list[Path],
+) -> TestCase:
+    metadata = source_result.metadata or {}
+    additional_data, evidence_tar, evidence_error = _prepare_evidence_bundle(
+        sample_id=source_case.name,
+        model_name=model_name,
+        evidence_root=evidence_root,
+        temp_dirs=temp_dirs,
+    )
+    return TestCase(
+        name=verifier_sample_id,
+        description=source_case.description,
+        repo_path=source_case.repo_path,
+        sandbox_path=source_case.sandbox_path,
+        additional_data=additional_data,
+        metadata={
+            "source_sample_id": source_case.name,
+            "evidence_tar": evidence_tar,
+            "evidence_artifacts_available": bool(additional_data),
+            "evidence_artifacts_error": evidence_error,
+            "original_reason": str(metadata.get("reason_text") or "").strip(),
+            "original_evidence": str(metadata.get("evidence_text") or "").strip(),
+            "original_output": str(source_result.message or ""),
+        },
+    )
+
+
+def _verifier_payload(result) -> dict[str, Any]:
+    metadata = result.metadata or {}
+    return {
+        "score": metadata.get("evidence_support_score"),
+        "verifier_model": metadata.get("verifier_model"),
+        "reason_text": metadata.get("reason_text") or "",
+        "evidence_assessment": metadata.get("evidence_assessment") or "",
+        "raw_output": result.message,
+        "execution_log": result.execution_log,
+        "source_sample_id": result.test_case.metadata.get("source_sample_id"),
+        "evidence_tar": result.test_case.metadata.get("evidence_tar"),
+        "evidence_artifacts_available": result.test_case.metadata.get("evidence_artifacts_available"),
+        "evidence_artifacts_error": result.test_case.metadata.get("evidence_artifacts_error"),
+    }
+
+
 def _ensure_property_alignment(tests: list[dict[str, Any]], props: list[PropertyGT], reviewer: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for idx, prop in enumerate(props):
@@ -540,6 +688,167 @@ def _run_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -> list[
                 tests,
                 usage=aggregate_usage_from_results(case_results),
                 method="AT",
+                method_model=agent.model_name,
+            )
+        )
+    return entries
+
+
+def _run_vibetest_iterative(cases: list[SyntheticCase], args: argparse.Namespace) -> list[dict[str, Any]]:
+    print("=" * 80)
+    print("Running synthetic experiment with iterative VibeTest + evidence verifier")
+    print("=" * 80)
+
+    max_iterations = max(1, int(args.max_iterations or 3))
+    threshold = float(args.verifier_threshold)
+    vibetest_model = args.model or "openai/gpt-5-mini"
+    verifier_model = args.verifier_model or vibetest_model
+    evidence_root = Path(args.evidence_root)
+    agent = VibeTestAgent(model=vibetest_model, static=not bool(args.dynamic))
+    verifier = EvidenceVerifierAgent(
+        model=verifier_model,
+        static=bool(args.verifier_static),
+        log_dir=args.verifier_log_dir,
+    )
+
+    slots: list[dict[str, Any]] = []
+    for case_idx, case in enumerate(cases):
+        for prop_idx, prop in enumerate(case.properties):
+            slots.append(
+                {
+                    "case_index": case_idx,
+                    "prop_index": prop_idx,
+                    "case": case,
+                    "prop": prop,
+                    "latest_result": None,
+                    "latest_verifier": None,
+                    "attempts": [],
+                    "attempt_results": [],
+                    "verifier_results": [],
+                    "feedback": "",
+                    "done": False,
+                }
+            )
+
+    for attempt in range(1, max_iterations + 1):
+        pending = [slot for slot in slots if not slot["done"]]
+        if not pending:
+            break
+
+        test_cases = [
+            _make_vibetest_case(
+                slot["case"],
+                slot["prop"],
+                int(slot["prop_index"]),
+                attempt=attempt,
+                feedback=str(slot.get("feedback") or ""),
+            )
+            for slot in pending
+        ]
+        print(f"Iteration {attempt}/{max_iterations}: running VibeTest on {len(test_cases)} property case(s).")
+        results = agent.execute_tests(test_cases, sandbox=args.sandbox)
+
+        fail_slots: list[dict[str, Any]] = []
+        verifier_cases: list[TestCase] = []
+        temp_dirs: list[Path] = []
+        try:
+            for slot, test_case, result in zip(pending, test_cases, results):
+                slot["latest_result"] = result
+                slot["attempt_results"].append(result)
+                verdict = _verdict_from_result(result)
+                attempt_record: dict[str, Any] = {
+                    "iteration": attempt,
+                    "sample_id": test_case.name,
+                    "verdict": verdict,
+                }
+                slot["attempts"].append(attempt_record)
+                if verdict != "FAIL":
+                    slot["done"] = True
+                    continue
+
+                verifier_sample_id = f"verify_{test_case.name}"
+                verifier_case = _make_verifier_case(
+                    source_result=result,
+                    source_case=test_case,
+                    verifier_sample_id=verifier_sample_id,
+                    model_name=agent.model_name,
+                    evidence_root=evidence_root,
+                    temp_dirs=temp_dirs,
+                )
+                fail_slots.append(slot)
+                verifier_cases.append(verifier_case)
+
+            if verifier_cases:
+                print(f"Iteration {attempt}/{max_iterations}: verifying {len(verifier_cases)} FAIL evidence item(s).")
+                verifier_results = verifier.execute_tests(verifier_cases, sandbox=args.sandbox)
+                for slot, verifier_result in zip(fail_slots, verifier_results):
+                    slot["latest_verifier"] = verifier_result
+                    slot["verifier_results"].append(verifier_result)
+                    score = _verifier_score(verifier_result)
+                    payload = _verifier_payload(verifier_result)
+                    slot["attempts"][-1]["evidence_verifier"] = payload
+                    if score is not None and score >= threshold:
+                        slot["done"] = True
+                    elif attempt >= max_iterations:
+                        slot["done"] = True
+                    else:
+                        slot["feedback"] = _format_verifier_feedback(verifier_result, threshold)
+        finally:
+            for temp_dir in temp_dirs:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    entries: list[dict[str, Any]] = []
+    for case_idx, case in enumerate(cases):
+        case_slots = [slot for slot in slots if int(slot["case_index"]) == case_idx]
+        case_slots.sort(key=lambda slot: int(slot["prop_index"]))
+        tests: list[dict[str, Any]] = []
+        results_for_usage = []
+        for slot in case_slots:
+            result = slot["latest_result"]
+            prop_idx = int(slot["prop_index"])
+            prop = slot["prop"]
+            if result is None:
+                tests.append(
+                    {
+                        "description": "Iterative VibeTest did not produce a result.",
+                        "passed": False,
+                        "evidence": [],
+                        "execution_log": "",
+                        "metadata": {
+                            "reviewer": "AT-iterative",
+                            "property_index": prop_idx,
+                            "property_id": prop.property_id,
+                            "property_text": prop.property_text,
+                            "verdict": "INCONCLUSIVE",
+                            "evidence_text": "",
+                            "iterative_verifier": {"attempts": slot["attempts"]},
+                        },
+                    }
+                )
+                continue
+
+            results_for_usage.extend(slot.get("attempt_results") or [result])
+            results_for_usage.extend(slot.get("verifier_results") or [])
+            test = _serialize_test_result(result, prop, prop_idx)
+            metadata = dict(test.get("metadata") or {})
+            if slot.get("latest_verifier") is not None:
+                metadata["evidence_verifier"] = _verifier_payload(slot["latest_verifier"])
+            metadata["iterative_verifier"] = {
+                "enabled": True,
+                "max_iterations": max_iterations,
+                "threshold": threshold,
+                "iterations_run": len(slot["attempts"]),
+                "attempts": slot["attempts"],
+            }
+            test["metadata"] = metadata
+            tests.append(test)
+
+        entries.append(
+            _entry_from_tests(
+                case,
+                tests,
+                usage=aggregate_usage_from_results(results_for_usage),
+                method="AT-iterative",
                 method_model=agent.model_name,
             )
         )
@@ -1301,6 +1610,7 @@ def _infer_output_path(
     model: str | None,
     *,
     dynamic: bool = False,
+    iterative_verifier: bool = False,
 ) -> Path:
     datasets = sorted({c.dataset for c in cases if c.dataset})
     if len(datasets) == 1:
@@ -1309,7 +1619,7 @@ def _infer_output_path(
         dataset_name = "synthetic_mixed"
 
     method_name = {
-        "vibetest": "AT",
+        "vibetest": "AT-iterative" if iterative_verifier else "AT",
         "codex-vibetest": "AT-codex",
         "vibetest-codex": "AT-codex",
         "vibetest-claude": "AT-claude",
@@ -1328,6 +1638,10 @@ def _infer_output_path(
 def _run(args: argparse.Namespace) -> None:
     if args.method == "codex-vibetest":
         args.method = "vibetest-codex"
+    if args.iterative_verifier and args.method != "vibetest":
+        raise SystemExit("--iterative-verifier is currently supported only with --method vibetest.")
+    if not (0.0 <= float(args.verifier_threshold) <= 1.0):
+        raise SystemExit("--verifier-threshold must be between 0 and 1.")
     domain_filters = {d.strip() for d in (args.domains or []) if d.strip()}
     dataset_filters = {d.strip() for d in (args.datasets or []) if d.strip()}
 
@@ -1344,7 +1658,10 @@ def _run(args: argparse.Namespace) -> None:
     print(f"Datasets: {sorted({c.dataset for c in cases})}")
 
     if args.method == "vibetest":
-        entries = _run_vibetest(cases, args)
+        if args.iterative_verifier:
+            entries = _run_vibetest_iterative(cases, args)
+        else:
+            entries = _run_vibetest(cases, args)
         method_model = args.model or "openai/gpt-5-mini"
     elif args.method == "vibetest-codex":
         entries = _run_codex_vibetest(cases, args)
@@ -1370,7 +1687,13 @@ def _run(args: argparse.Namespace) -> None:
     output_path = (
         Path(args.output_path)
         if args.output_path
-        else _infer_output_path(cases, args.method, method_model, dynamic=bool(args.dynamic))
+        else _infer_output_path(
+            cases,
+            args.method,
+            method_model,
+            dynamic=bool(args.dynamic),
+            iterative_verifier=bool(args.iterative_verifier),
+        )
     )
     # Persist method outputs before scoring so long runs are recoverable even if scoring fails/interrupted.
     _write_results(output_path, entries)
@@ -1444,6 +1767,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, help="Model for vibetest/codex methods.")
     parser.add_argument("--dynamic", action="store_true", help="Use dynamic VibeTest agent mode.")
     parser.add_argument("--review-mapper-model", type=str, help="Model for review->property mapping.")
+    parser.add_argument(
+        "--iterative-verifier",
+        action="store_true",
+        help="For --method vibetest, rerun weak FAIL evidence with clean-context verifier feedback.",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=3,
+        help="Maximum VibeTest+verifier attempts when --iterative-verifier is enabled.",
+    )
+    parser.add_argument(
+        "--verifier-threshold",
+        type=float,
+        default=0.7,
+        help="Minimum verifier evidence-support score needed to accept a FAIL in iterative mode.",
+    )
+    parser.add_argument("--verifier-model", type=str, help="Verifier model for iterative mode; defaults to --model.")
+    parser.add_argument("--verifier-static", action="store_true", help="Disable python tool for the iterative verifier agent.")
+    parser.add_argument("--verifier-log-dir", type=str, default="./logs", help="Inspect log directory for iterative verifier runs.")
+    parser.add_argument("--evidence-root", type=str, default="evidence-dumps", help="Root for VibeTest /evidence tarballs.")
 
     parser.add_argument("--codex-cmd", type=str, default="codex", help="Codex CLI command.")
     parser.add_argument("--codex-model", type=str, default="inspect", help="Codex model argument passed to CLI.")
