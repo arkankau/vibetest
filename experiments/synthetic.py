@@ -106,6 +106,16 @@ def _model_suffix(model_name: str) -> str:
     return model_name.split("/")[-1] if model_name else "unknown-model"
 
 
+def _slug_sample_component(value: str, *, max_len: int = 80) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", (value or "").strip()).strip("_")
+    return (slug or "unknown")[:max_len]
+
+
+def _synthetic_property_sample_id(case: "SyntheticCase", prop: "PropertyGT") -> str:
+    dataset = _slug_sample_component(case.dataset, max_len=60)
+    return f"{dataset}_row{case.row_index}_{prop.property_id}"
+
+
 def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
     dest_root = dest_dir.resolve()
     with tarfile.open(tar_path, "r:gz") as tf:
@@ -487,7 +497,7 @@ def _make_vibetest_case(
     attempt: int,
     feedback: str = "",
 ) -> TestCase:
-    base_name = f"row{case.row_index}_{prop.property_id}"
+    base_name = _synthetic_property_sample_id(case, prop)
     name = base_name if attempt == 1 else f"{base_name}_iter{attempt}"
     return TestCase(
         name=name,
@@ -498,6 +508,7 @@ def _make_vibetest_case(
         metadata={
             "property_id": prop.property_id,
             "property_index": prop_idx,
+            "source_sample_id": name,
             "iteration": attempt,
             "base_sample_id": base_name,
         },
@@ -660,13 +671,14 @@ def _run_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -> list[
         for idx, prop in enumerate(case.properties):
             all_test_cases.append(
                 TestCase(
-                    name=f"row{case.row_index}_{prop.property_id}",
+                    name=_synthetic_property_sample_id(case, prop),
                     description=prop.property_text,
                     repo_path=case.repo_path,
                     sandbox_path="/workspace",
                     metadata={
                         "property_id": prop.property_id,
                         "property_index": idx,
+                        "source_sample_id": _synthetic_property_sample_id(case, prop),
                     },
                 )
             )
@@ -862,7 +874,7 @@ def _run_codex(cases: list[SyntheticCase], args: argparse.Namespace) -> list[dic
 
     test_cases = [
         TestCase(
-            name=f"row{case.row_index}",
+            name=f"{_slug_sample_component(case.dataset, max_len=60)}_row{case.row_index}",
             description="",
             repo_path=case.repo_path,
             sandbox_path="/workspace",
@@ -961,13 +973,14 @@ def _run_codex_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) ->
         for idx, prop in enumerate(case.properties):
             all_test_cases.append(
                 TestCase(
-                    name=f"row{case.row_index}_{prop.property_id}",
+                    name=_synthetic_property_sample_id(case, prop),
                     description=prop.property_text,
                     repo_path=case.repo_path,
                     sandbox_path="/workspace",
                     metadata={
                         "property_id": prop.property_id,
                         "property_index": idx,
+                        "source_sample_id": _synthetic_property_sample_id(case, prop),
                     },
                 )
             )
@@ -1007,13 +1020,14 @@ def _run_claude_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -
         for idx, prop in enumerate(case.properties):
             all_test_cases.append(
                 TestCase(
-                    name=f"row{case.row_index}_{prop.property_id}",
+                    name=_synthetic_property_sample_id(case, prop),
                     description=prop.property_text,
                     repo_path=case.repo_path,
                     sandbox_path="/workspace",
                     metadata={
                         "property_id": prop.property_id,
                         "property_index": idx,
+                        "source_sample_id": _synthetic_property_sample_id(case, prop),
                     },
                 )
             )

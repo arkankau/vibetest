@@ -157,12 +157,13 @@ FAIL verdict; it is independent of synthetic ground truth correctness.
 
 By default the verifier also looks for saved base-agent evidence bundles under
 `evidence-dumps/<model>/evidence-<sample-id>.tar.gz`, extracts them, and makes
-them available to the clean-context verifier at `/evidence`. For synthetic
-Kaggle VibeTest results the original sample IDs are reconstructed as
-`row<synthetic_row_index>_<property_id>` (for example `row0_kaggle_p3`). Use
-`--evidence-root` if the evidence bundles live somewhere else, `--evidence-model`
-if the model folder differs from the result metadata, or
-`--fail-on-missing-evidence` to require every FAIL item to have a bundle.
+them available to the clean-context verifier at `/evidence`. Current synthetic
+Kaggle VibeTest sample IDs are stored in test metadata and include the dataset
+name, for example `kaggle_titanic_row0_kaggle_p3`. Older result files used
+`row<synthetic_row_index>_<property_id>` names. Use `--evidence-root` if the
+evidence bundles live somewhere else, `--evidence-model` if the model folder
+differs from the result metadata, or `--fail-on-missing-evidence` to require
+every FAIL item to have a bundle.
 
 ## Iterative VibeTest + Verifier
 

@@ -643,6 +643,12 @@ _temp_archive_dirs: list[Path] = []
 # Cache for archives: maps (repo_path, additional_data_tuple, sandbox_prefix) to (files_dict, setup_script)
 _archive_cache: dict[tuple, tuple[dict[str, str], str]] = {}
 
+_REPO_ARCHIVE_SKIP_FILENAMES = {
+    "injection.diff.patch",
+    "injection.diff.json",
+    "injection_report.json",
+}
+
 
 def _make_cache_key(test_case: TestCase, sandbox_prefix: str) -> tuple:
     """Create a hashable cache key from test case file sources and sandbox prefix."""
@@ -689,6 +695,8 @@ def create_files_archive(test_case: TestCase, sandbox_prefix: str = "/workspace/
                 dirs[:] = [d for d in dirs if d not in (".venv", "__pycache__", ".git", "node_modules")]
                 
                 for filename in filenames:
+                    if filename in _REPO_ARCHIVE_SKIP_FILENAMES:
+                        continue
                     full_path = os.path.join(root, filename)
                     relative_path = os.path.relpath(full_path, repo_path)
                     # Archive path will be relative to sandbox_prefix
