@@ -28,6 +28,9 @@ uv run experiments/hallucination.py --method vibetest --paper-list data/hallucin
 
 ## Synthetic (Injected) Bug Experiments
 
+For the Kaggle ML synthetic data archive, setup commands, run commands, and
+metrics analysis, see `docs/SYNTHETIC_KAGGLE_EXPERIMENTS.md`.
+
 To overcome the problem with a lack of ground truth with the real bug
 experiments above, we create a synthetic bug dataset seeded by the real bugs
 from above. We take clean code with no known bugs and inject different property

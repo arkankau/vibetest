@@ -149,6 +149,11 @@ Configure via `.env` file or environment variables:
 See the `examples/` directory for:
 - `simple_example.py`: Basic usage
 
+## Experiment Notes
+
+- [Synthetic Kaggle experiments](docs/SYNTHETIC_KAGGLE_EXPERIMENTS.md): setup
+  from `synthetic-kaggle-data.tar.gz`, run commands, and metrics analysis.
+
 ## Results Viewer
 
 A minimal browser-based viewer for inspecting agent evaluation results lives in `viewer/index.html`.
