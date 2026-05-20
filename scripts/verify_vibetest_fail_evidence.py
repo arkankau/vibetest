@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +113,93 @@ def _repo_path(entry: dict[str, Any]) -> Path | None:
     return Path(str(raw))
 
 
+def _model_suffix(model_name: str) -> str:
+    return model_name.split("/")[-1] if model_name else "unknown-model"
+
+
+def _source_sample_id(entry: dict[str, Any], test: dict[str, Any], row_idx: int) -> str | None:
+    metadata = test.get("metadata") or {}
+    for obj in (metadata, test, entry):
+        for key in ("source_sample_id", "sample_id", "test_case_name", "name", "id"):
+            value = obj.get(key) if isinstance(obj, dict) else None
+            if str(value or "").strip():
+                return str(value).strip()
+
+    synthetic_row = entry.get("synthetic_row_index", row_idx)
+    property_id = str(metadata.get("property_id") or test.get("property_id") or "").strip()
+    if property_id:
+        return f"row{synthetic_row}_{property_id}"
+    return None
+
+
+def _evidence_tar_path(
+    *,
+    entry: dict[str, Any],
+    test: dict[str, Any],
+    row_idx: int,
+    evidence_root: Path,
+    evidence_model: str | None,
+) -> tuple[Path | None, str | None]:
+    metadata = test.get("metadata") or {}
+    explicit = (
+        metadata.get("evidence_tar")
+        or metadata.get("evidence_tar_path")
+        or test.get("evidence_tar")
+        or entry.get("evidence_tar")
+        or entry.get("evidence_tar_path")
+    )
+    if str(explicit or "").strip():
+        path = Path(str(explicit))
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        return path, _source_sample_id(entry, test, row_idx)
+
+    sample_id = _source_sample_id(entry, test, row_idx)
+    if not sample_id:
+        return None, None
+
+    model_name = (
+        evidence_model
+        or str(metadata.get("model") or "")
+        or str(entry.get("method_model") or "")
+    )
+    if not model_name:
+        return None, sample_id
+    return evidence_root / _model_suffix(model_name) / f"evidence-{sample_id}.tar.gz", sample_id
+
+
+def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
+    dest_root = dest_dir.resolve()
+    with tarfile.open(tar_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            member_path = (dest_root / member.name).resolve()
+            if not str(member_path).startswith(str(dest_root) + "/") and member_path != dest_root:
+                raise ValueError(f"Unsafe path in evidence tar: {member.name}")
+        tf.extractall(dest_root, filter="data")
+
+
+def _prepare_evidence_data(
+    evidence_tar: Path | None,
+    temp_dirs: list[Path],
+) -> tuple[dict[str, str], str | None]:
+    if evidence_tar is None:
+        return {}, None
+    if not evidence_tar.exists():
+        return {}, f"Evidence tar not found: {evidence_tar}"
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="vibetest-verifier-evidence-"))
+    temp_dirs.append(temp_dir)
+    try:
+        _safe_extract_tar(evidence_tar, temp_dir)
+    except Exception as exc:
+        return {}, f"Failed to extract evidence tar {evidence_tar}: {exc}"
+
+    evidence_dir = temp_dir / "evidence"
+    if not evidence_dir.exists():
+        return {}, f"Evidence tar has no evidence/ directory: {evidence_tar}"
+    return {str(evidence_dir): "/"}, None
+
+
 def _safe_sample_id(path: Path, row_idx: int, test_idx: int) -> str:
     stem = _SAFE_ID_RE.sub("_", path.stem)[:80]
     return f"{stem}_row{row_idx:04d}_test{test_idx:03d}"
@@ -168,11 +258,17 @@ def _collect_verification_cases(
     limit: int,
     offset: int,
     fail_on_missing_repo: bool,
-) -> tuple[list[TestCase], dict[str, tuple[int, int]], int]:
+    evidence_root: Path,
+    evidence_model: str | None,
+    include_evidence_artifacts: bool,
+    fail_on_missing_evidence: bool,
+    temp_dirs: list[Path],
+) -> tuple[list[TestCase], dict[str, tuple[int, int]], int, int]:
     test_cases: list[TestCase] = []
     sample_to_position: dict[str, tuple[int, int]] = {}
     skipped_for_offset = 0
     missing_repo = 0
+    missing_evidence = 0
 
     for row_idx, entry in enumerate(rows):
         repo_path = _repo_path(entry)
@@ -189,7 +285,7 @@ def _collect_verification_cases(
                 skipped_for_offset += 1
                 continue
             if limit > 0 and len(test_cases) >= limit:
-                return test_cases, sample_to_position, missing_repo
+                return test_cases, sample_to_position, missing_repo, missing_evidence
 
             if repo_path is None or not repo_path.exists():
                 missing_repo += 1
@@ -202,6 +298,24 @@ def _collect_verification_cases(
                 test["metadata"] = metadata
                 continue
 
+            evidence_tar = None
+            source_sample_id = None
+            additional_data: dict[str, str] = {}
+            evidence_error = None
+            if include_evidence_artifacts:
+                evidence_tar, source_sample_id = _evidence_tar_path(
+                    entry=entry,
+                    test=test,
+                    row_idx=row_idx,
+                    evidence_root=evidence_root,
+                    evidence_model=evidence_model,
+                )
+                additional_data, evidence_error = _prepare_evidence_data(evidence_tar, temp_dirs)
+                if evidence_error:
+                    missing_evidence += 1
+                    if fail_on_missing_evidence:
+                        raise SystemExit(f"{result_path}:{row_idx}:{test_idx}: {evidence_error}")
+
             sample_id = _safe_sample_id(result_path, row_idx, test_idx)
             sample_to_position[sample_id] = (row_idx, test_idx)
             test_cases.append(
@@ -210,10 +324,15 @@ def _collect_verification_cases(
                     description=_property_text(test),
                     repo_path=repo_path,
                     sandbox_path="/workspace",
+                    additional_data=additional_data,
                     metadata={
                         "result_path": str(result_path),
                         "row_index": row_idx,
                         "test_index": test_idx,
+                        "source_sample_id": source_sample_id,
+                        "evidence_tar": str(evidence_tar) if evidence_tar else "",
+                        "evidence_artifacts_available": bool(additional_data),
+                        "evidence_artifacts_error": evidence_error or "",
                         "original_reason": _reason_text(test),
                         "original_evidence": _evidence_text(test),
                         "original_output": str(test.get("description") or ""),
@@ -221,51 +340,67 @@ def _collect_verification_cases(
                 )
             )
 
-    return test_cases, sample_to_position, missing_repo
+    return test_cases, sample_to_position, missing_repo, missing_evidence
 
 
 def _process_one_file(args: argparse.Namespace, result_path: Path) -> None:
     rows = _load_rows(result_path)
-    test_cases, sample_to_position, missing_repo = _collect_verification_cases(
-        result_path=result_path,
-        rows=rows,
-        skip_existing=bool(args.skip_existing),
-        limit=args.limit,
-        offset=args.offset,
-        fail_on_missing_repo=bool(args.fail_on_missing_repo),
-    )
+    temp_dirs: list[Path] = []
+    try:
+        test_cases, sample_to_position, missing_repo, missing_evidence = _collect_verification_cases(
+            result_path=result_path,
+            rows=rows,
+            skip_existing=bool(args.skip_existing),
+            limit=args.limit,
+            offset=args.offset,
+            fail_on_missing_repo=bool(args.fail_on_missing_repo),
+            evidence_root=Path(args.evidence_root),
+            evidence_model=args.evidence_model,
+            include_evidence_artifacts=not bool(args.no_evidence_artifacts),
+            fail_on_missing_evidence=bool(args.fail_on_missing_evidence),
+            temp_dirs=temp_dirs,
+        )
 
-    print(
-        f"{result_path}: {len(test_cases)} FAIL evidence item(s) queued "
-        f"({missing_repo} skipped for missing repo path)."
-    )
-    if args.dry_run:
-        return
-    if not test_cases:
+        print(
+            f"{result_path}: {len(test_cases)} FAIL evidence item(s) queued "
+            f"({missing_repo} skipped for missing repo path, "
+            f"{missing_evidence} without evidence artifact bundle)."
+        )
+        if args.dry_run:
+            return
+        if not test_cases:
+            output_path = result_path if args.in_place else Path(args.output_path or _default_output_path(result_path))
+            _write_rows(output_path, rows)
+            print(f"Wrote unchanged rows: {output_path}")
+            return
+
+        agent = EvidenceVerifierAgent(
+            model=args.model,
+            static=bool(args.static),
+            log_dir=args.log_dir,
+        )
+        verifier_results = agent.execute_tests(test_cases, sandbox=args.sandbox)
+        for result in verifier_results:
+            position = sample_to_position.get(result.test_case.name)
+            if position is None:
+                continue
+            row_idx, test_idx = position
+            test = rows[row_idx]["tests"][test_idx]
+            metadata = dict(test.get("metadata") or {})
+            payload = _verifier_payload(result)
+            payload["source_sample_id"] = result.test_case.metadata.get("source_sample_id")
+            payload["evidence_tar"] = result.test_case.metadata.get("evidence_tar")
+            payload["evidence_artifacts_available"] = result.test_case.metadata.get("evidence_artifacts_available")
+            payload["evidence_artifacts_error"] = result.test_case.metadata.get("evidence_artifacts_error")
+            metadata["evidence_verifier"] = payload
+            test["metadata"] = metadata
+
         output_path = result_path if args.in_place else Path(args.output_path or _default_output_path(result_path))
         _write_rows(output_path, rows)
-        print(f"Wrote unchanged rows: {output_path}")
-        return
-
-    agent = EvidenceVerifierAgent(
-        model=args.model,
-        static=bool(args.static),
-        log_dir=args.log_dir,
-    )
-    verifier_results = agent.execute_tests(test_cases, sandbox=args.sandbox)
-    for result in verifier_results:
-        position = sample_to_position.get(result.test_case.name)
-        if position is None:
-            continue
-        row_idx, test_idx = position
-        test = rows[row_idx]["tests"][test_idx]
-        metadata = dict(test.get("metadata") or {})
-        metadata["evidence_verifier"] = _verifier_payload(result)
-        test["metadata"] = metadata
-
-    output_path = result_path if args.in_place else Path(args.output_path or _default_output_path(result_path))
-    _write_rows(output_path, rows)
-    print(f"Wrote verified results: {output_path}")
+        print(f"Wrote verified results: {output_path}")
+    finally:
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -282,6 +417,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-path", help="Output path for a single input file. Defaults to *_evidence_verified.jsonl.")
     parser.add_argument("--dry-run", action="store_true", help="Only count queued FAIL evidence items.")
     parser.add_argument("--fail-on-missing-repo", action="store_true", help="Fail instead of annotating/skipping missing repos.")
+    parser.add_argument("--evidence-root", default="evidence-dumps", help="Root directory containing base VibeTest evidence tarballs.")
+    parser.add_argument("--evidence-model", help="Model folder/name used under --evidence-root. Defaults to each row's method_model/test metadata model.")
+    parser.add_argument("--no-evidence-artifacts", action="store_true", help="Do not attach saved /evidence artifacts to verifier sandboxes.")
+    parser.add_argument("--fail-on-missing-evidence", action="store_true", help="Fail when a matching evidence tarball is missing or invalid.")
     return parser
 
 

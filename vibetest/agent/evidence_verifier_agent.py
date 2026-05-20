@@ -162,8 +162,16 @@ class EvidenceVerifierAgent:
         original_reason = str(metadata.get("original_reason") or "").strip()
         original_evidence = str(metadata.get("original_evidence") or "").strip()
         original_output = str(metadata.get("original_output") or "").strip()
+        artifact_note = (
+            "Saved evidence artifacts from the original VibeTest run are available under /evidence. "
+            "If the original evidence cites /evidence/artifacts/..., inspect those files there."
+            if metadata.get("evidence_artifacts_available")
+            else "No saved /evidence artifact bundle is available for this verifier run."
+        )
 
         return f"""Repository: {test_case.sandbox_path}/repo
+
+{artifact_note}
 
 Property:
 {test_case.description}

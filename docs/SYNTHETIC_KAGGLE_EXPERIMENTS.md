@@ -155,6 +155,15 @@ FAIL test with a score from 0.0 to 1.0, a reason, and an evidence assessment.
 The score measures only how clearly the original evidence supports the original
 FAIL verdict; it is independent of synthetic ground truth correctness.
 
+By default the verifier also looks for saved base-agent evidence bundles under
+`evidence-dumps/<model>/evidence-<sample-id>.tar.gz`, extracts them, and makes
+them available to the clean-context verifier at `/evidence`. For synthetic
+Kaggle VibeTest results the original sample IDs are reconstructed as
+`row<synthetic_row_index>_<property_id>` (for example `row0_kaggle_p3`). Use
+`--evidence-root` if the evidence bundles live somewhere else, `--evidence-model`
+if the model folder differs from the result metadata, or
+`--fail-on-missing-evidence` to require every FAIL item to have a bundle.
+
 ## Regenerating Injections
 
 The current shared archive already contains injected repos and labels. To create
