@@ -116,6 +116,20 @@ def _synthetic_property_sample_id(case: "SyntheticCase", prop: "PropertyGT") -> 
     return f"{dataset}_row{case.row_index}_{prop.property_id}"
 
 
+def _synthetic_sandbox_path(case: "SyntheticCase") -> str:
+    return "/kaggle" if case.domain == "ml-bugs" and case.dataset.startswith("kaggle_") else "/workspace"
+
+
+def _synthetic_additional_data(case: "SyntheticCase") -> dict[str, str]:
+    if case.domain != "ml-bugs":
+        return {}
+    if case.dataset == "kaggle_titanic":
+        return {"./titanic-kaggle-data": "/kaggle/input"}
+    if case.dataset == "kaggle_nlp":
+        return {"./nlp-kaggle-data": "/kaggle/input"}
+    return {}
+
+
 def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
     dest_root = dest_dir.resolve()
     with tarfile.open(tar_path, "r:gz") as tf:
@@ -504,7 +518,8 @@ def _make_vibetest_case(
         description=prop.property_text,
         extra_instructions=feedback or None,
         repo_path=case.repo_path,
-        sandbox_path="/workspace",
+        sandbox_path=_synthetic_sandbox_path(case),
+        additional_data=_synthetic_additional_data(case),
         metadata={
             "property_id": prop.property_id,
             "property_index": prop_idx,
@@ -674,7 +689,8 @@ def _run_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -> list[
                     name=_synthetic_property_sample_id(case, prop),
                     description=prop.property_text,
                     repo_path=case.repo_path,
-                    sandbox_path="/workspace",
+                    sandbox_path=_synthetic_sandbox_path(case),
+                    additional_data=_synthetic_additional_data(case),
                     metadata={
                         "property_id": prop.property_id,
                         "property_index": idx,
@@ -877,7 +893,8 @@ def _run_codex(cases: list[SyntheticCase], args: argparse.Namespace) -> list[dic
             name=f"{_slug_sample_component(case.dataset, max_len=60)}_row{case.row_index}",
             description="",
             repo_path=case.repo_path,
-            sandbox_path="/workspace",
+            sandbox_path=_synthetic_sandbox_path(case),
+            additional_data=_synthetic_additional_data(case),
         )
         for case in cases
     ]
@@ -976,7 +993,8 @@ def _run_codex_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) ->
                     name=_synthetic_property_sample_id(case, prop),
                     description=prop.property_text,
                     repo_path=case.repo_path,
-                    sandbox_path="/workspace",
+                    sandbox_path=_synthetic_sandbox_path(case),
+                    additional_data=_synthetic_additional_data(case),
                     metadata={
                         "property_id": prop.property_id,
                         "property_index": idx,
@@ -1023,7 +1041,8 @@ def _run_claude_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -
                     name=_synthetic_property_sample_id(case, prop),
                     description=prop.property_text,
                     repo_path=case.repo_path,
-                    sandbox_path="/workspace",
+                    sandbox_path=_synthetic_sandbox_path(case),
+                    additional_data=_synthetic_additional_data(case),
                     metadata={
                         "property_id": prop.property_id,
                         "property_index": idx,

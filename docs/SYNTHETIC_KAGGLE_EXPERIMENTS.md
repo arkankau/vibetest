@@ -76,6 +76,12 @@ uv run --active python experiments/synthetic.py \
   --scorer-model openai/gpt-5-mini
 ```
 
+Synthetic VibeTest runs place injected repos under `/kaggle/repo`, matching the
+real Kaggle experiment sandbox. Titanic and NLP runs also mount
+`titanic-kaggle-data/` and `nlp-kaggle-data/` under `/kaggle/input/` when those
+local data directories are present. Diabetic synthetic runs currently match the
+real Diabetic runner and do not mount an additional local data directory.
+
 Run all three Kaggle splits:
 
 ```sh
