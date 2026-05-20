@@ -580,6 +580,23 @@ def _property_catalog_from_plan_rows(plan_rows: list[dict[str, Any]]) -> dict[tu
     return catalog
 
 
+def _available_properties_for_plan_row(
+    row: dict[str, Any],
+    property_catalog: dict[tuple[str, str], dict[str, str]],
+) -> list[dict[str, str]]:
+    existing = row.get("available_properties") or []
+    if existing:
+        return existing
+
+    domain = str(row.get("domain") or "").strip()
+    dataset = str(row.get("dataset") or "").strip()
+    props = property_catalog.get((domain, dataset)) or {}
+    return [
+        {"property_id": pid, "property_text": props.get(pid, "")}
+        for pid in sorted(props)
+    ]
+
+
 def _property_description_from_bug_locations(
     property_id: str,
     bug_locations: list[dict[str, Any]],
@@ -1471,7 +1488,9 @@ def _inject(args: argparse.Namespace) -> None:
         repo_name = str(row.get("repo_name") or row.get("repo_slug") or source_repo_path.name)
         repo_slug = _slugify(repo_name, max_len=100)
         sample_name = f"inject_{row_index:06d}_{repo_slug}"
-        prompt = _build_injection_prompt(row)
+        prompt_row = dict(row)
+        prompt_row["available_properties"] = _available_properties_for_plan_row(row, property_catalog)
+        prompt = _build_injection_prompt(prompt_row)
         test_case = TestCase(
             name=sample_name,
             description=prompt,
