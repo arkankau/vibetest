@@ -4,6 +4,7 @@ from vibetest.agent.react_agent import VibeTestAgent
 from vibetest.agent.baseline_agent import BaselineAgent
 from vibetest.agent.codex_agent import CodexReviewAgent, CodexVibeTestAgent
 from vibetest.agent.claudecode_agent import ClaudeCodeReviewAgent, ClaudeCodeVibeTestAgent
+from vibetest.agent.evidence_verifier_agent import EvidenceVerifierAgent
 
 __all__ = [
     "VibeTestAgent",
@@ -12,4 +13,5 @@ __all__ = [
     "CodexVibeTestAgent",
     "ClaudeCodeReviewAgent",
     "ClaudeCodeVibeTestAgent",
+    "EvidenceVerifierAgent",
 ]

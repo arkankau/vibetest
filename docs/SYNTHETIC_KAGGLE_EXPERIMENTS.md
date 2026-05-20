@@ -137,6 +137,24 @@ Scoring treats the positive class as ground-truth property failures. A predicted
 FAIL is a true positive only when the verifier grades the evidence as matching
 the injected violation. `INCONCLUSIVE` and `NOT APPLICABLE` are abstentions.
 
+## Verify FAIL Evidence
+
+To run a clean-context evidence verifier on existing VibeTest FAIL results
+without rerunning the original VibeTest agent, use:
+
+```sh
+uv run --active python scripts/verify_vibetest_fail_evidence.py \
+  results/synthetic/synthetic_kaggle_titanic_AT-gpt-5-mini.jsonl \
+  --model openai/gpt-5-mini \
+  --sandbox docker
+```
+
+This writes `*_evidence_verified.jsonl` by default. Use `--in-place` to annotate
+the input file directly. The verifier adds `metadata.evidence_verifier` to each
+FAIL test with a score from 0.0 to 1.0, a reason, and an evidence assessment.
+The score measures only how clearly the original evidence supports the original
+FAIL verdict; it is independent of synthetic ground truth correctness.
+
 ## Regenerating Injections
 
 The current shared archive already contains injected repos and labels. To create
