@@ -274,6 +274,38 @@ def _candidate_thresholds(items: list[FailItem]) -> list[float]:
     return sorted(grid, reverse=True)
 
 
+def _precision_recall_curve(
+    items: list[FailItem],
+    *,
+    total_gt_fail: int,
+    total_gt_pass: int,
+    missing_score: str,
+) -> list[dict[str, Any]]:
+    curve: list[dict[str, Any]] = []
+    for threshold in _candidate_thresholds(items):
+        metrics = _threshold_metrics(
+            items,
+            total_gt_fail=total_gt_fail,
+            total_gt_pass=total_gt_pass,
+            threshold=threshold,
+            missing_score=missing_score,
+        )
+        curve.append(
+            {
+                "threshold": threshold,
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "tp": metrics["tp"],
+                "fp": metrics["fp"],
+                "fn": metrics["fn"],
+                "tn": metrics["tn"],
+                "accepted_fail_predictions": metrics["accepted_fail_predictions"],
+            }
+        )
+    return sorted(curve, key=lambda row: (row["recall"] or 0.0, row["precision"] or 0.0))
+
+
 def _summarize_collected(
     name: str,
     items: list[FailItem],
@@ -331,6 +363,12 @@ def _summarize_collected(
         "baseline": baseline,
         "default_threshold": at_default,
         "best_threshold": best,
+        "precision_recall_curve": _precision_recall_curve(
+            items,
+            total_gt_fail=totals["gt_fail"],
+            total_gt_pass=totals["gt_pass"],
+            missing_score=missing_score,
+        ),
         "verifier_auroc": auroc,
         "verifier_average_precision": ap,
         "scored_tp_fail": sum(1 for item in scored if item.gt_label == 1),
@@ -425,6 +463,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="How thresholded metrics handle predicted FAILs without verifier scores.",
     )
     parser.add_argument("--csv", type=Path, help="Optional CSV path for summary rows.")
+    parser.add_argument("--pr-curve-csv", type=Path, help="Optional CSV path for precision-recall curve points.")
     return parser
 
 
@@ -434,6 +473,7 @@ def main() -> None:
         raise SystemExit("--threshold must be between 0 and 1.")
     summaries = []
     csv_rows = []
+    pr_rows: list[dict[str, Any]] = []
     all_items: list[FailItem] = []
     all_totals = {
         "tests": 0,
@@ -464,6 +504,8 @@ def main() -> None:
         csv_rows.append(_summary_row(summary, f"threshold_{args.threshold:g}", summary["default_threshold"]))
         if summary["best_threshold"] is not None:
             csv_rows.append(_summary_row(summary, "best_f1_threshold", summary["best_threshold"]))
+        for point in summary["precision_recall_curve"]:
+            pr_rows.append({"file": summary["file"], **point})
 
     if len(args.results) > 1:
         combined = _summarize_collected(
@@ -478,10 +520,15 @@ def main() -> None:
         csv_rows.append(_summary_row(combined, f"threshold_{args.threshold:g}", combined["default_threshold"]))
         if combined["best_threshold"] is not None:
             csv_rows.append(_summary_row(combined, "best_f1_threshold", combined["best_threshold"]))
+        for point in combined["precision_recall_curve"]:
+            pr_rows.append({"file": combined["file"], **point})
 
     if args.csv:
         _write_csv(args.csv, csv_rows)
         print(f"\nWrote CSV: {args.csv}")
+    if args.pr_curve_csv:
+        _write_csv(args.pr_curve_csv, pr_rows)
+        print(f"Wrote PR curve CSV: {args.pr_curve_csv}")
 
 
 if __name__ == "__main__":

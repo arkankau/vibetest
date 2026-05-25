@@ -130,12 +130,20 @@ def _synthetic_additional_data(case: "SyntheticCase") -> dict[str, str]:
     return {}
 
 
+def _is_safe_tar_member(dest_root: Path, member_path: Path) -> bool:
+    try:
+        member_path.relative_to(dest_root)
+        return True
+    except ValueError:
+        return member_path == dest_root
+
+
 def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
     dest_root = dest_dir.resolve()
     with tarfile.open(tar_path, "r:gz") as tf:
         for member in tf.getmembers():
             member_path = (dest_root / member.name).resolve()
-            if not str(member_path).startswith(str(dest_root) + "/") and member_path != dest_root:
+            if not _is_safe_tar_member(dest_root, member_path):
                 raise ValueError(f"Unsafe path in evidence tar: {member.name}")
         tf.extractall(dest_root, filter="data")
 

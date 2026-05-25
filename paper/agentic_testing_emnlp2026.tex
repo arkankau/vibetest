@@ -1,0 +1,337 @@
+%%%%%%%%%%%%%%%%%%%% AGENTIC TESTING -- EMNLP 2026 %%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% Uses the official ACL style files from:
+%   https://github.com/acl-org/acl-style-files
+%
+% EMNLP/ARR short paper target:
+%   4 pages of content, excluding references, limitations, ethics, and appendix.
+%
+% Compile with: pdflatex -> bibtex -> pdflatex -> pdflatex
+%
+% Submission mode:
+%   \usepackage[review]{acl}    % anonymous review
+%   \usepackage{acl}            % camera-ready
+%   \usepackage[preprint]{acl}  % arXiv/preprint
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\definecolor{darkblue}{rgb}{0, 0, 0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+\newcommand{\agent}[1]{\textcolor{red}{[Agent: #1]}}
+\newcommand{\adam}[1]{\textcolor{blue}{[AS: #1]}}
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\title{Agentic Testing for Machine Learning Pipelines\\with Natural Language Specifications}
+
+% Anonymous for review submission.
+\author{Anonymous ACL submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Machine learning pipeline correctness remains difficult to validate at the repository level, especially when intent is specified only in natural language.
+At the same time, highly capable LLM agents increasingly modify codebases from high-level instructions.
+Given the high coding capabilities of today's LLM agents, we study Agentic Testing for ML pipelines, a testing paradigm enabling repository-level correctness evaluation without the requirement of formal specifications.
+A testing agent operates within a sandboxed environment on top of its own copy of the repository, translates informal properties into analysis and evidence-gathering actions, and returns a \textsc{pass}/\textsc{fail}/\textsc{inconclusive} decision along with an evidence report.
+We evaluate agentic testing on ML pipeline bugs in Kaggle-style repositories, comparing against ML-specific and general-purpose code reviewing baselines.
+\end{abstract}
+
+\section{Introduction}
+
+The correctness of repository-scale software systems remains challenging to test even as the ease of creating such software reduces with the capabilities of AI coding agents.
+Checking code correctness relies on methods for validating that the developer's intent is reflected in the code, but this remains difficult and costly in practice~\citep{zeller2009why}.
+For machine learning pipelines, failures are especially difficult to detect because data leakage, split misuse, preprocessing bugs, and misleading metrics can silently produce plausible results.
+
+At the same time, software engineering is being reshaped by highly capable AI agents~\citep{metr2025longtasks}.
+Benchmarks such as the SWE-bench family~\citep{jimenez2024swebench,swebench-verified} task models with resolving real-world bug reports in repositories, and recent analyses show that agentic workflows are becoming increasingly effective at solving these tasks~\citep{jimenez2024swebench,xia2024agentless,guo2025repoaudit}.
+Software is now even being developed without humans writing any of the code, including a full tensor library~\citep{vibetensor}, a C compiler~\citep{carlini2026building}, and internal tools at OpenAI~\citep{lopopolo2026harness}, leading to a new paradigm shift in software engineering.
+
+Existing approaches to software correctness provide complementary but incomplete coverage.
+While static program analysis is ideally sound with respect to a formal semantics, it requires explicit formal specifications, often must trade completeness for tractability~\citep{cousot1979systematic,nielson1999principles}, and the claimed soundness can be incorrect due to simplifying formalization assumptions~\citep{java-unsound}.
+Recent LLM-assisted query systems reduce manual effort but still depend on formalized properties which can fail to generalize and miss higher-level issues.
+Testing and fuzzing explore concrete executions and can uncover defects, but they again require extensive manual effort to extend to new properties or repositories for validation~\citep{manes2018fuzzing}.
+Together, these methods leave a gap for evaluating high-level intent without preexisting formal specifications.
+
+This gap raises a broader question.
+\textit{How do we evaluate program correctness with respect to high-level intent rather than formal specifications?}
+Answering this question requires methods that translate informal intent into actionable, repository-level testing procedures.
+
+We introduce Agentic Testing, a general method for validating repository correctness against natural language specifications.
+The agent takes a repository and a natural language property specification, performs analysis and evidence gathering, and outputs a \textsc{pass}/\textsc{fail}/\textsc{inconclusive} decision with an evidence report.
+The design emphasizes repository-level context and allows the agent to execute and modify code within a sandboxed copy of the repository, without persisting changes.
+
+We evaluate agentic testing on ML pipeline bugs across Kaggle-style repositories.
+This evaluation spans tabular, text, and image classification workflows and compares the agent against ML-specific analyses and general-purpose code review agents.
+
+\begin{figure*}[t]
+  \centering
+  \fbox{\parbox[c][1.4in][c]{0.95\linewidth}{\centering Placeholder: motivating bug found by the agent.}}
+  \caption{Placeholder for a motivating example bug discovered by the agent.}
+  \label{fig:motivating-bug}
+\end{figure*}
+
+We summarize our contributions as follows.
+\begin{itemize}
+  \item We formulate repository-level correctness as testing informal properties specified in natural language, motivating a setting where high-level intent must be evaluated without formal specifications.
+  \item We propose an agentic testing system that operates over repositories and produces \textsc{pass}/\textsc{fail}/\textsc{inconclusive} decisions with evidence reports.
+  \item We construct evaluation datasets for ML pipelines and evaluate the agent against ML-specific baselines and model backbones using both accuracy and evidence quality.
+\end{itemize}
+
+\section{Natural Language Specifications of Code}
+
+Software correctness is often described through informal specifications that are stated in natural language and at a high level rather than encoded into formal specifications.
+These informal specifications are used heavily by human programmers when finding bugs, but they are often unused by automated program analysis methods.
+For instance, static analysis tools require explicit, formalized queries, and recent LLM-assisted methods reduce the burden of writing these queries, but still end up requiring a formal specification of correctness.
+We define an informal specification as a natural language statement about expected behavior or artifacts in a repository.
+Such properties are central in ML pipelines, where failures are often detectable only through repository-level context and human intent~\citep{schoop2021umlaut}.
+
+This section motivates the problem setting and introduces the datasets used in our study.
+We focus on informal properties for ML pipeline bugs.
+We provide representative examples below and include the full property lists in \Cref{app:properties}.
+
+We formalize the setting as follows.
+Classical program analysis asks whether a formal property holds on all traces of a program.
+Let $T(R)$ denote the set of concrete execution traces induced by repository $R$, and let $\phi$ be a formal predicate over traces, such as ``no array out of bounds.''
+The traditional goal is to decide whether $\forall t \in T(R), \phi(t)$ holds, or to find a counterexample trace when it does not.
+In our setting, the key difference is that the property is specified informally rather than as a formal predicate.
+
+Let $p$ be a natural language statement about expected behavior or artifacts in $R$, such as ``no training on the test set'' or ``augmentation is applied only to training data.''
+We then want to evaluate a pair $(R, p)$ and return a decision $y \in \{\textsc{pass}, \textsc{fail}, \textsc{inconclusive}\}$ with an evidence report $E$.
+The evidence report should identify the relevant files, executions, and outputs that justify $y$ and enable independent verification.
+This framing treats properties as inputs rather than handcrafted queries, enabling evaluation of high-level intent without requiring formal specifications.
+
+\subsection{ML Pipeline Bugs}
+ML pipeline bugs are often subtle and are diagnosed using domain heuristics and end-to-end context~\citep{schoop2021umlaut}.
+We use Kaggle-style ML pipeline repositories.
+The real-world dataset contains randomly sampled submissions from each of three Kaggle competitions.
+The competitions are Titanic (tabular), Diabetic Retinopathy (image), and NLP with Disaster Tweets (text).
+We also use a synthetic controlled setting in which known ML pipeline bugs are injected into clean Kaggle-style notebooks.
+Representative ML properties include:
+\begin{itemize}
+  \item No leakage from test to train/val sets.
+  \item Data augmentation is applied only to training data.
+  \item Reported metrics use the correct split and definitions.
+\end{itemize}
+
+\begin{table*}[t]
+  \centering
+  \caption{Summary of ML pipeline datasets.}
+  \label{tab:datasets}
+  \begin{tabular}{llrr}
+    \toprule
+    Setting & Dataset & Properties & Size \\
+    \midrule
+    \multirow{3}{*}{Real Kaggle} & Titanic (tabular) & 16 & 50 \\
+    & Diabetic Retinopathy (image) & 16 & 21 \\
+    & Disaster Tweets (text) & 16 & 50 \\
+    \midrule
+    \multirow{3}{*}{Synthetic Kaggle} & Titanic (tabular) & 15 & 25 \\
+    & Diabetic Retinopathy (image) & 15 & 25 \\
+    & Disaster Tweets (text) & 15 & 25 \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\section{Agentic Testing}
+
+We propose a testing agent that evaluates whether an informal property holds for a given repository.
+The agent takes two inputs: the code repository and a property specification written in natural language.
+It produces a decision of \textsc{pass}, \textsc{fail}, or \textsc{inconclusive}, along with an evidence report that justifies the decision.
+The design emphasizes repository-level reasoning rather than local code snippets and does not require formal specifications.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/overview-sketch.png}
+  \caption{Overview of agentic testing.
+  The agent ingests a repository and a property specification, executes three phases of analysis, and outputs a decision with supporting evidence.}
+  \label{fig:overview}
+\end{figure}
+
+\paragraph{Phase 1: Analysis.}
+The agent first builds a high-level model of the repository to situate the property.
+It identifies key files, entry points, and relevant artifacts such as notebooks, scripts, configuration files, datasets, and documentation.
+When applicable, it assesses ML-specific assumptions that shape the property, such as which split is used for model selection or evaluation.
+This phase narrows the search space and yields a plan for evidence gathering.
+
+\paragraph{Phase 2: Evidence gathering.}
+The agent reviews code, tests, and data processing logic to find evidence for or against the property.
+It can run code when necessary to validate behavior, reproduce results, or check for violations.
+The goal is to collect concrete, reproducible evidence tied to specific files, logs, or outputs.
+
+\paragraph{Phase 3: Decision.}
+The agent aggregates the gathered evidence and produces a decision.
+\textsc{Pass} indicates the property is supported by evidence, \textsc{fail} indicates a violation, and \textsc{inconclusive} indicates insufficient evidence.
+The agent outputs an evidence report that highlights the relevant files, outputs, and reasoning steps that support the classification.
+The agent operates in a sandboxed copy of the repository and may modify code to probe properties, but these modifications do not persist to the original repository.
+
+\section{Experiments}
+\subsection{Setup}
+
+We evaluate baselines for ML pipeline bugs using TrainCheck~\citep{traincheck}.
+We also compare with Codex Code Review~\citep{openai_codex} as a general-purpose, open-ended code review baseline.
+We refer to these as Code Review (CR) baselines because they are prompted to find any bugs, without conditioning on a specific property.
+To indicate the specific model family, we denote Codex Code Review with a model suffix, e.g., CR-gpt-5.2-codex.
+Our method, Agentic Testing (AT), instead conditions on a property and focuses evidence gathering on that target.
+
+We evaluate the testing agent with GPT-5-mini, Claude-4.5-Sonnet, and GPT-5.2-codex~\citep{openai_codex_models,openai_gpt52,openai_gpt52_codex,anthropic_models}.
+For evaluation, we collect the classification and evidence provided by each method on each (repo, property) pair and then either use ground truth or human evaluation to determine the correctness of any bug detections.
+This human evaluation takes 2--3 minutes per (repo, property) pair.
+This enables us to assess the precision of each method.
+For the synthetic ML benchmark with injected bugs, we also compute recall.
+
+\subsection{RQ1: Classification Accuracy vs. ML Baselines}
+We ask whether the agent can accurately classify (repo, property) pairs compared to domain baselines.
+For datasets with ground truth, we report precision and recall for each method.
+For datasets without ground truth, we report precision under human evaluation.
+We present results by dataset to expose where the agent is strongest or weakest.
+For real Kaggle notebooks, where complete ground truth is unavailable, \Cref{tab:rq1} reports verified precision from human validation.
+
+\begin{table*}[t]
+  \centering
+  \caption{Overall performance on real Kaggle ML pipeline audits. Verified precision is reported from human validation because complete ground truth is unavailable.}
+  \label{tab:rq1}
+  \begin{tabular}{llrrcc}
+    \toprule
+    Subdataset & Method & Precision & Recall & Coverage & Avg. Cost \\
+    \midrule
+    \multirow{3}{*}{Titanic} & TrainCheck & N/A & -- & 18.0\% & N/A \\
+     & Codex-gpt-5-mini & 36.84\% & -- & 3.6\% & -- \\
+     & AT-gpt-5-mini & \textbf{58.91\%} & -- & 75.8\% & 0.023 \\
+     \cmidrule(lr){2-6}
+    \multirow{3}{*}{NLP} & TrainCheck & N/A & -- & 0.0\% & N/A \\
+     & Codex-gpt-5-mini & 33.33\% & -- & 2.9\% & -- \\
+     & AT-gpt-5-mini & \textbf{73.91\%} & -- & 70.0\% & 0.023 \\
+     \cmidrule(lr){2-6}
+    \multirow{3}{*}{Diabetic} & TrainCheck & N/A & -- & 0.0\% & N/A \\
+     & Codex-gpt-5-mini & 20.00\% & -- & 3.0\% & -- \\
+     & AT-gpt-5-mini & \textbf{62.22\%} & -- & 67.9\% & 0.024 \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{RQ2: Evidence Quality}
+We ask how strong the evidence is that the agent provides for its classifications relative to baselines.
+We use the same human evaluation protocol as in the setup to assess evidence quality.
+We report evidence quality alongside accuracy to distinguish correct predictions from well-justified predictions.
+\agent{Insert evidence quality rubric and results once defined.}
+
+\begin{table}[t]
+  \centering
+  \caption{Placeholder results for RQ2: evidence quality by method.}
+  \label{tab:rq2}
+  \begin{tabular}{lll}
+    \toprule
+    Method & Evidence quality & Notes \\
+    \midrule
+    \multicolumn{3}{l}{\textbf{ML pipeline bugs}} \\
+    Agentic testing & Placeholder & Placeholder \\
+    Baseline 1 & Placeholder & Placeholder \\
+    Baseline 2 & Placeholder & Placeholder \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{RQ3: Variation Across Domains and Models}
+We ask how performance varies across domains and model backbones.
+We compare results for GPT-5-mini, Claude-4.5-Sonnet, and GPT-5.2-codex across ML pipeline datasets.
+This analysis isolates whether gains are driven by domain structure or by model capability.
+\agent{Insert per-model breakdown and discussion once results are available.}
+
+\begin{table*}[t]
+  \centering
+  \caption{Placeholder results for RQ3: performance by model and domain.}
+  \label{tab:rq3}
+  \begin{tabular}{llll}
+    \toprule
+    Model & Domain & Precision & Recall \\
+    \midrule
+    GPT-5-mini & ML pipeline bugs & Placeholder & Placeholder \\
+    Claude-4.5-Sonnet & ML pipeline bugs & Placeholder & Placeholder \\
+    GPT-5.2-codex & ML pipeline bugs & Placeholder & Placeholder \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\section{Related Work}
+
+\paragraph{Static analysis and specification burden.}
+Static analysis systems encode bug patterns as declarative queries and support custom project-specific checks, but they require specialized expertise to author and maintain.
+Recent work uses LLMs to reduce this burden, but such systems still depend on formalized properties and can miss higher-level ML pipeline issues.
+
+\paragraph{Repository-level agents and evaluation.}
+RepoAudit proposes an autonomous LLM agent for repository-level auditing that reasons over data-flow facts and validates candidate reports~\citep{guo2025repoaudit}.
+BugScope learns bug patterns from examples and applies multi-agent auditing to detect diverse defects~\citep{guo2025bugscope}.
+SWE-bench frames repository-scale issue resolution and highlights the difficulty of end-to-end fixes that require coordinated edits across files~\citep{jimenez2024swebench}.
+Agentless shows that simplified localization--repair pipelines can be competitive on SWE-bench Lite, providing a strong baseline for agentic approaches~\citep{xia2024agentless}.
+
+\paragraph{Domain-specific ML debugging.}
+ML debugging tools such as UMLAUT use expert heuristics to surface errors in deep learning programs by linking code structure and model behavior~\citep{schoop2021umlaut}.
+These domain-specific efforts motivate a natural-language approach to ML pipeline properties that are difficult to encode as reusable formal checks.
+
+\section{Conclusion}
+
+\agent{Write a concise conclusion once the final short-paper scope is chosen.}
+
+\section*{Limitations}
+
+\agent{ARR requires a limitations section. Add scope limitations, annotation limitations, and dataset limitations here.}
+
+\section*{Ethics Statement}
+
+Authors can add an optional ethics statement to the paper.
+For papers that touch on ethical issues, this section will be evaluated as part of the review process.
+
+\section*{Acknowledgments}
+
+Acknowledgments, including funding agencies, should be omitted during anonymous review if they reveal author identity and restored in the camera-ready version.
+
+\bibliographystyle{acl_natbib}
+\bibliography{refs}
+
+\appendix
+\section{Appendix}
+
+\section{Full Informal Property List}
+\label{app:properties}
+
+\begin{itemize}
+  \item No leakage from test to train/val sets.
+  \item If there is any model selection or hyperparameter tuning, then it uses val only.
+  \item If there is any model training, then all model parameters are updated during training (no frozen layers unless explicitly intended).
+  \item Data is loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).
+  \item Any data augmentation is only performed on the training dataset; val/test dataset use deterministic preprocessing.
+  \item Any class-imbalance handling (weighted loss / sampler) applies only to training data.
+  \item No path/filename text is fed as a feature unless explicitly intended.
+  \item Reported metrics use the correct split(s) and the exact definitions claimed (e.g., micro vs macro, top-k).
+  \item Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.
+  \item The model after the full training procedure outperforms a simple baseline (e.g., random or majority class) on an evaluation set.
+  \item The model can overfit a single (or tiny) batch to near-zero loss.
+  \item Training loss generally decreases during training and plateaus within the number of epochs used (if no loss is logged, then add logging to check this).
+  \item Training dataloader shuffles or training dataset is shuffled for training; val/test do not shuffle.
+  \item Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining.
+  \item Model and inputs are consistently moved to one device; no implicit CPU-to-GPU transfers; dtype policy (e.g., fp32/bf16) is applied consistently.
+  \item Code does not use explicit loops or Python control flow when matrix operations could have been used to implement the exact same operation more efficiently.
+\end{itemize}
+
+\end{document}

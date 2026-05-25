@@ -1,0 +1,506 @@
+%%%%%%%%%%%%%%%%%%%% VIBETEST -- EMNLP 2026 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% Uses the official ACL style files from:
+%   https://github.com/acl-org/acl-style-files
+%
+% EMNLP/ARR long paper target:
+%   8 pages of content, excluding references, limitations, ethics, and appendix.
+%
+% Compile FROM this directory (paper/):
+%   pdflatex agentic_testing_emnlp2026
+%   bibtex agentic_testing_emnlp2026
+%   pdflatex agentic_testing_emnlp2026
+%   pdflatex agentic_testing_emnlp2026
+% Requires ACL style files on TEXINPUTS and figures/ populated (see sync_paper_figures.ps1).
+%
+% Submission mode:
+%   \usepackage[review]{acl}    % anonymous review
+%   \usepackage{acl}            % camera-ready
+%   \usepackage[preprint]{acl}  % arXiv/preprint
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage{placeins}
+\usepackage{caption}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\captionsetup{font=small,skip=4pt}
+
+\definecolor{darkblue}{rgb}{0, 0, 0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+\newcommand{\agent}[1]{\textcolor{red}{[Agent: #1]}}
+\newcommand{\adam}[1]{\textcolor{blue}{[AS: #1]}}
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+% Prefer floats near their references without forcing page-filling gaps.
+\setcounter{topnumber}{3}
+\setcounter{bottomnumber}{2}
+\setcounter{totalnumber}{5}
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.75}
+
+% All figures/tables must fit one column (never figure*/table* or \textwidth spans).
+\newcommand{\singlecoltabular}[1]{\resizebox{\columnwidth}{!}{#1}}
+\newenvironment{singlecolcenter}{%
+  \begin{center}%
+  \begin{minipage}{\columnwidth}%
+  \centering
+}{%
+  \end{minipage}%
+  \end{center}%
+}
+
+\title{Agentic Testing: Validating Repositories Against\\Natural Language Specifications}
+
+% Anonymous for review submission.
+\author{Anonymous ACL submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Software correctness remains difficult to validate at the repository level, especially when intent is specified only in natural language.
+At the same time, highly capable large language model (LLM) agents increasingly modify and review codebases from high-level instructions.
+Given these coding capabilities, we propose \emph{Agentic Testing}, a general testing paradigm for repository-level correctness evaluation without requiring formal specifications.
+A testing agent operates within a sandboxed copy of the repository, translates informal properties into analysis and evidence-gathering actions, and returns a \textsc{pass}/\textsc{fail}/\textsc{inconclusive} verdict with an evidence report.
+We instantiate this paradigm as Agentic Testing and evaluate it on machine learning (ML) pipelines, a focused domain where high-level intent is common and formal specifications are scarce.
+Across 121 real and 75 synthetic Kaggle notebooks, Agentic Testing evaluates up to 16 natural-language properties per repository.
+On real notebooks, it achieves higher coverage and permissive LLM-assisted \textsc{fail} precision than TrainCheck and Codex Code Review, but a strict human-only present-and-violating re-audit lowers valid \textsc{fail}s from 66.1\% to 40.0\% on a 100-case sample, largely due to absence-as-failure errors.
+We add a post-hoc evidence verifier and precision--recall analysis over verifier scores.
+The verifier provides the intended evaluation interface, but the current same-backbone GPT-5-mini verifier ranks near chance on real data and does not improve strict audit precision at $\tau=0.7$.
+\end{abstract}
+
+\section{Introduction}
+
+The correctness of repository-scale software systems remains challenging to test even as the ease of creating such software decreases with the capabilities of AI coding agents.
+Checking code correctness relies on methods for validating that the developer's intent is reflected in the code, but this intent is often stated only informally in natural language~\citep{zeller2009why}.
+A developer may ask that a training script avoid leakage, that evaluation use the held-out split, or that a reported metric match its stated definition.
+These requirements are easy to state, but difficult for automated systems to test because they require interpreting informal language, locating relevant code, running or modifying the repository, and producing evidence that another person can verify.
+This makes repository-level testing against natural-language specifications a natural problem for the natural language processing (NLP) community: the central object is not just code, but the interpretation of language as an executable audit task.
+
+At the same time, software engineering is being reshaped by highly capable AI agents~\citep{metr2025longtasks}.
+Benchmarks such as the SWE-bench family~\citep{jimenez2024swebench,swebench-verified} task models with resolving real-world bug reports in repositories, and recent analyses show that agentic workflows are becoming increasingly effective at solving these tasks~\citep{jimenez2024swebench,xia2024agentless,guo2025repoaudit}.
+Commercial coding agents now also support code review, refactoring, and repository-level development workflows~\citep{openai_codex}, making it increasingly important to evaluate whether their reported failures are grounded in checkable evidence.
+
+Existing approaches to software correctness provide complementary but incomplete coverage.
+While static program analysis is ideally sound with respect to a formal semantics, it requires explicit formal specifications, often must trade completeness for tractability~\citep{cousot1979systematic,nielson1999principles}, and can miss higher-level pipeline issues that are specified only informally.
+Domain-specific ML debugging tools can surface important classes of errors~\citep{schoop2021umlaut}, but they still require hand-designed checks or assumptions about the target workflow.
+Together, these methods leave a gap for evaluating high-level intent without preexisting formal specifications.
+
+This gap raises a broader question.
+\textit{How do we evaluate repository correctness with respect to high-level natural-language specifications rather than formal specifications?}
+Answering this question requires methods that translate informal intent into actionable, repository-level testing procedures.
+
+We propose \emph{Agentic Testing}, a general paradigm for validating repositories against natural language specifications.
+The agent takes a repository and a natural language property specification, performs analysis and evidence gathering, and outputs a \textsc{pass}/\textsc{fail}/\textsc{inconclusive} decision with an evidence report.
+The design emphasizes repository-level context and allows the agent to execute and modify code within a sandboxed copy of the repository, without persisting changes.
+Agentic Testing is our implementation of this paradigm.
+
+However, an audit decision is only useful when its evidence can be checked.
+In particular, a \textsc{fail} verdict should not merely show that the agent failed to find evidence of success.
+For example, if a notebook does not run a randomized-label sanity check, this absence does not prove that randomized labels would fail to reduce accuracy.
+It only shows that the evidence needed to decide the property is missing.
+This motivates adding one more step to Agentic Testing: for every \textsc{fail} verdict, a post-hoc verifier produces a 0--1 score for whether the cited evidence actually supports the failure.
+
+We evaluate this paradigm on ML pipelines because they make natural-language specification failures especially concrete: important bugs are often semantic, repository-wide, and experimentally verifiable, while complete formal specifications are unavailable.
+We evaluate this setup in three parts.
+First, we evaluate Agentic Testing on synthetic Kaggle notebooks with injected bugs, where precision and recall can be measured.
+Second, we evaluate how well the verifier can reject \textsc{fail} verdicts with bad evidence on synthetic Kaggle.
+Third, we evaluate Agentic Testing on real Kaggle notebooks using manual annotation.
+In the real setting we evaluate precision only, since we do not have ground truth for all true bugs.
+
+We summarize our contributions as follows.
+\begin{itemize}
+  \item We formulate \emph{Agentic Testing}: repository-level testing against natural-language specifications, with evidence-backed \textsc{pass}/\textsc{fail}/\textsc{inconclusive} verdicts.
+  \item We introduce Agentic Testing as an implementation of this paradigm and evaluate it on ML pipelines using 121 real and 75 synthetic Kaggle notebooks, including comparisons to TrainCheck and Codex Code Review on real data.
+  \item We show that a permissive LLM-assisted human audit overstates evidence quality: a strict human-only re-audit precision falls from 66.1\% to 40.0\%, with absence-as-failure as the dominant error mode.
+  \item We add a post-hoc evidence verifier and precision--recall evaluation protocol for natural-language audit evidence, finding that the current same-backbone verifier is not yet a reliable real-world filter.
+\end{itemize}
+
+\begin{figure}[!tb]
+  \centering
+  \includegraphics[width=\columnwidth,keepaspectratio]{figures/vibetest_evidence_verification.png}
+  \caption{Overview of Agentic Testing with evidence verification. The verifier is applied after the testing agent and scores whether each reported \textsc{fail} is justified by its cited evidence.}
+  \label{fig:overview}
+\end{figure}
+
+\section{Natural Language Specifications of Code}
+
+Software correctness is often described through informal specifications that are stated in natural language and at a high level rather than encoded into formal specifications.
+These informal specifications are used heavily by human programmers when finding bugs, but they are often unused by automated program analysis methods.
+For instance, query-based static analysis tools such as CodeQL require explicit, formalized queries, which makes them powerful but still dependent on a formalized specification of correctness~\citep{codeql}.
+We define an informal specification as a natural language statement about expected behavior or artifacts in a repository.
+Such properties are central in ML pipelines, where failures are often detectable only through repository-level context and human intent~\citep{schoop2021umlaut}.
+
+This section motivates the problem setting and introduces the datasets used in our study.
+The formal setting is domain-general; the empirical study instantiates it with ML pipeline properties.
+Representative ML examples appear below and the full inventory is in \Cref{app:properties}.
+
+We formalize the setting as follows.
+Classical program analysis asks whether a formal property holds on all traces of a program.
+Let $T(R)$ denote the set of concrete execution traces induced by repository $R$, and let $\phi$ be a formal predicate over traces, such as ``no array out of bounds.''
+The traditional goal is to decide whether $\forall t \in T(R), \phi(t)$ holds, or to find a counterexample trace when it does not.
+In our setting, the key difference is that the property is specified informally rather than as a formal predicate.
+
+Let $p$ be a natural language statement about expected behavior or artifacts in $R$, such as ``no training on the test set'' or ``augmentation is applied only to training data.''
+We then want to evaluate a pair $(R, p)$ and return a decision $y \in \{\textsc{pass}, \textsc{fail}, \textsc{inconclusive}\}$ with an evidence report $E$.
+The evidence report should identify the relevant files, executions, and outputs that justify $y$ and enable independent verification.
+This framing treats properties as inputs rather than handcrafted queries, enabling evaluation of high-level intent without requiring formal specifications.
+
+\subsection{ML Pipeline Bugs}
+ML pipeline bugs are often subtle and are diagnosed using domain heuristics and end-to-end context~\citep{schoop2021umlaut}.
+We use Kaggle-style ML pipeline repositories as the evaluation domain for Agentic Testing.
+This domain is useful for an initial evaluation because the properties are naturally expressed in English, span multiple files and execution artifacts, and can be evaluated in both synthetic and real-world settings.
+The real-world dataset contains randomly sampled submissions from each of three Kaggle competitions.
+The competitions are Titanic (tabular), Diabetic Retinopathy (image), and Natural Language Processing with Disaster Tweets (text)~\citep{kaggle_titanic,kaggle_diabetic_retinopathy,kaggle_disaster_tweets}.
+We also use a synthetic controlled setting in which known ML pipeline bugs are injected into clean Kaggle-style notebooks.
+Representative ML properties include:
+\begin{itemize}
+  \item No leakage from test to train/val sets.
+  \item Data augmentation is applied only to training data.
+  \item Reported metrics use the correct split and definitions.
+  \item Randomizing labels causes validation accuracy to drop near a random guessing baseline.
+  \item The model can overfit a single or tiny batch to near-zero loss.
+\end{itemize}
+
+\begin{singlecolcenter}
+\captionof{table}{Summary of ML pipeline datasets.}
+\label{tab:datasets}
+\small
+\singlecoltabular{%
+\begin{tabular}{llrr}
+  \toprule
+  Setting & Dataset & Properties & Size \\
+  \midrule
+  \multirow{3}{*}{Real Kaggle} & Titanic (tabular) & 16 & 50 \\
+  & Diabetic Retinopathy (image) & 16 & 21 \\
+  & Disaster Tweets (text) & 16 & 50 \\
+  \midrule
+  \multirow{3}{*}{Synthetic Kaggle} & Titanic (tabular) & 15 & 25 \\
+  & Diabetic Retinopathy (image) & 15 & 25 \\
+  & Disaster Tweets (text) & 15 & 25 \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+
+\section{Agentic Testing}
+
+We propose a testing agent that evaluates whether an informal property holds for a given repository.
+The agent takes two inputs: the code repository and a property specification written in natural language.
+It produces a decision of \textsc{pass}, \textsc{fail}, or \textsc{inconclusive}, along with an evidence report that justifies the decision.
+The design emphasizes repository-level reasoning rather than local code snippets and does not require formal specifications.
+Although our experiments use ML pipelines, the procedure is not ML-specific: the domain enters through the natural-language property and the evidence needed to support the verdict.
+
+\paragraph{Phase 1: Analysis}
+The agent first builds a high-level model of the repository to situate the property.
+It identifies key files, entry points, and relevant artifacts such as notebooks, scripts, configuration files, datasets, and documentation.
+When applicable, it assesses domain-specific assumptions that shape the property, such as which split is used for model selection or evaluation in an ML repository.
+This phase narrows the search space and yields a plan for evidence gathering.
+
+\paragraph{Phase 2: Evidence gathering}
+The agent reviews code, tests, and data processing logic to find evidence for or against the property.
+It can run code when necessary to validate behavior, reproduce results, or check for violations.
+The goal is to collect concrete, reproducible evidence tied to specific files, logs, or outputs.
+
+\paragraph{Phase 3: Decision}
+The agent aggregates the gathered evidence and produces a decision.
+\textsc{Pass} indicates the property is supported by evidence, \textsc{fail} indicates a violation, and \textsc{inconclusive} indicates insufficient evidence.
+The agent outputs an evidence report that highlights the relevant files, outputs, and reasoning steps that support the classification.
+The agent operates in a sandboxed copy of the repository and may modify code to probe properties, but these modifications do not persist to the original repository.
+
+\paragraph{Phase 4: Evidence verification}
+We add one more step after the testing agent.
+For any \textsc{fail} verdict, an LLM verifier receives the test property, the agent's reasoning, and the cited evidence.
+It outputs a score in $[0,1]$ indicating how strongly the original reason and evidence support the claimed \textsc{fail}.
+The current verifier uses a continuous evidence-support rubric: high scores require concrete, cited or directly checkable evidence that establishes the claimed failure; low scores are assigned to weak, vague, miscited, absence-only, best-practice-only, or contradictory evidence.
+The verifier is instructed not to search for unrelated new failures.
+This score can be thresholded to reject low-confidence failures and produce a precision-recall tradeoff curve over accepted reports.
+
+\section{Experiments}
+\subsection{Setup}
+
+We evaluate Agentic Testing with GPT-5-mini on all reported runs~\citep{openai_models}.
+Synthetic bugs were injected with GPT-5.2-codex~\citep{openai_models}.
+The post-hoc evidence verifier also uses GPT-5-mini with a continuous $[0,1]$ evidence-support prompt~\citep{openai_models}.
+For real Kaggle, we compare against TrainCheck~\citep{traincheck}, a domain-specific ML debugging baseline, and Codex Code Review~\citep{openai_codex}, an open-ended code-review baseline whose findings are mapped back to the same ML properties.
+Because these baselines are not evaluated on the synthetic injected-bug benchmark, we use them only for the real-Kaggle comparison.
+
+We collect the classification and evidence provided by each method on each (repo, property) pair and then use either ground truth or human evaluation to determine correctness.
+On synthetic Kaggle, the positive class is a ground-truth (GT) property failure: a predicted \textsc{fail} is a true positive when the corresponding property is labeled as failing in the injected-bug ground truth.
+Precision is true positives (TPs) divided by all predicted failures, and recall is true positives divided by all ground-truth failures.
+When we evaluate verifier filtering, we recompute these quantities only over \textsc{fail} predictions whose verifier score is at least a threshold $\tau$.
+In tables, ``ROC AUC'' means area under the receiver operating characteristic curve.
+For the real Kaggle benchmark, we only evaluate \textsc{fail} precision, since we do not have ground truth for all true bugs.
+We report two real-audit protocols.
+The full 380-\textsc{fail} audit is a permissive human audit with LLM assistance for code navigation and summarization.
+The 100-case strict re-audit is human-only: the annotator inspected the reported evidence and the corresponding Kaggle repository directly, without using an LLM to navigate code or suggest labels, and applied the present-and-violating rubric described in \Cref{sec:analysis}.
+Scripts and result files are in the public repository.
+
+\subsection{Question 1: Classification Accuracy on Synthetic Kaggle}
+We ask whether Agentic Testing can accurately classify (repo, property) pairs when ground truth is available.
+The synthetic Kaggle benchmark contains 75 injected notebooks across Titanic, Disaster Tweets, and Diabetic Retinopathy, with 15 properties per notebook for 1,125 notebook-property pairs.
+\begin{singlecolcenter}
+\captionof{table}{Agentic Testing on synthetic Kaggle injected bugs.}
+\label{tab:rq1}
+\small
+\singlecoltabular{%
+\begin{tabular}{lrrrrrr}
+  \toprule
+  Setting & Entries & GT Fails & Expected Fails & TP & Precision & Recall \\
+  \midrule
+  Synthetic Kaggle & 1,125 & 504 & 476 & 346 & 72.7\% & 68.7\% \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+Agentic Testing emits 476 \textsc{fail} predictions, of which 346 correspond to ground-truth property failures, giving 72.7\% precision and 68.7\% recall.
+We separately compute a stricter evidence-backed score that requires the reported evidence to match the injected violation.
+Under that stricter criterion, 280 of the 476 \textsc{fail} predictions are counted as supported true positives.
+This distinction matters because the verifier in Question 2 is evaluated as a filter over emitted \textsc{fail} reports, not as a replacement for the synthetic evidence-matching audit.
+
+\subsection{Question 2: Evidence Verification on Synthetic Kaggle}
+We ask how well the verifier can reject \textsc{fail} verdicts with bad evidence.
+For each Agentic Testing \textsc{fail}, the verifier outputs a score in $[0,1]$.
+We accept only \textsc{fail}s above a threshold $\tau$ and compare the accepted failures against synthetic ground truth, producing a precision--recall tradeoff over accepted reports~\citep{davis2006prroc}.
+
+In the current synthetic verifier run, the aggregate verifier ROC AUC is 0.58, indicating modest ranking ability but not a robust global filter.
+At $\tau=0.7$, the verifier reduces accepted \textsc{fail} reports from 476 to 469 and removes one false positive, but it also removes six true positives.
+As a result, precision changes from 72.7\% to 72.5\% and recall drops from 68.7\% to 67.5\%.
+\begin{singlecolcenter}
+\captionof{table}{Current synthetic verifier operating point. The verifier ROC AUC is 0.58.}
+\label{tab:rq2}
+\small
+\singlecoltabular{%
+\begin{tabular}{lrrrrr}
+  \toprule
+  Filter & Accepted failures & True positives & False positives & Precision & Recall \\
+  \midrule
+  Unfiltered & 476 & 346 & 130 & 72.7\% & 68.7\% \\
+  Threshold $\tau=0.7$ & 469 & 340 & 129 & 72.5\% & 67.5\% \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+Filtering therefore barely helps on synthetic Kaggle, though the verifier score still provides the intended precision-recall interface.
+\Cref{fig:verifier-pr-curves} shows the synthetic precision-recall tradeoff.
+
+\begin{figure}[!tb]
+  \centering
+  \includegraphics[width=\columnwidth,keepaspectratio]{figures/synthetic_verifier_pr_curve_combined.png}
+  \caption{Synthetic-Kaggle precision-recall curve for verifier-threshold filtering over \textsc{fail} predictions, using the continuous verifier run. The circle indicates the unfiltered baseline and the cross indicates $\tau=0.7$.}
+  \label{fig:verifier-pr-curves}
+\end{figure}
+
+The mixed result is useful.
+The verifier is the right mechanism for pruning unsupported reports, but the current prompt/backbone is not yet reliable enough to be treated as solved.
+This motivates evaluating verifier prompts, backbones, and calibration data as separate design choices.
+
+\subsection{Question 3: Real Kaggle Precision and Manual Annotation}
+We ask how precise Agentic Testing's \textsc{fail} verdicts are on real Kaggle notebooks.
+The real benchmark contains 121 public Kaggle notebooks: 50 Titanic, 50 Disaster Tweets, and 21 Diabetic Retinopathy~\citep{kaggle_titanic,kaggle_disaster_tweets,kaggle_diabetic_retinopathy}.
+Since the complete set of real bugs is unknown, we only measure precision.
+
+Agentic Testing emits 380 \textsc{fail} verdicts.
+The permissive LLM-assisted human audit labels 251 as Correct and 129 as Incorrect (66.1\% precision).
+A strict human-only present-and-violating re-audit of 100 sampled \textsc{fail}s lowers valid failures to 40 (40.0\% precision); 45 become \textsc{inconclusive} and 15 become \textsc{pass}.
+Under the original labels on that same 100-case sample, 64 remain Correct (64.0\%).
+\Cref{tab:real-baselines} compares coverage and both precision estimates against the available ML baselines by subdataset; baseline methods were not re-audited under the strict rubric.
+\begin{singlecolcenter}
+\captionof{table}{Real-Kaggle ML pipeline audit by subdataset. Permissive precision uses the original LLM-assisted human audit; strict precision uses the human-only present-and-violating re-audit on the sampled \textsc{fail}s in each split ($n=31/46/23$). Baselines report permissive precision only. Coverage is the fraction of pairs with a decisive \textsc{pass} or \textsc{fail} verdict.}
+\label{tab:real-baselines}
+\small
+\singlecoltabular{%
+\begin{tabular}{llrrr}
+  \toprule
+  Subdataset & Method & Permissive precision & Strict precision & Coverage \\
+  \midrule
+  \multirow{3}{*}{Titanic} & TrainCheck & Not applicable & -- & 18.0\% \\
+   & Codex Code Review & 36.8\% & -- & 3.6\% \\
+   & Agentic Testing & 58.9\% & 29.0\% & 75.8\% \\
+  \cmidrule(lr){2-5}
+  \multirow{3}{*}{Disaster Tweets} & TrainCheck & Not applicable & -- & 0.0\% \\
+   & Codex Code Review & 33.3\% & -- & 2.9\% \\
+   & Agentic Testing & 73.9\% & 50.0\% & 70.0\% \\
+  \cmidrule(lr){2-5}
+  \multirow{3}{*}{Diabetic} & TrainCheck & Not applicable & -- & 0.0\% \\
+   & Codex Code Review & 20.0\% & -- & 3.0\% \\
+   & Agentic Testing & 62.2\% & 34.8\% & 67.9\% \\
+  \cmidrule(lr){2-5}
+  All & Agentic Testing & 66.1\% & 40.0\% & 72.0\% \\
+  \bottomrule
+\end{tabular}%
+}
+
+\vspace{0.75em}
+\captionof{table}{Verifier filtering on the 100-case real-Kaggle strict human-only re-audit sample.}
+\label{tab:real-verifier}
+\singlecoltabular{%
+\begin{tabular}{lrrrr}
+  \toprule
+  Labels & Unfiltered precision & Precision at threshold 0.7 & Accepted failures & ROC AUC \\
+  \midrule
+  Strict re-audit & 40.0\% & 35.3\% & 17 & 0.46 \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+We compare verifier scores to the strict 100-case re-audit in \Cref{tab:real-verifier,fig:real-verifier-diagnostics}.
+The verifier ROC AUC is 0.46 and precision at $\tau=0.7$ is 35.3\% (6 correct accepted failures out of 17 accepted).
+This is worse than the unfiltered strict baseline of 40.0\%, so the current verifier actively harms strict real-world precision at this operating point.
+The result clarifies the next step: the verifier must be improved before it can reliably prune false \textsc{fail}s in real notebooks.
+
+\begin{figure}[!tb]
+  \centering
+  \includegraphics[width=\columnwidth,keepaspectratio]{figures/real_verifier_pr_curve_combined.png}
+  \caption{Real-Kaggle strict re-audit verifier precision-recall tradeoff over valid \textsc{fail}s. The curve lies below the unfiltered 40.0\% strict baseline across useful thresholds.}
+  \label{fig:real-verifier-diagnostics}
+\end{figure}
+
+\section{Analysis}
+\label{sec:analysis}
+
+\paragraph{Absence-as-failure}
+The dominant real-world failure mode is that Agentic Testing sometimes treats missing evidence as evidence of violation.
+For experiment-required tests, this is especially visible.
+\Cref{tab:experiment-required} summarizes verdict counts across 121 notebooks for four properties that require running an experiment.
+\begin{singlecolcenter}
+\captionof{table}{Experiment-required properties on real Kaggle (121 notebooks). These properties require running code to gather evidence; absence of the experiment is not evidence of violation.}
+\label{tab:experiment-required}
+\small
+\singlecoltabular{%
+\begin{tabular}{lrrr}
+  \toprule
+  Property & \textsc{Pass} & \textsc{Fail} & \textsc{Inconclusive} \\
+  \midrule
+  Randomized-label sanity & 0 & 44 & 77 \\
+  Baseline comparison & 0 & 23 & 98 \\
+  Training-loss behavior & 0 & 7 & 114 \\
+  Tiny-batch overfit & 1 & 13 & 107 \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+Randomized-label sanity receives 0 \textsc{pass}, 44 \textsc{fail}, and 77 \textsc{inconclusive} verdicts; baseline comparison receives 0/23/98; training-loss behavior receives 0/7/114; and tiny-batch overfit receives 1/13/107.
+In the strict re-audit, 21 of 22 experiment-required \textsc{fail}s become \textsc{inconclusive}.
+
+\paragraph{Present-and-violating rule}
+The underlying rule is simple.
+\textsc{Fail} should require evidence of a present-and-violating operation.
+If the relevant operation is absent, ambiguous, or unverifiable, the correct verdict is \textsc{inconclusive}.
+The verifier is intended to enforce this rule by rejecting failures whose evidence is insufficient.
+
+\section{Related Work}
+
+\paragraph{Repository-level agents and evaluation}
+RepoAudit proposes an autonomous LLM agent for repository-level auditing that reasons over data-flow facts and validates candidate reports~\citep{guo2025repoaudit}.
+BugScope learns bug patterns from examples and applies multi-agent auditing to detect diverse defects~\citep{liu2025bugscope}.
+SWE-bench frames repository-scale issue resolution and highlights the difficulty of end-to-end fixes that require coordinated edits across files~\citep{jimenez2024swebench}.
+
+\paragraph{Domain-specific ML debugging}
+ML debugging tools such as UMLAUT use expert heuristics to surface errors in deep learning programs by linking code structure and model behavior~\citep{schoop2021umlaut}.
+Other ML correctness tools such as Model Assertions and TorchQL similarly motivate systematic checking of ML pipelines~\citep{kang2020assertions,naik2024torchql}.
+Our work differs by taking natural-language properties as input and evaluating evidence sufficiency for the resulting agent verdicts.
+
+\paragraph{LLM verifiers}
+LLM verifiers separate generation from checking in reasoning tasks~\citep{cobbe2021verifier,lightman2024process}.
+LLM-as-judge methods evaluate open-ended outputs~\citep{zheng2023judge,tan2025judgebench}.
+Our verifier judges whether code-audit evidence supports a \textsc{fail} verdict, and our results show that this verifier should be evaluated independently rather than assumed to work by construction.
+
+\section{Conclusion}
+
+We introduced agentic testing, a repository-level framework for validating code against natural-language specifications, and instantiated it as Agentic Testing.
+The central natural language processing problem is translating an informal property into evidence-gathering actions and a verifiable verdict.
+We evaluated this framework on ML pipeline repositories because their correctness properties are naturally expressed in English and difficult to formalize completely.
+On synthetic Kaggle notebooks, Agentic Testing reaches 72.7\% \textsc{fail} precision and 68.7\% recall against injected-bug ground truth.
+On real Kaggle notebooks, the permissive LLM-assisted human audit gives 66.1\% \textsc{fail} precision and substantially higher coverage than domain-specific and code-review baselines, but a strict human-only present-and-violating re-audit on 100 sampled failures lowers this to 40.0\%, largely because many errors treat missing evidence as evidence of violation.
+The current same-backbone verifier has modest synthetic ranking ability (ROC AUC 0.58) but does not provide a deployable filter: at $\tau=0.7$ it barely changes synthetic precision and lowers strict real-world precision from 40.0\% to 35.3\%.
+The contribution is therefore the agentic-testing framing, its ML-pipeline evaluation, the present-and-violating rubric, and the precision--recall evaluation protocol; building a verifier that can reliably downgrade unsupported \textsc{fail}s to \textsc{inconclusive} remains future work.
+
+\section*{Limitations}
+
+\paragraph{Single domain}
+Agentic testing is intended as a general repository-level framework, but this paper evaluates it only on ML pipeline bugs in Kaggle-style repositories.
+The results may not transfer directly to production ML systems or other software domains without new property sets and audit protocols.
+
+\paragraph{Real-world recall}
+The real Kaggle setting has no complete bug ground truth.
+We audit precision of emitted \textsc{fail}s but cannot measure recall on real notebooks.
+
+\paragraph{Annotation protocol}
+The full real-world audit was labeled by one human annotator with LLM assistance for code navigation and summarization.
+The 100-case strict re-audit was human-only: the annotator reviewed the evidence and Kaggle repository directly and did not use an LLM to navigate code, summarize evidence, or suggest labels.
+We do not report inter-annotator agreement.
+The strict re-audit precision estimate is 40.0\% on $n=100$ cases, with an approximate 95\% binomial confidence interval of $[31\%, 50\%]$.
+
+\paragraph{Verifier backbone}
+The current verifier uses the same backbone family as Agentic Testing.
+Its weak real-label performance may reflect shared biases between the generator and verifier.
+
+\paragraph{Verifier target}
+The current continuous scoring prompt asks for a fine-grained evidence-support score in $[0,1]$: does the original reason and cited evidence support the original \textsc{fail}?
+This is related to, but not identical with, the stricter present-and-violating rubric used in the re-audit.
+The re-audit effectively distinguishes five evidence states: present-and-violating, present-and-satisfying, absent operation, present-but-unverifiable, and miscited or unsupported evidence.
+Future verifier prompts should predict this structured five-bin label before mapping it to a scalar accept/reject score.
+
+\paragraph{Future verifier loop}
+This paper evaluates the verifier as a post-hoc filter only.
+A natural next step is a structured verifier that first assigns one of the five evidence states above, then feeds a critique back to Agentic Testing so the agent can revise unsupported \textsc{fail}s into \textsc{inconclusive} when the evidence is absence-based or unverifiable.
+
+\section*{Ethics Statement}
+
+Automated code-auditing agents can waste developer time or erode trust if they report unsupported failures.
+Our results argue for conservative reporting and explicit evidence verification before surfacing automated bug reports.
+The real-world audit uses public Kaggle notebooks; supplementary material should reference public identifiers and avoid redistributing code where licensing is unclear.
+
+\FloatBarrier
+\bibliographystyle{acl_natbib}
+\bibliography{vibetest}
+
+\appendix
+\section{Full Informal Property List}
+\label{app:properties}
+
+{\setlength{\itemsep}{0.2em}
+\begin{itemize}
+  \item No leakage from test to train/val sets.
+  \item If there is any model selection or hyperparameter tuning, then it uses val only.
+  \item If there is any model training, then all model parameters are updated during training (no frozen layers unless explicitly intended).
+  \item Data is loaded and preprocessed correctly (e.g., no all-black images, no text with weird or unexpected characters, tables look correct and feature values are reasonable).
+  \item Any data augmentation is only performed on the training dataset; val/test dataset use deterministic preprocessing.
+  \item Any class-imbalance handling (weighted loss / sampler) applies only to training data.
+  \item No path/filename text is fed as a feature unless explicitly intended.
+  \item Reported metrics use the correct split(s) and the exact definitions claimed (e.g., micro vs macro, top-k).
+  \item Randomizing the labels results in accuracy dropping to be near a random guessing baseline (may not be 0.5 if the data is imbalanced) on a validation set.
+  \item The model after the full training procedure outperforms a simple baseline (e.g., random or majority class) on an evaluation set.
+  \item The model can overfit a single (or tiny) batch to near-zero loss.
+  \item Training loss generally decreases during training and plateaus within the number of epochs used (if no loss is logged, then add logging to check this).
+  \item Training dataloader shuffles or training dataset is shuffled for training; val/test do not shuffle.
+  \item Accuracy should be deterministic (same value) when running the model evaluation multiple times without retraining.
+  \item Model and inputs are consistently moved to one device; no implicit CPU-to-GPU transfers; dtype policy (e.g., fp32/bf16) is applied consistently.
+  \item Code does not use explicit loops or Python control flow when matrix operations could have been used to implement the exact same operation more efficiently.
+\end{itemize}}
+
+\end{document}
