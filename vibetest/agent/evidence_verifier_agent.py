@@ -170,7 +170,6 @@ class EvidenceVerifierAgent:
         metadata = test_case.metadata or {}
         original_reason = str(metadata.get("original_reason") or "").strip()
         original_evidence = str(metadata.get("original_evidence") or "").strip()
-        original_output = str(metadata.get("original_output") or "").strip()
         artifact_note = (
             "Saved evidence artifacts from the original VibeTest run are available under /evidence. "
             "If the original evidence cites /evidence/artifacts/..., inspect those files there."
@@ -192,9 +191,6 @@ Original reason:
 
 Original evidence:
 {original_evidence or "(not provided separately)"}
-
-Original full output:
-{original_output[:20000] if original_output else "(not provided)"}
 
 Judge only whether the original reason/evidence supports the FAIL verdict for
 the property. Inspect repository files as needed to verify citations and code
@@ -252,6 +248,7 @@ context. Do not search for unrelated new failures.
                 log_dir=self.log_dir,
                 retry_on_error=2,
                 fail_on_error=False,
+                max_sandboxes=20,
             )
             return self._parse_results(results, id_to_test_case)
         finally:

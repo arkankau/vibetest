@@ -29,7 +29,13 @@ import jsonlines
 from inspect_ai.model import GenerateConfig, get_model
 
 from vibetest import TestCase, VibeTestAgent
-from vibetest.agent import ClaudeCodeVibeTestAgent, CodexReviewAgent, CodexVibeTestAgent, EvidenceVerifierAgent
+from vibetest.agent import (
+    BaselineAgent,
+    ClaudeCodeVibeTestAgent,
+    CodexReviewAgent,
+    CodexVibeTestAgent,
+    EvidenceVerifierAgent,
+)
 from vibetest.baselines import (
     analyze_repo_with_codeql,
     map_review_to_hallucination_tests,
@@ -102,6 +108,14 @@ def _normalize_verdict(raw: Any, *, passed: Any = None) -> str:
     return "INCONCLUSIVE"
 
 
+def _normalize_score(raw: Any) -> float:
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(1.0, max(0.0, score))
+
+
 def _model_suffix(model_name: str) -> str:
     return model_name.split("/")[-1] if model_name else "unknown-model"
 
@@ -116,6 +130,12 @@ def _synthetic_property_sample_id(case: "SyntheticCase", prop: "PropertyGT") -> 
     return f"{dataset}_row{case.row_index}_{prop.property_id}"
 
 
+def _traincheck_case_output_root(base_output_root: Path, case: "SyntheticCase") -> Path:
+    dataset = _slug_sample_component(case.dataset, max_len=60)
+    repo = _slug_sample_component(case.repo_slug or case.repo_name, max_len=80)
+    return base_output_root / f"{dataset}_row{case.row_index:06d}_{repo}"
+
+
 def _synthetic_sandbox_path(case: "SyntheticCase") -> str:
     return "/kaggle" if case.domain == "ml-bugs" and case.dataset.startswith("kaggle_") else "/workspace"
 
@@ -124,9 +144,17 @@ def _synthetic_additional_data(case: "SyntheticCase") -> dict[str, str]:
     if case.domain != "ml-bugs":
         return {}
     if case.dataset == "kaggle_titanic":
-        return {"./titanic-kaggle-data": "/kaggle/input"}
+        return {
+            str(path): f"/kaggle/input/titanic/{path.name}"
+            for path in sorted(Path("./titanic-kaggle-data").glob("*"))
+            if path.is_file()
+        }
     if case.dataset == "kaggle_nlp":
-        return {"./nlp-kaggle-data": "/kaggle/input"}
+        return {
+            str(path): f"/kaggle/input/nlp-getting-started/{path.name}"
+            for path in sorted(Path("./nlp-kaggle-data").glob("*"))
+            if path.is_file()
+        }
     return {}
 
 
@@ -284,7 +312,7 @@ def _tests_from_props(
     mapper_model: str | None,
 ) -> list[dict[str, Any]]:
     verdict = _normalize_verdict(verdict)
-    passed = verdict == "PASS"
+    passed = True if verdict == "PASS" else False if verdict == "FAIL" else None
     out: list[dict[str, Any]] = []
     for idx, prop in enumerate(props):
         out.append(
@@ -300,6 +328,7 @@ def _tests_from_props(
                     "property_id": prop.property_id,
                     "property_text": prop.property_text,
                     "verdict": verdict,
+                    "fail_support_score": 0.0,
                     "evidence_text": "",
                 },
             }
@@ -451,7 +480,10 @@ def _load_injected_cases(
 
 
 def _serialize_test_result(result, prop: PropertyGT, prop_idx: int) -> dict[str, Any]:
-    metadata = dict(result.metadata or {})
+    metadata = {
+        **dict(getattr(result.test_case, "metadata", None) or {}),
+        **dict(result.metadata or {}),
+    }
     verdict = _normalize_verdict(metadata.get("verdict"), passed=result.passed)
     metadata.update(
         {
@@ -559,7 +591,6 @@ def _make_verifier_case(
             "evidence_artifacts_error": evidence_error,
             "original_reason": str(metadata.get("reason_text") or "").strip(),
             "original_evidence": str(metadata.get("evidence_text") or "").strip(),
-            "original_output": str(source_result.message or ""),
         },
     )
 
@@ -592,14 +623,15 @@ def _ensure_property_alignment(tests: list[dict[str, Any]], props: list[Property
             md["property_text"] = prop.property_text
             md["verdict"] = _normalize_verdict(md.get("verdict"), passed=t.get("passed"))
             md["evidence_text"] = str(md.get("evidence_text") or "")
+            md["fail_support_score"] = _normalize_score(md.get("fail_support_score"))
             t["metadata"] = md
-            t["passed"] = md["verdict"] == "PASS"
+            t["passed"] = True if md["verdict"] == "PASS" else False if md["verdict"] == "FAIL" else None
             out.append(t)
         else:
             out.append(
                 {
                     "description": "Property missing from mapped output.",
-                    "passed": False,
+                    "passed": None,
                     "evidence": [],
                     "execution_log": "",
                     "metadata": {
@@ -608,11 +640,32 @@ def _ensure_property_alignment(tests: list[dict[str, Any]], props: list[Property
                         "property_id": prop.property_id,
                         "property_text": prop.property_text,
                         "verdict": "INCONCLUSIVE",
+                        "fail_support_score": 0.0,
                         "evidence_text": "",
                     },
                 }
             )
     return out
+
+
+def _traincheck_mark_unmapped_properties_pass(tests: list[dict[str, Any]]) -> None:
+    for test in tests:
+        metadata = test.setdefault("metadata", {})
+        verdict = _normalize_verdict(metadata.get("verdict"), passed=test.get("passed"))
+        if verdict != "INCONCLUSIVE":
+            continue
+        metadata["verdict"] = "PASS"
+        metadata["fail_support_score"] = 0.0
+        metadata["evidence_text"] = str(metadata.get("evidence_text") or "")
+        reason = str(test.get("description") or metadata.get("reason_text") or "").strip()
+        if reason:
+            test["description"] = (
+                reason
+                + " No TrainCheck failed invariant clearly maps to this property, so the TrainCheck baseline does not flag it."
+            )
+        else:
+            test["description"] = "No TrainCheck failed invariant clearly maps to this property."
+        test["passed"] = True
 
 
 def _entry_from_tests(
@@ -888,10 +941,35 @@ def _run_codex(cases: list[SyntheticCase], args: argparse.Namespace) -> list[dic
     print("Running synthetic experiment with Codex reviewer baseline")
     print("=" * 80)
 
+    def _review_context(case: SyntheticCase) -> str:
+        if case.domain == "ml-bugs" and case.dataset.startswith("kaggle_"):
+            domain_context = (
+                "Domain context: This is a Kaggle machine-learning repository. "
+                "Review it for ML pipeline correctness issues, especially data loading, "
+                "preprocessing, train/validation/test separation, leakage, augmentation, "
+                "class imbalance handling, training behavior, evaluation, reported metrics, "
+                "reproducibility, device/dtype handling, and inefficient result-affecting code."
+            )
+        else:
+            domain_context = (
+                f"Domain context: {case.domain or 'unknown'} / {case.dataset or 'unknown'} repository. "
+                "Review it for correctness bugs and risky behavior."
+            )
+        property_lines = [
+            f"{prop.property_id}: {prop.property_text}"
+            for prop in case.properties
+        ]
+        return (
+            f"{domain_context}\n\n"
+            "Review checklist properties. Use these to focus the review, but do not force a finding for every property; "
+            "only report concrete issues that are supported by code, commands, or artifacts.\n"
+            + "\n".join(f"- {line}" for line in property_lines)
+        )
+
     test_cases = [
         TestCase(
             name=f"{_slug_sample_component(case.dataset, max_len=60)}_row{case.row_index}",
-            description="",
+            description=_review_context(case),
             repo_path=case.repo_path,
             sandbox_path=_synthetic_sandbox_path(case),
             additional_data=_synthetic_additional_data(case),
@@ -972,6 +1050,145 @@ def _run_codex(cases: list[SyntheticCase], args: argparse.Namespace) -> list[dic
                 tests,
                 usage=usage_from_result_metadata(result),
                 method="codex",
+                method_model=agent.model_name,
+            )
+        )
+    return entries
+
+
+def _baseline_reprompts(args: argparse.Namespace) -> int:
+    if args.baseline_reprompts is not None:
+        return max(0, int(args.baseline_reprompts))
+    mode = str(args.baseline_compute_mode or "0")
+    if mode == "1":
+        return 5
+    if mode == "2":
+        return 10
+    return 0
+
+
+def _baseline_method_name(args: argparse.Namespace) -> str:
+    reprompts = _baseline_reprompts(args)
+    if reprompts == 5 and str(args.baseline_compute_mode or "0") == "1":
+        return "baseline-reviewer-mode1"
+    if reprompts == 10 and str(args.baseline_compute_mode or "0") == "2":
+        return "baseline-reviewer-mode2"
+    if reprompts:
+        return f"baseline-reviewer-reprompt{reprompts}"
+    return "baseline-reviewer"
+
+
+def _run_baseline_reviewer(cases: list[SyntheticCase], args: argparse.Namespace) -> list[dict[str, Any]]:
+    print("=" * 80)
+    print("Running synthetic experiment with Inspect ReAct baseline reviewer")
+    print(f"Static review only: {not args.baseline_dynamic}")
+    print(f"Additional review passes after first submit: {_baseline_reprompts(args)}")
+    print("=" * 80)
+
+    def _review_context(case: SyntheticCase) -> str:
+        if case.domain == "ml-bugs" and case.dataset.startswith("kaggle_"):
+            domain_context = (
+                "Domain context: This is a Kaggle machine-learning repository. "
+                "Review it for ML pipeline correctness issues, especially data loading, "
+                "preprocessing, train/validation/test separation, leakage, augmentation, "
+                "class imbalance handling, training behavior, evaluation, reported metrics, "
+                "reproducibility, device/dtype handling, and inefficient result-affecting code."
+            )
+        else:
+            domain_context = (
+                f"Domain context: {case.domain or 'unknown'} / {case.dataset or 'unknown'} repository. "
+                "Review it for correctness bugs and risky behavior."
+            )
+        property_lines = [prop.property_text for prop in case.properties]
+        return (
+            f"{domain_context}\n\n"
+            "Task-specific guidelines. Use these to guide the bug review; they are not questions to answer one-by-one. "
+            "Only report concrete bug findings that are supported by code, commands, or artifacts.\n"
+            + "\n".join(f"- {line}" for line in property_lines)
+        )
+
+    test_cases = [
+        TestCase(
+            name=f"{_slug_sample_component(case.dataset, max_len=60)}_row{case.row_index}",
+            description=_review_context(case),
+            repo_path=case.repo_path,
+            sandbox_path=_synthetic_sandbox_path(case),
+            additional_data=_synthetic_additional_data(case),
+        )
+        for case in cases
+    ]
+
+    agent = BaselineAgent(
+        model=args.model or "openai/gpt-5-mini",
+        max_attempts=args.baseline_max_attempts,
+        static=not args.baseline_dynamic,
+        max_sandboxes=args.baseline_max_sandboxes,
+        reviewer_reprompts=_baseline_reprompts(args),
+        findings_json=True,
+    )
+    all_results = agent.execute_tests(test_cases, sandbox=args.sandbox)
+
+    entries: list[dict[str, Any]] = []
+    for case, result in zip(cases, all_results):
+        review_text = result.message or ""
+        props = case.properties
+
+        if not review_text.strip():
+            tests = _all_inconclusive_tests(
+                props,
+                reviewer="baseline-reviewer",
+                mapper_model=args.review_mapper_model,
+                reason="No baseline reviewer output captured.",
+            )
+        elif case.domain == "ml-bugs":
+            tests = map_review_to_kaggle_tests(
+                review_text,
+                [p.property_text for p in props],
+                reviewer="baseline-reviewer",
+                mapper_model=args.review_mapper_model,
+            )
+        elif case.domain == "security-vuln":
+            if case.dataset == "bibifi":
+                vuln_props: list[Any] = [p.property_text for p in props]
+            else:
+                vuln_props = []
+                for p in props:
+                    cwe_num = _extract_cwe_num(p.property_id, p.property_text) or "0"
+                    vuln_props.append((cwe_num, p.property_text))
+            tests = map_review_to_vuln_tests(
+                review_text,
+                case.dataset,
+                vuln_props,
+                repo_id_for_eval=case.repo_slug or case.repo_name,
+                reviewer="baseline-reviewer",
+                mapper_model=args.review_mapper_model,
+            )
+        else:
+            tests = _all_inconclusive_tests(
+                props,
+                reviewer="baseline-reviewer",
+                mapper_model=args.review_mapper_model,
+                reason="Unsupported domain for baseline reviewer mapping.",
+            )
+
+        _augment_tests_with_review(
+            tests,
+            review_text,
+            {
+                "baseline_reviewer_ok": bool(review_text.strip()),
+                "baseline_reviewer_error": None
+                if review_text.strip()
+                else "No review output captured",
+            },
+        )
+        tests = _ensure_property_alignment(tests, props, reviewer="baseline-reviewer")
+
+        entries.append(
+            _entry_from_tests(
+                case,
+                tests,
+                usage=usage_from_result_metadata(result),
+                method=_baseline_method_name(args),
                 method_model=agent.model_name,
             )
         )
@@ -1083,7 +1300,7 @@ def _run_traincheck(cases: list[SyntheticCase], args: argparse.Namespace) -> lis
         if case.domain != "ml-bugs":
             raise SystemExit("TrainCheck synthetic run currently supports only ml-bugs domain labels.")
 
-    output_root = Path(args.traincheck_output) if args.traincheck_output else None
+    output_root = Path(args.traincheck_output) if args.traincheck_output else Path("results") / "traincheck"
 
     invariants_path: Path | None = None
     reference_error: str | None = None
@@ -1146,7 +1363,7 @@ def _run_traincheck(cases: list[SyntheticCase], args: argparse.Namespace) -> lis
                 case.repo_path,
                 script_path=args.traincheck_script,
                 model_var=args.traincheck_model,
-                output_root=output_root,
+                output_root=_traincheck_case_output_root(output_root, case),
                 invariants_path=invariants_path,
                 infer_relations=[r.strip() for r in args.traincheck_relations.split(",") if r.strip()]
                 if args.traincheck_relations
@@ -1166,12 +1383,21 @@ def _run_traincheck(cases: list[SyntheticCase], args: argparse.Namespace) -> lis
 
         traincheck_ok = result.get("ok")
         failed_invariants = result.get("failed_invariants") or []
-        if traincheck_ok is False:
+        if failed_invariants:
+            review_text = result.get("review") or ""
+            tests = map_review_to_kaggle_tests(
+                review_text,
+                [p.property_text for p in case.properties],
+                reviewer="traincheck",
+                mapper_model=args.review_mapper_model,
+            )
+            _traincheck_mark_unmapped_properties_pass(tests)
+        elif traincheck_ok is False:
             tests = _all_inconclusive_tests(
                 case.properties,
                 reviewer="traincheck",
                 mapper_model=args.review_mapper_model,
-                reason="TrainCheck failed to run.",
+                reason=result.get("error") or "TrainCheck failed to run.",
             )
             review_text = ""
         elif not failed_invariants:
@@ -1182,14 +1408,6 @@ def _run_traincheck(cases: list[SyntheticCase], args: argparse.Namespace) -> lis
                 reason="No failed TrainCheck invariants.",
             )
             review_text = ""
-        else:
-            review_text = result.get("review") or ""
-            tests = map_review_to_kaggle_tests(
-                review_text,
-                [p.property_text for p in case.properties],
-                reviewer="traincheck",
-                mapper_model=args.review_mapper_model,
-            )
 
         _augment_tests_with_review(
             tests,
@@ -1200,6 +1418,7 @@ def _run_traincheck(cases: list[SyntheticCase], args: argparse.Namespace) -> lis
                 "trace_dir": result.get("trace_dir"),
                 "report_files": result.get("report_files", []),
                 "failed_invariants_count": result.get("failed_invariants_count", 0),
+                "check_summary": result.get("check_summary", {}),
                 "converted_notebook": result.get("converted_notebook"),
                 "reference_invariants": str(invariants_path) if invariants_path else "",
             },
@@ -1637,6 +1856,31 @@ def _write_results(path: Path, entries: list[dict[str, Any]]) -> None:
             writer.write(entry)
 
 
+def _load_result_entries(path: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    with jsonlines.open(str(path), mode="r") as reader:
+        for entry in reader:
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+def _rescore_results(args: argparse.Namespace) -> None:
+    input_path = Path(args.rescore_results)
+    output_path = Path(args.output_path) if args.output_path else input_path
+    entries = _load_result_entries(input_path)
+    print(f"Loaded existing results: {input_path}")
+    print(f"Rows: {len(entries)}")
+    print(f"Scoring predictions against synthetic ground truth with {args.scorer_model}...")
+    _score_entries(
+        entries,
+        scorer_model=args.scorer_model,
+        scorer_concurrency=args.scorer_concurrency,
+    )
+    _write_results(output_path, entries)
+    print(f"Wrote rescored results: {output_path}")
+
+
 def _infer_output_path(
     cases: list[SyntheticCase],
     method: str,
@@ -1657,6 +1901,7 @@ def _infer_output_path(
         "vibetest-codex": "AT-codex",
         "vibetest-claude": "AT-claude",
         "codex": "codex",
+        "baseline-reviewer": "baseline-reviewer",
         "traincheck": "traincheck",
         "codeql": "codeql",
         "refchecker": "refchecker",
@@ -1669,6 +1914,15 @@ def _infer_output_path(
 
 
 def _run(args: argparse.Namespace) -> None:
+    if args.rescore_results:
+        _rescore_results(args)
+        return
+
+    if not args.method:
+        raise SystemExit("--method is required unless --rescore-results is used.")
+    if not args.labels_path:
+        raise SystemExit("--labels-path is required unless --rescore-results is used.")
+
     if args.method == "codex-vibetest":
         args.method = "vibetest-codex"
     if args.iterative_verifier and args.method != "vibetest":
@@ -1704,6 +1958,9 @@ def _run(args: argparse.Namespace) -> None:
         method_model = args.model or "anthropic/claude-sonnet-4.5"
     elif args.method == "codex":
         entries = _run_codex(cases, args)
+        method_model = args.model or "openai/gpt-5-mini"
+    elif args.method == "baseline-reviewer":
+        entries = _run_baseline_reviewer(cases, args)
         method_model = args.model or "openai/gpt-5-mini"
     elif args.method == "traincheck":
         entries = _run_traincheck(cases, args)
@@ -1781,14 +2038,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--method",
-        choices=["vibetest", "vibetest-codex", "vibetest-claude", "codex-vibetest", "codex", "traincheck", "codeql", "refchecker"],
-        required=True,
+        choices=[
+            "vibetest",
+            "vibetest-codex",
+            "vibetest-claude",
+            "codex-vibetest",
+            "codex",
+            "baseline-reviewer",
+            "traincheck",
+            "codeql",
+            "refchecker",
+        ],
+        help="Synthetic experiment method. Required unless --rescore-results is used.",
     )
     parser.add_argument(
         "--labels-path",
         type=str,
-        required=True,
-        help="Path to synthetic injected labels JSONL (e.g., synth-data/injected/labels_kaggle_titanic.jsonl)",
+        help="Path to synthetic injected labels JSONL (e.g., synth-data/injected/labels_kaggle_titanic.jsonl). Required unless --rescore-results is used.",
+    )
+    parser.add_argument(
+        "--rescore-results",
+        type=str,
+        help="Existing synthetic result JSONL to rescore without rerunning the experiment. Defaults to overwriting the input unless --output-path is provided.",
     )
     parser.add_argument("--output-path", type=str, help="Optional explicit output JSONL path.")
     parser.add_argument("--domains", nargs="+", default=[], help="Optional domain filters (ml-bugs, security-vuln).")
@@ -1797,7 +2068,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-offset", type=int, default=0, help="Optional repositories to skip before running.")
     parser.add_argument("--sandbox", type=str, default="docker", help="Inspect sandbox backend.")
 
-    parser.add_argument("--model", type=str, help="Model for vibetest/codex methods.")
+    parser.add_argument("--model", type=str, help="Model for vibetest/codex/baseline-reviewer methods.")
     parser.add_argument("--dynamic", action="store_true", help="Use dynamic VibeTest agent mode.")
     parser.add_argument("--review-mapper-model", type=str, help="Model for review->property mapping.")
     parser.add_argument(
@@ -1829,9 +2100,45 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-max-files", type=int, help="Optional cap on files passed to Codex sandbox.")
     parser.add_argument("--codex-max-total-mb", type=int, help="Optional cap on total MB passed to Codex sandbox.")
     parser.add_argument("--codex-log-dir", type=str, default="./logs", help="Inspect log directory for codex runs.")
+    parser.add_argument(
+        "--baseline-max-attempts",
+        type=int,
+        default=20,
+        help="Maximum ReAct attempts for --method baseline-reviewer.",
+    )
+    parser.add_argument(
+        "--baseline-static",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--baseline-dynamic",
+        action="store_true",
+        help=(
+            "Allow --method baseline-reviewer to run code/tests. By default the reviewer is static-only "
+            "and is told not to run repository code, notebooks, tests, training scripts, or user code."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-max-sandboxes",
+        type=int,
+        default=10,
+        help="Maximum concurrent Inspect sandboxes for --method baseline-reviewer.",
+    )
+    parser.add_argument(
+        "--baseline-compute-mode",
+        choices=["0", "1", "2"],
+        default="0",
+        help="Compute scaling mode for --method baseline-reviewer: 0=no reprompt, 1=5 reprompts, 2=10 reprompts.",
+    )
+    parser.add_argument(
+        "--baseline-reprompts",
+        type=int,
+        help="Override number of additional baseline-reviewer static review passes after the first submit.",
+    )
 
     parser.add_argument("--traincheck-script", type=str, help="Optional explicit training script path inside each repo.")
-    parser.add_argument("--traincheck-model", type=str, help="Optional model variable name to patch in script.")
+    parser.add_argument("--traincheck-model", type=str, default="model", help="Model variable name to track for TrainCheck.")
     parser.add_argument("--traincheck-timeout", type=int, default=1200, help="TrainCheck timeout in seconds.")
     parser.add_argument("--traincheck-output", type=str, help="Optional TrainCheck output root.")
     parser.add_argument("--traincheck-relations", type=str, help="Comma-separated invariant relations for infer/check.")

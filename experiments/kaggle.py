@@ -85,7 +85,7 @@ def _all_inconclusive_tests(
         tests.append(
             {
                 "description": reason,
-                "passed": False,
+                "passed": None,
                 "evidence": [],
                 "execution_log": "",
                 "metadata": {
@@ -99,6 +99,26 @@ def _all_inconclusive_tests(
             }
         )
     return tests
+
+
+def _traincheck_mark_unmapped_properties_pass(tests: list[dict]) -> None:
+    for test in tests:
+        metadata = test.setdefault("metadata", {})
+        verdict = str(metadata.get("verdict") or "").strip().upper()
+        if verdict != "INCONCLUSIVE":
+            continue
+        metadata["verdict"] = "PASS"
+        metadata["fail_support_score"] = 0.0
+        metadata["evidence_text"] = str(metadata.get("evidence_text") or "")
+        reason = str(test.get("description") or "").strip()
+        if reason:
+            test["description"] = (
+                reason
+                + " No TrainCheck failed invariant clearly maps to this property, so the TrainCheck baseline does not flag it."
+            )
+        else:
+            test["description"] = "No TrainCheck failed invariant clearly maps to this property."
+        test["passed"] = True
 
 
 def run_traincheck_baseline(
@@ -199,6 +219,7 @@ def run_traincheck_baseline(
                 reviewer="traincheck",
                 mapper_model=mapper_model,
             )
+            _traincheck_mark_unmapped_properties_pass(tests)
         _augment_tests_with_review(
             tests,
             review_text,
@@ -208,6 +229,7 @@ def run_traincheck_baseline(
                 "trace_dir": result.get("trace_dir"),
                 "report_files": result.get("report_files", []),
                 "failed_invariants_count": result.get("failed_invariants_count", 0),
+                "check_summary": result.get("check_summary", {}),
                 "converted_notebook": result.get("converted_notebook"),
                 "reference_invariants": str(invariants_path),
             },

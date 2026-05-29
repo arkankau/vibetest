@@ -22,7 +22,9 @@ _REPO_ROOT = "/workspace/repo"
 
 _CODEX_REVIEW_INSTRUCTIONS = """You are a code reviewer auditing the repository for correctness bugs and risky behavior.
 
-Review the repository and report any concrete findings you can support from the code or from commands you run.
+Review the repository and report concrete findings you can support from the code or from commands you run. Focus on issues that affect correctness, data handling, training/evaluation behavior, reported results, reproducibility, or runtime behavior. Do not report speculative issues.
+
+When the prompt includes a domain-specific review checklist, use it to guide what you look for, but do not force a finding for every checklist item. Report only findings with checkable evidence.
 """
 
 _CODEX_VIBETEST_INSTRUCTIONS = """You are an expert software testing agent that evaluates a repository against one natural-language property.
@@ -297,6 +299,7 @@ class _CodexAgentBase:
                 log_dir=self.log_dir,
                 retry_on_error=1,
                 fail_on_error=False,
+                max_sandboxes=20,
             )
             return self._parse_results(results, id_to_test_case)
         finally:
@@ -369,7 +372,20 @@ class CodexReviewAgent(_CodexAgentBase):
         return _CODEX_REVIEW_INSTRUCTIONS
 
     def _create_prompt(self, test_case: TestCase) -> str:
-        return f"{self.codex_prompt}\n\nRepository: {_REPO_ROOT}\nReview the repository."
+        context = test_case.description.strip() if test_case.description else ""
+        additional_data = ""
+        if test_case.additional_data:
+            mounted_paths = sorted(set(test_case.additional_data.values()))
+            additional_data = "\nAdditional data mounted in the sandbox:\n" + "\n".join(
+                f"- {path}" for path in mounted_paths
+            )
+        return f"""{self.codex_prompt}
+
+Repository: {_REPO_ROOT}{additional_data}
+
+{context}
+
+Review the repository. Use the context/checklist above to focus your review, but report only concrete findings with checkable evidence."""
 
     def _target(self) -> str:
         return "REVIEW"
