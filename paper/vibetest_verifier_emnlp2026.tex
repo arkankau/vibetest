@@ -1,4 +1,4 @@
-%%%%%%%%%%%%%%%%%%%% VIBETEST -- EMNLP 2026 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%% VIBETEST / EMNLP 2026 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %
 % Uses the official ACL style files from:
 %   https://github.com/acl-org/acl-style-files
@@ -7,10 +7,10 @@
 %   8 pages of content, excluding references, limitations, ethics, and appendix.
 %
 % Compile FROM this directory (paper/):
-%   pdflatex agentic_testing_emnlp2026
-%   bibtex agentic_testing_emnlp2026
-%   pdflatex agentic_testing_emnlp2026
-%   pdflatex agentic_testing_emnlp2026
+%   pdflatex vibetest_verifier_emnlp2026
+%   bibtex vibetest_verifier_emnlp2026
+%   pdflatex vibetest_verifier_emnlp2026
+%   pdflatex vibetest_verifier_emnlp2026
 % Requires ACL style files on TEXINPUTS and figures/ populated (see sync_paper_figures.ps1).
 %
 % Submission mode:
@@ -88,8 +88,8 @@ A testing agent operates within a sandboxed copy of the repository, translates i
 We instantiate this paradigm as Agentic Testing and evaluate it on machine learning (ML) pipelines, a focused domain where high-level intent is common and formal specifications are scarce.
 Across 121 real and 75 synthetic Kaggle notebooks, Agentic Testing evaluates up to 16 natural-language properties per repository.
 On real notebooks, it achieves higher coverage and permissive LLM-assisted \textsc{fail} precision than TrainCheck and Codex Code Review, but a strict human-only present-and-violating re-audit lowers valid \textsc{fail}s from 66.1\% to 40.0\% on a 100-case sample, largely due to absence-as-failure errors.
-We add a post-hoc evidence verifier and precision--recall analysis over verifier scores.
-The verifier provides the intended evaluation interface, but the current same-backbone GPT-5-mini verifier ranks near chance on real data and does not improve strict audit precision at $\tau=0.7$.
+For experiment-required tests, 21 of 22 strict re-audited \textsc{fail}s become \textsc{inconclusive}, showing that absent evidence is the dominant source of unsupported failures.
+We add a post-hoc evidence verifier and precision-recall analysis over verifier scores, finding that the current same-backbone GPT-5-mini verifier ranks near chance on real data and does not address this failure mode at $\tau=0.7$.
 \end{abstract}
 
 \section{Introduction}
@@ -122,7 +122,7 @@ However, an audit decision is only useful when its evidence can be checked.
 In particular, a \textsc{fail} verdict should not merely show that the agent failed to find evidence of success.
 For example, if a notebook does not run a randomized-label sanity check, this absence does not prove that randomized labels would fail to reduce accuracy.
 It only shows that the evidence needed to decide the property is missing.
-This motivates adding one more step to Agentic Testing: for every \textsc{fail} verdict, a post-hoc verifier produces a 0--1 score for whether the cited evidence actually supports the failure.
+This motivates adding one more step to Agentic Testing: for every \textsc{fail} verdict, a post-hoc verifier produces a 0-1 score for whether the cited evidence actually supports the failure.
 
 We evaluate this paradigm on ML pipelines because they make natural-language specification failures especially concrete: important bugs are often semantic, repository-wide, and experimentally verifiable, while complete formal specifications are unavailable.
 We evaluate this setup in three parts.
@@ -136,13 +136,13 @@ We summarize our contributions as follows.
   \item We formulate \emph{Agentic Testing}: repository-level testing against natural-language specifications, with evidence-backed \textsc{pass}/\textsc{fail}/\textsc{inconclusive} verdicts.
   \item We introduce Agentic Testing as an implementation of this paradigm and evaluate it on ML pipelines using 121 real and 75 synthetic Kaggle notebooks, including comparisons to TrainCheck and Codex Code Review on real data.
   \item We show that a permissive LLM-assisted human audit overstates evidence quality: a strict human-only re-audit precision falls from 66.1\% to 40.0\%, with absence-as-failure as the dominant error mode.
-  \item We add a post-hoc evidence verifier and precision--recall evaluation protocol for natural-language audit evidence, finding that the current same-backbone verifier is not yet a reliable real-world filter.
+  \item We add a post-hoc evidence verifier and precision-recall evaluation protocol for natural-language audit evidence, finding that naive same-backbone verification does not address absence-based false \textsc{fail}s on real notebooks.
 \end{itemize}
 
 \begin{figure}[!tb]
   \centering
   \includegraphics[width=\columnwidth,keepaspectratio]{figures/vibetest_evidence_verification.png}
-  \caption{Overview of Agentic Testing with evidence verification. The verifier is applied after the testing agent and scores whether each reported \textsc{fail} is justified by its cited evidence.}
+  \caption{Overview of Agentic Testing with evidence verification. The diagram shows the repository and property specification entering a testing agent with analysis, evidence-gathering, and decision phases. The verifier is applied after the testing agent and scores whether each reported \textsc{fail} is justified by its cited evidence.}
   \label{fig:overview}
 \end{figure}
 
@@ -156,7 +156,7 @@ Such properties are central in ML pipelines, where failures are often detectable
 
 This section motivates the problem setting and introduces the datasets used in our study.
 The formal setting is domain-general; the empirical study instantiates it with ML pipeline properties.
-Representative ML examples appear below and the full inventory is in \Cref{app:properties}.
+Representative ML examples appear below and the full inventory is provided in the appendix.
 
 We formalize the setting as follows.
 Classical program analysis asks whether a formal property holds on all traces of a program.
@@ -219,17 +219,24 @@ The agent first builds a high-level model of the repository to situate the prope
 It identifies key files, entry points, and relevant artifacts such as notebooks, scripts, configuration files, datasets, and documentation.
 When applicable, it assesses domain-specific assumptions that shape the property, such as which split is used for model selection or evaluation in an ML repository.
 This phase narrows the search space and yields a plan for evidence gathering.
+In our implementation, the default tool set includes shell commands, Python execution, a text editor, and an explicit planning tool.
+The agent commonly begins with lightweight search and inspection commands over \texttt{/workspace/repo}, then opens notebooks or scripts that define data splits, transforms, training loops, and metric computation.
 
 \paragraph{Phase 2: Evidence gathering}
 The agent reviews code, tests, and data processing logic to find evidence for or against the property.
 It can run code when necessary to validate behavior, reproduce results, or check for violations.
 The goal is to collect concrete, reproducible evidence tied to specific files, logs, or outputs.
+Repository files are copied into a Docker sandbox, and tool calls execute inside that sandbox with bounded command timeouts.
+For ML properties, typical evidence includes split-construction code, dataloader configuration, preprocessing transforms, evaluation cells, short reruns, and captured outputs.
+When execution is too expensive or the relevant operation is absent, the agent should mark the property \textsc{inconclusive} rather than infer failure from missing evidence.
 
 \paragraph{Phase 3: Decision}
 The agent aggregates the gathered evidence and produces a decision.
 \textsc{Pass} indicates the property is supported by evidence, \textsc{fail} indicates a violation, and \textsc{inconclusive} indicates insufficient evidence.
 The agent outputs an evidence report that highlights the relevant files, outputs, and reasoning steps that support the classification.
 The agent operates in a sandboxed copy of the repository and may modify code to probe properties, but these modifications do not persist to the original repository.
+The verdict schema forces the agent to separate a detected violation from an unsupported claim.
+The evidence report is therefore part of the prediction: a \textsc{fail} is useful only if its cited code or execution output lets a later auditor reconstruct why the property is violated.
 
 \paragraph{Phase 4: Evidence verification}
 We add one more step after the testing agent.
@@ -238,6 +245,8 @@ It outputs a score in $[0,1]$ indicating how strongly the original reason and ev
 The current verifier uses a continuous evidence-support rubric: high scores require concrete, cited or directly checkable evidence that establishes the claimed failure; low scores are assigned to weak, vague, miscited, absence-only, best-practice-only, or contradictory evidence.
 The verifier is instructed not to search for unrelated new failures.
 This score can be thresholded to reject low-confidence failures and produce a precision-recall tradeoff curve over accepted reports.
+Verifier runs use a clean context: the verifier sees the property, the reported rationale, and evidence artifacts, but not the original agent's hidden trajectory.
+This makes verification a separate evidence-grading task rather than a second attempt to rediscover the bug.
 
 \section{Experiments}
 \subsection{Setup}
@@ -259,7 +268,7 @@ The full 380-\textsc{fail} audit is a permissive human audit with LLM assistance
 The 100-case strict re-audit is human-only: the annotator inspected the reported evidence and the corresponding Kaggle repository directly, without using an LLM to navigate code or suggest labels, and applied the present-and-violating rubric described in \Cref{sec:analysis}.
 Scripts and result files are in the public repository.
 
-\subsection{Question 1: Classification Accuracy on Synthetic Kaggle}
+\subsection{RQ1: Classification Accuracy on Synthetic Kaggle}
 We ask whether Agentic Testing can accurately classify (repo, property) pairs when ground truth is available.
 The synthetic Kaggle benchmark contains 75 injected notebooks across Titanic, Disaster Tweets, and Diabetic Retinopathy, with 15 properties per notebook for 1,125 notebook-property pairs.
 \begin{singlecolcenter}
@@ -279,27 +288,27 @@ The synthetic Kaggle benchmark contains 75 injected notebooks across Titanic, Di
 Agentic Testing emits 476 \textsc{fail} predictions, of which 346 correspond to ground-truth property failures, giving 72.7\% precision and 68.7\% recall.
 We separately compute a stricter evidence-backed score that requires the reported evidence to match the injected violation.
 Under that stricter criterion, 280 of the 476 \textsc{fail} predictions are counted as supported true positives.
-This distinction matters because the verifier in Question 2 is evaluated as a filter over emitted \textsc{fail} reports, not as a replacement for the synthetic evidence-matching audit.
+This distinction matters because the verifier in RQ2 is evaluated as a filter over emitted \textsc{fail} reports, not as a replacement for the synthetic evidence-matching audit.
 
-\subsection{Question 2: Evidence Verification on Synthetic Kaggle}
+\subsection{RQ2: Evidence Verification on Synthetic Kaggle}
 We ask how well the verifier can reject \textsc{fail} verdicts with bad evidence.
 For each Agentic Testing \textsc{fail}, the verifier outputs a score in $[0,1]$.
-We accept only \textsc{fail}s above a threshold $\tau$ and compare the accepted failures against synthetic ground truth, producing a precision--recall tradeoff over accepted reports~\citep{davis2006prroc}.
+We accept only \textsc{fail}s above a threshold $\tau$ and compare the accepted failures against synthetic ground truth, producing a precision-recall tradeoff over accepted reports~\citep{davis2006prroc}.
 
 In the current synthetic verifier run, the aggregate verifier ROC AUC is 0.58, indicating modest ranking ability but not a robust global filter.
 At $\tau=0.7$, the verifier reduces accepted \textsc{fail} reports from 476 to 469 and removes one false positive, but it also removes six true positives.
 As a result, precision changes from 72.7\% to 72.5\% and recall drops from 68.7\% to 67.5\%.
 \begin{singlecolcenter}
-\captionof{table}{Current synthetic verifier operating point. The verifier ROC AUC is 0.58.}
+\captionof{table}{Current synthetic verifier operating point.}
 \label{tab:rq2}
 \small
 \singlecoltabular{%
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrrrrr}
   \toprule
-  Filter & Accepted failures & True positives & False positives & Precision & Recall \\
+  Filter & Accepted failures & True positives & False positives & Precision & Recall & ROC AUC \\
   \midrule
-  Unfiltered & 476 & 346 & 130 & 72.7\% & 68.7\% \\
-  Threshold $\tau=0.7$ & 469 & 340 & 129 & 72.5\% & 67.5\% \\
+  Unfiltered & 476 & 346 & 130 & 72.7\% & 68.7\% & 0.58 \\
+  Threshold $\tau=0.7$ & 469 & 340 & 129 & 72.5\% & 67.5\% & n/a \\
   \bottomrule
 \end{tabular}%
 }
@@ -314,11 +323,10 @@ Filtering therefore barely helps on synthetic Kaggle, though the verifier score 
   \label{fig:verifier-pr-curves}
 \end{figure}
 
-The mixed result is useful.
-The verifier is the right mechanism for pruning unsupported reports, but the current prompt/backbone is not yet reliable enough to be treated as solved.
-This motivates evaluating verifier prompts, backbones, and calibration data as separate design choices.
+This establishes the synthetic verifier finding: same-backbone verification gives a score interface and modest ranking signal, but thresholding does not materially improve the \textsc{fail} set.
+The synthetic setting is also favorable to the verifier because injected bugs are present-and-violating by construction, making the evidence pattern closer to the verifier's continuous evidence-support rubric.
 
-\subsection{Question 3: Real Kaggle Precision and Manual Annotation}
+\subsection{RQ3: Real Kaggle Precision and Manual Annotation}
 We ask how precise Agentic Testing's \textsc{fail} verdicts are on real Kaggle notebooks.
 The real benchmark contains 121 public Kaggle notebooks: 50 Titanic, 50 Disaster Tweets, and 21 Diabetic Retinopathy~\citep{kaggle_titanic,kaggle_disaster_tweets,kaggle_diabetic_retinopathy}.
 Since the complete set of real bugs is unknown, we only measure precision.
@@ -337,16 +345,16 @@ Under the original labels on that same 100-case sample, 64 remain Correct (64.0\
   \toprule
   Subdataset & Method & Permissive precision & Strict precision & Coverage \\
   \midrule
-  \multirow{3}{*}{Titanic} & TrainCheck & Not applicable & -- & 18.0\% \\
-   & Codex Code Review & 36.8\% & -- & 3.6\% \\
+  \multirow{3}{*}{Titanic} & TrainCheck & Not applicable & n/a & 18.0\% \\
+   & Codex Code Review & 36.8\% & n/a & 3.6\% \\
    & Agentic Testing & 58.9\% & 29.0\% & 75.8\% \\
   \cmidrule(lr){2-5}
-  \multirow{3}{*}{Disaster Tweets} & TrainCheck & Not applicable & -- & 0.0\% \\
-   & Codex Code Review & 33.3\% & -- & 2.9\% \\
+  \multirow{3}{*}{Disaster Tweets} & TrainCheck & Not applicable & n/a & 0.0\% \\
+   & Codex Code Review & 33.3\% & n/a & 2.9\% \\
    & Agentic Testing & 73.9\% & 50.0\% & 70.0\% \\
   \cmidrule(lr){2-5}
-  \multirow{3}{*}{Diabetic} & TrainCheck & Not applicable & -- & 0.0\% \\
-   & Codex Code Review & 20.0\% & -- & 3.0\% \\
+  \multirow{3}{*}{Diabetic} & TrainCheck & Not applicable & n/a & 0.0\% \\
+   & Codex Code Review & 20.0\% & n/a & 3.0\% \\
    & Agentic Testing & 62.2\% & 34.8\% & 67.9\% \\
   \cmidrule(lr){2-5}
   All & Agentic Testing & 66.1\% & 40.0\% & 72.0\% \\
@@ -370,7 +378,8 @@ Under the original labels on that same 100-case sample, 64 remain Correct (64.0\
 We compare verifier scores to the strict 100-case re-audit in \Cref{tab:real-verifier,fig:real-verifier-diagnostics}.
 The verifier ROC AUC is 0.46 and precision at $\tau=0.7$ is 35.3\% (6 correct accepted failures out of 17 accepted).
 This is worse than the unfiltered strict baseline of 40.0\%, so the current verifier actively harms strict real-world precision at this operating point.
-The result clarifies the next step: the verifier must be improved before it can reliably prune false \textsc{fail}s in real notebooks.
+This establishes the central verifier finding: naive same-backbone LLM verification does not address the dominant real-world failure mode.
+The synthetic-to-real gap is informative: synthetic failures are injected violations with concrete bug locations, while many real false \textsc{fail}s are absence-based or unverifiable, exactly the cases where an evidence-support score is easiest to over-trust.
 
 \begin{figure}[!tb]
   \centering
@@ -426,8 +435,11 @@ Our work differs by taking natural-language properties as input and evaluating e
 
 \paragraph{LLM verifiers}
 LLM verifiers separate generation from checking in reasoning tasks~\citep{cobbe2021verifier,lightman2024process}.
+Prior work often uses verifiers for answer selection or step-level process supervision, where the verifier grades whether a proposed solution or reasoning step is correct.
+Self-verification and self-refinement methods instead ask a model to critique or revise its own output, often as part of an iterative generation loop~\citep{weng2023selfverification,madaan2023selfrefine}.
 LLM-as-judge methods evaluate open-ended outputs~\citep{zheng2023judge,tan2025judgebench}.
-Our verifier judges whether code-audit evidence supports a \textsc{fail} verdict, and our results show that this verifier should be evaluated independently rather than assumed to work by construction.
+Our setting is different: the verifier is not grading fluent output quality or selecting among candidate answers, but judging whether cited repository evidence supports a specific \textsc{fail} verdict.
+Our results show that this evidence-grading task must be evaluated independently rather than assumed to work by construction.
 
 \section{Conclusion}
 
@@ -436,8 +448,11 @@ The central natural language processing problem is translating an informal prope
 We evaluated this framework on ML pipeline repositories because their correctness properties are naturally expressed in English and difficult to formalize completely.
 On synthetic Kaggle notebooks, Agentic Testing reaches 72.7\% \textsc{fail} precision and 68.7\% recall against injected-bug ground truth.
 On real Kaggle notebooks, the permissive LLM-assisted human audit gives 66.1\% \textsc{fail} precision and substantially higher coverage than domain-specific and code-review baselines, but a strict human-only present-and-violating re-audit on 100 sampled failures lowers this to 40.0\%, largely because many errors treat missing evidence as evidence of violation.
-The current same-backbone verifier has modest synthetic ranking ability (ROC AUC 0.58) but does not provide a deployable filter: at $\tau=0.7$ it barely changes synthetic precision and lowers strict real-world precision from 40.0\% to 35.3\%.
-The contribution is therefore the agentic-testing framing, its ML-pipeline evaluation, the present-and-violating rubric, and the precision--recall evaluation protocol; building a verifier that can reliably downgrade unsupported \textsc{fail}s to \textsc{inconclusive} remains future work.
+The current same-backbone verifier has modest synthetic ranking ability (ROC AUC 0.58), but at $\tau=0.7$ it barely changes synthetic precision and lowers strict real-world precision from 40.0\% to 35.3\%.
+We make two findings.
+First, a single rule, \textsc{fail} requires evidence of a present-and-violating operation, unifies the recurring failure modes of LLM-agent code auditors; the 40.0\% strict precision and the reclassification of 21 of 22 experiment-required \textsc{fail}s establish this empirically.
+Second, naive same-backbone verification does not address this failure mode (ROC AUC 0.46 on real audits), motivating structured five-state verifiers as the next step.
+Agentic Testing provides the framework and evaluation protocol that make both findings measurable.
 
 \section*{Limitations}
 

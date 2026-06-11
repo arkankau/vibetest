@@ -1,0 +1,329 @@
+%%%%%%%%%%%%%%%%%%%% AGENTIC TESTING -- EMNLP 2026 SHORT %%%%%%%%%%%%%%%%%%%%%
+%
+% Short-paper draft focused on Agentic Testing for ML pipeline bugs.
+% Compile from paper/:
+%   pdflatex agentic_testing_short_emnlp2026
+%   bibtex agentic_testing_short_emnlp2026
+%   pdflatex agentic_testing_short_emnlp2026
+%   pdflatex agentic_testing_short_emnlp2026
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\captionsetup{font=small,skip=4pt}
+
+\definecolor{darkblue}{rgb}{0, 0, 0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+\setcounter{topnumber}{3}
+\setcounter{bottomnumber}{2}
+\setcounter{totalnumber}{5}
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.75}
+
+\newcommand{\singlecoltabular}[1]{\resizebox{\columnwidth}{!}{#1}}
+\newenvironment{singlecolcenter}{%
+  \begin{center}%
+  \begin{minipage}{\columnwidth}%
+  \centering
+}{%
+  \end{minipage}%
+  \end{center}%
+}
+
+\title{Agentic Testing: Validating Repositories Against\\Natural Language Specifications}
+
+\author{Anonymous ACL submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Software correctness remains difficult to validate at the repository level, especially when intent is specified only in natural language.
+At the same time, highly capable large language model agents increasingly modify and review codebases from high-level instructions.
+We propose \emph{Agentic Testing}, a testing paradigm for repository-level correctness evaluation without requiring formal specifications.
+A testing agent operates within a sandboxed copy of a repository, translates informal properties into analysis and evidence-gathering actions, and returns a \textsc{pass}/\textsc{fail}/\textsc{inconclusive} verdict with an evidence report.
+We evaluate Agentic Testing on machine learning pipelines, a domain where high-level intent is common and formal specifications are scarce.
+Across 121 real and 75 synthetic Kaggle notebooks, Agentic Testing evaluates up to 16 natural-language properties per repository.
+On synthetic notebooks with injected bugs, Agentic Testing reaches 72.7\% \textsc{fail} precision and 68.7\% recall.
+On real notebooks, it achieves higher coverage and permissive \textsc{fail} precision than TrainCheck and Codex Code Review, but strict human-only evidence audit lowers valid \textsc{fail}s from 66.1\% to 40.0\%.
+\end{abstract}
+
+\section{Introduction}
+
+The correctness of repository-scale software systems remains challenging to test even as AI coding agents make such systems easier to create and modify.
+Checking correctness requires validating that the developer's intent is reflected in the code, but this intent is often stated informally in natural language~\citep{zeller2009why}.
+A developer may ask that a training script avoid leakage, that evaluation use a held-out split, or that a reported metric match its stated definition.
+These requirements are easy to state, but difficult for automated systems to test because they require interpreting language, locating relevant code, running or modifying the repository, and producing evidence that another person can verify.
+
+At the same time, software engineering is being reshaped by increasingly capable AI agents~\citep{metr2025longtasks}.
+Benchmarks such as SWE-bench task models with resolving real-world bug reports in repositories~\citep{jimenez2024swebench,swebench-verified}, and recent analyses show that agentic workflows are becoming increasingly effective at solving these tasks~\citep{xia2024agentless,guo2025repoaudit}.
+Commercial coding agents now also support code review and repository-level development workflows~\citep{openai_codex}, making it important to evaluate whether their reported failures are grounded in checkable evidence.
+
+Existing approaches to software correctness provide complementary but incomplete coverage.
+Static analysis is powerful when a property is formalized, but it requires explicit specifications and often must trade completeness for tractability~\citep{cousot1979systematic,nielson1999principles}.
+Query-based tools such as CodeQL similarly require explicit bug patterns or project-specific checks~\citep{codeql}.
+Domain-specific machine learning (ML) debugging tools surface important pipeline errors, but depend on hand-designed checks or workflow assumptions~\citep{schoop2021umlaut,traincheck}.
+Together, these methods leave a gap for evaluating high-level intent without preexisting formal specifications.
+
+This gap raises a broader question.
+\textit{How do we evaluate repository correctness with respect to high-level natural-language specifications rather than formal specifications?}
+We introduce \emph{Agentic Testing}, a general paradigm for validating repositories against natural language specifications.
+The agent takes a repository and a natural-language property specification, performs analysis and evidence gathering, and outputs a \textsc{pass}/\textsc{fail}/\textsc{inconclusive} decision with an evidence report.
+
+We evaluate this paradigm on ML pipeline bugs because they make natural-language specification failures concrete: important bugs are often semantic, repository-wide, and experimentally verifiable, while complete formal specifications are unavailable.
+We use real Kaggle notebooks and synthetic Kaggle notebooks with injected failures.
+Our results show that Agentic Testing provides broad coverage and detects many plausible bugs, but also that evidence quality must be audited carefully.
+
+Our contributions are:
+\begin{itemize}
+  \item We formulate Agentic Testing: repository-level testing against natural-language specifications, with evidence-backed \textsc{pass}/\textsc{fail}/\textsc{inconclusive} verdicts.
+  \item We instantiate Agentic Testing on ML pipelines and evaluate it on 121 real and 75 synthetic Kaggle notebooks.
+  \item We show that permissive audit overstates evidence quality: strict human-only evidence audit lowers real-notebook \textsc{fail} precision from 66.1\% to 40.0\%, primarily because agents sometimes treat missing evidence as evidence of violation.
+\end{itemize}
+
+\section{Natural Language Specifications}
+
+Software correctness is often described through informal specifications stated in natural language rather than encoded as formal predicates.
+These specifications are used heavily by human programmers when finding bugs, but are often unused by automated program analysis methods.
+We define an informal specification as a natural-language statement about expected behavior or artifacts in a repository.
+Such properties are central in ML pipelines, where failures often require repository-level context and human intent to diagnose~\citep{schoop2021umlaut}.
+
+Classical program analysis asks whether a formal property holds on program traces.
+Let $T(R)$ denote the set of concrete execution traces induced by repository $R$, and let $\phi$ be a formal predicate over traces.
+The traditional goal is to decide whether $\forall t \in T(R), \phi(t)$ holds, or to find a counterexample trace.
+In our setting, the key difference is that the property is specified informally rather than as a formal predicate.
+
+Let $p$ be a natural-language statement about expected behavior or artifacts in $R$, such as ``no training on the test set'' or ``augmentation is applied only to training data.''
+We evaluate a pair $(R,p)$ and return a decision $y \in \{\textsc{pass},\textsc{fail},\textsc{inconclusive}\}$ with an evidence report $E$.
+The evidence report should identify the relevant files, executions, and outputs that justify $y$ and enable independent verification.
+This framing treats natural-language properties as inputs rather than handcrafted queries.
+
+\paragraph{ML pipeline properties.}
+We evaluate properties that commonly arise when reviewing ML pipelines.
+Representative examples include:
+\begin{itemize}
+  \item No leakage from test to train or validation sets.
+  \item Data augmentation is applied only to training data.
+  \item Reported metrics use the correct split and definitions.
+  \item Randomizing labels causes validation accuracy to drop near a random guessing baseline.
+  \item The model can overfit a single or tiny batch to near-zero loss.
+\end{itemize}
+The full property list appears in the appendix.
+
+\begin{singlecolcenter}
+\captionof{table}{Summary of ML pipeline datasets.}
+\label{tab:datasets}
+\small
+\singlecoltabular{%
+\begin{tabular}{llrr}
+  \toprule
+  Setting & Dataset & Properties & Size \\
+  \midrule
+  Real Kaggle & Titanic (tabular) & 16 & 50 \\
+  Real Kaggle & Diabetic Retinopathy (image) & 16 & 21 \\
+  Real Kaggle & Disaster Tweets (text) & 16 & 50 \\
+  Synthetic Kaggle & Titanic (tabular) & 15 & 25 \\
+  Synthetic Kaggle & Diabetic Retinopathy (image) & 15 & 25 \\
+  Synthetic Kaggle & Disaster Tweets (text) & 15 & 25 \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+
+\section{Agentic Testing}
+
+Agentic Testing evaluates whether an informal property holds for a given repository.
+The agent takes two inputs: the repository and a property specification written in natural language.
+It produces a decision of \textsc{pass}, \textsc{fail}, or \textsc{inconclusive}, along with an evidence report that justifies the decision.
+The design emphasizes repository-level reasoning rather than local code snippets and does not require formal specifications.
+
+\paragraph{Phase 1: Analysis}
+The agent first builds a high-level model of the repository to situate the property.
+It identifies key files, entry points, and relevant artifacts such as notebooks, scripts, configuration files, datasets, and documentation.
+For ML pipelines, it identifies data split construction, preprocessing, training, and evaluation code.
+This phase narrows the search space and yields a plan for evidence gathering.
+
+\paragraph{Phase 2: Evidence gathering}
+The agent reviews code, tests, and data processing logic to find evidence for or against the property.
+It can run code when necessary to validate behavior, reproduce results, or check for violations.
+For ML properties, typical evidence includes split-construction code, dataloader configuration, preprocessing transforms, metric computation, short reruns, and captured outputs.
+The goal is to collect concrete, reproducible evidence tied to specific files, logs, or outputs.
+
+\paragraph{Phase 3: Decision}
+The agent aggregates the gathered evidence and produces a decision.
+\textsc{Pass} indicates the property is supported by evidence, \textsc{fail} indicates a violation, and \textsc{inconclusive} indicates insufficient evidence.
+The agent operates in a sandboxed copy of the repository and may modify code to probe properties, but these modifications do not persist to the original repository.
+The evidence report is part of the prediction: a \textsc{fail} is useful only if its cited code or execution output lets a later auditor reconstruct why the property is violated.
+
+\section{Experiments}
+
+\subsection{Setup}
+
+We evaluate Agentic Testing with GPT-5-mini on all reported runs~\citep{openai_models}.
+Synthetic bugs were injected with GPT-5.2-codex~\citep{openai_models}.
+For real Kaggle, we compare against TrainCheck~\citep{traincheck}, a domain-specific ML debugging baseline, and Codex Code Review~\citep{openai_codex}, an open-ended code-review baseline whose findings are mapped back to the same ML properties.
+The real benchmark contains public Kaggle notebooks from Titanic, Diabetic Retinopathy, and Natural Language Processing with Disaster Tweets~\citep{kaggle_titanic,kaggle_diabetic_retinopathy,kaggle_disaster_tweets}.
+
+On synthetic Kaggle, the positive class is a ground-truth property failure: a predicted \textsc{fail} is a true positive when the corresponding property is labeled as failing in the injected-bug ground truth.
+Precision is true positives divided by all predicted failures, and recall is true positives divided by all ground-truth failures.
+For the real Kaggle benchmark, we only evaluate \textsc{fail} precision because complete bug ground truth is unavailable.
+We report two real-audit protocols.
+The full 380-\textsc{fail} audit is a permissive human audit with LLM assistance for code navigation and summarization.
+The 100-case strict re-audit is human-only: the annotator inspected the reported evidence and corresponding Kaggle repository directly, without using an LLM to navigate code or suggest labels.
+
+\subsection{Synthetic Kaggle}
+
+The synthetic Kaggle benchmark contains 75 injected notebooks across Titanic, Disaster Tweets, and Diabetic Retinopathy, with 15 properties per notebook for 1,125 repository-property pairs.
+\Cref{tab:synthetic} shows the results.
+Agentic Testing emits 476 \textsc{fail} predictions, of which 346 correspond to ground-truth property failures, giving 72.7\% precision and 68.7\% recall.
+We separately compute a stricter evidence-backed score that requires the reported evidence to match the injected violation.
+Under that stricter criterion, 280 of the 476 \textsc{fail} predictions are counted as supported true positives.
+
+\begin{singlecolcenter}
+\captionof{table}{Agentic Testing on synthetic Kaggle injected bugs.}
+\label{tab:synthetic}
+\small
+\singlecoltabular{%
+\begin{tabular}{lrrrrr}
+  \toprule
+  Entries & Ground-truth failures & Predicted failures & True positives & Precision & Recall \\
+  \midrule
+  1,125 & 504 & 476 & 346 & 72.7\% & 68.7\% \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+
+\subsection{Real Kaggle}
+
+The real benchmark contains 121 public Kaggle notebooks: 50 Titanic, 50 Disaster Tweets, and 21 Diabetic Retinopathy.
+Agentic Testing emits 380 \textsc{fail} verdicts.
+The permissive LLM-assisted human audit labels 251 as correct and 129 as incorrect, giving 66.1\% precision.
+A strict human-only present-and-violating re-audit of 100 sampled \textsc{fail}s lowers valid failures to 40, for 40.0\% precision; 45 become \textsc{inconclusive} and 15 become \textsc{pass}.
+\Cref{tab:real} compares coverage and both precision estimates against the available ML baselines by subdataset.
+
+\begin{singlecolcenter}
+\captionof{table}{Real-Kaggle ML pipeline audit by subdataset. Permissive precision uses the original LLM-assisted human audit; strict precision uses the human-only re-audit on sampled \textsc{fail}s. Coverage is the fraction of pairs with a decisive \textsc{pass} or \textsc{fail} verdict.}
+\label{tab:real}
+\small
+\singlecoltabular{%
+\begin{tabular}{llrrr}
+  \toprule
+  Subdataset & Method & Permissive precision & Strict precision & Coverage \\
+  \midrule
+  Titanic & TrainCheck & N/A & N/A & 18.0\% \\
+  Titanic & Codex Code Review & 36.8\% & N/A & 3.6\% \\
+  Titanic & Agentic Testing & 58.9\% & 29.0\% & 75.8\% \\
+  Disaster Tweets & TrainCheck & N/A & N/A & 0.0\% \\
+  Disaster Tweets & Codex Code Review & 33.3\% & N/A & 2.9\% \\
+  Disaster Tweets & Agentic Testing & 73.9\% & 50.0\% & 70.0\% \\
+  Diabetic & TrainCheck & N/A & N/A & 0.0\% \\
+  Diabetic & Codex Code Review & 20.0\% & N/A & 3.0\% \\
+  Diabetic & Agentic Testing & 62.2\% & 34.8\% & 67.9\% \\
+  \midrule
+  All & Agentic Testing & 66.1\% & 40.0\% & 72.0\% \\
+  \bottomrule
+\end{tabular}%
+}
+\end{singlecolcenter}
+
+\section{Analysis}
+
+\paragraph{Absence-as-failure}
+The dominant real-world failure mode is that Agentic Testing sometimes treats missing evidence as evidence of violation.
+For experiment-required tests, this is especially visible.
+Across 121 real notebooks, randomized-label sanity receives 44 \textsc{fail} verdicts, baseline comparison receives 23, training-loss behavior receives 7, and tiny-batch overfit receives 13.
+In the strict re-audit, 21 of 22 experiment-required \textsc{fail}s become \textsc{inconclusive}.
+
+\paragraph{Present-and-violating rule}
+\textsc{Fail} should require evidence of a present-and-violating operation.
+If the relevant operation is absent, ambiguous, or unverifiable, the correct verdict is \textsc{inconclusive}.
+This rule explains the gap between permissive and strict precision, and it gives a concrete target for future Agentic Testing systems: the agent should gather evidence for a violation, not merely report that it could not find evidence of satisfaction.
+
+\section{Related Work}
+
+\paragraph{Repository-level agents and evaluation}
+RepoAudit proposes an autonomous LLM agent for repository-level auditing that reasons over data-flow facts and validates candidate reports~\citep{guo2025repoaudit}.
+SWE-bench frames repository-scale issue resolution and highlights the difficulty of end-to-end fixes that require coordinated edits across files~\citep{jimenez2024swebench}.
+Agentless shows that simplified localization and repair pipelines can be competitive on SWE-bench Lite~\citep{xia2024agentless}.
+
+\paragraph{Domain-specific ML debugging}
+ML debugging tools such as UMLAUT use expert heuristics to surface errors in deep learning programs by linking code structure and model behavior~\citep{schoop2021umlaut}.
+TrainCheck uses automated proactive checks to catch silent training errors~\citep{traincheck}.
+Our work differs by taking natural-language properties as inputs and evaluating whether resulting verdicts are supported by repository evidence.
+
+\paragraph{Specification burden}
+Static analysis and query-based systems can be powerful when correctness properties are formalized, but writing and maintaining those properties requires expertise~\citep{cousot1979systematic,nielson1999principles,codeql}.
+Agentic Testing instead asks whether an agent can operationalize a natural-language property directly against a repository.
+
+\section{Conclusion}
+
+We introduced Agentic Testing, a repository-level framework for validating code against natural-language specifications.
+The central NLP problem is translating an informal property into evidence-gathering actions and a verifiable verdict.
+On synthetic Kaggle notebooks, Agentic Testing reaches 72.7\% \textsc{fail} precision and 68.7\% recall against injected-bug ground truth.
+On real Kaggle notebooks, permissive audit gives 66.1\% \textsc{fail} precision and substantially higher coverage than domain-specific and code-review baselines, but a strict human-only evidence audit lowers this to 40.0\%.
+The key finding is that \textsc{fail} requires evidence of a present-and-violating operation; absent evidence should become \textsc{inconclusive}, not failure.
+
+\section*{Limitations}
+
+This paper evaluates Agentic Testing only on Kaggle-style ML pipeline repositories.
+The results may not transfer directly to production ML systems or other software domains without new property sets and audit protocols.
+The real Kaggle setting has no complete bug ground truth, so we audit precision of emitted \textsc{fail}s but cannot measure recall on real notebooks.
+The strict re-audit contains 100 sampled failures and uses one human annotator.
+
+\section*{Ethics Statement}
+
+Automated code-auditing agents can waste developer time or erode trust if they report unsupported failures.
+Our results argue for conservative reporting and explicit evidence checks before surfacing automated bug reports.
+The real-world audit uses public Kaggle notebooks; supplementary material should reference public identifiers and avoid redistributing code where licensing is unclear.
+
+\bibliographystyle{acl_natbib}
+\bibliography{agentic_testing_short_emnlp2026}
+
+\appendix
+\section{Full ML Property List}
+\label{app:properties}
+
+{\setlength{\itemsep}{0.2em}
+\begin{itemize}
+  \item No leakage from test to train/val sets.
+  \item If there is any model selection or hyperparameter tuning, then it uses val only.
+  \item If there is any model training, then all model parameters are updated during training.
+  \item Data is loaded and preprocessed correctly.
+  \item Any data augmentation is only performed on the training dataset.
+  \item Any class-imbalance handling applies only to training data.
+  \item No path or filename text is fed as a feature unless explicitly intended.
+  \item Reported metrics use the correct splits and definitions.
+  \item Randomizing the labels results in accuracy dropping near a random guessing baseline.
+  \item The model after the full training procedure outperforms a simple baseline.
+  \item The model can overfit a single or tiny batch to near-zero loss.
+  \item Training loss generally decreases during training and plateaus within the number of epochs used.
+  \item Training dataloader shuffles or training dataset is shuffled for training; val/test do not shuffle.
+  \item Accuracy should be deterministic when running evaluation multiple times without retraining.
+  \item Model and inputs are consistently moved to one device.
+  \item Code does not use explicit loops or Python control flow when matrix operations could implement the same operation more efficiently.
+\end{itemize}}
+
+\end{document}
