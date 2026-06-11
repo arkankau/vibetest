@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from inspect_ai import Task, eval
-from inspect_ai.agent import react
+from inspect_ai.agent import AgentAttempts, react
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import includes
 from inspect_ai.tool import Tool, bash_session, python, text_editor
@@ -12,6 +12,10 @@ from inspect_ai.tool import Tool, bash_session, python, text_editor
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.agent.react_agent import create_files_archive, cleanup_archive_temps
 from vibetest.usage import usage_payload_from_sample
+
+
+def _always_continue_score_value(_value) -> float:
+    return 0.0
 
 
 class BaselineAgent:
@@ -34,6 +38,9 @@ class BaselineAgent:
         max_attempts: int = 20,
         additional_tools: list[Tool] | None = None,
         static: bool = False,
+        max_sandboxes: int = 10,
+        reviewer_reprompts: int = 0,
+        findings_json: bool = False,
     ):
         """Initialize the baseline agent.
 
@@ -47,6 +54,9 @@ class BaselineAgent:
         )
         self.max_attempts = max_attempts
         self.static = static
+        self.max_sandboxes = max_sandboxes
+        self.reviewer_reprompts = max(0, reviewer_reprompts)
+        self.findings_json = findings_json
         self.tools = self._setup_tools(additional_tools)
 
     def _setup_tools(self, additional_tools: list[Tool] | None = None) -> list[Tool]:
@@ -59,7 +69,7 @@ class BaselineAgent:
             List of all tools
         """
         if self.static:
-            base_tools = [bash_session(timeout=120), text_editor()]
+            base_tools = [bash_session(timeout=210), text_editor()]
         else:
             base_tools = [
                 bash_session(),
@@ -80,21 +90,56 @@ class BaselineAgent:
         Returns:
             Solver configured with ReAct pattern
         """
-        instructions = f"""You are a code review agent that examines repositories to determine if there are any bugs affecting the code's correctness.
+        analysis_instruction = (
+            "Use static inspection only. Do not run repository code, notebooks, tests, training scripts, or user code. "
+            "You may use shell/text tools only to list, search, and read files."
+            if self.static
+            else "Carefully analyze the code and use the available tools to explore and verify your findings. "
+            "For example, you might run code snippets, inspect files, or modify code to test hypotheses."
+        )
+        if self.findings_json:
+            instructions = f"""You are a code review agent that examines repositories to identify bugs affecting the code's correctness.
 
-Carefully analyze the code and use the available tools to explore and verify your findings.
-{'For example, you might run code snippets, inspect files, or modify code to test hypotheses.' if not self.static else 'You cannot run code, but you should carefully examine relevant code.'}
+{analysis_instruction}
+Output all findings that the original author would fix if they knew about it. If there is no finding that a person would definitely love to see and fix, prefer outputting no findings. Do not stop at the first qualifying finding. Continue until you've listed every qualifying finding.
+
+When you have completed your examination, call the submit() tool with only compact JSON in this format:
+
+{{"findings":[{{"title":"Short bug title","body":"Why this is a bug, with concrete file/line/function citations.","confidence":0.0}}]}}
+
+Rules:
+- Each finding must describe a concrete bug, not a best-practice suggestion.
+- confidence must be a float from 0.0 to 1.0 for how confident you are that the finding is a real bug.
+- If there are no qualifying findings, submit {{"findings":[]}}."""
+        else:
+            instructions = f"""You are a code review agent that examines repositories to determine if there are any bugs affecting the code's correctness.
+
+{analysis_instruction}
 After examining the code, make a final verdict based on if any bugs were found. The verdict should be PASS if there are no bugs impacting correctness, FAIL if there is at least one bug impacting code correctness, or INCONCLUSIVE if additional information is required to conclusively determine the code's correctness.
 When you have completed your examination, call the submit() tool with your findings in this format:
 
 VERDICT: [PASS/FAIL/INCONCLUSIVE]
 EXPLANATION: [Your explanation of what you found]"""
 
+        attempts: int | AgentAttempts
+        if self.reviewer_reprompts:
+            attempts = AgentAttempts(
+                attempts=self.reviewer_reprompts + 1,
+                incorrect_message=(
+                    "Do not stop yet. Keep looking and recheck your result. "
+                    "Do not run repository code, notebooks, tests, training scripts, or user code. "
+                    "When you are done, submit your updated review."
+                ),
+                score_value=_always_continue_score_value,
+            )
+        else:
+            attempts = self.max_attempts
+
         # Create the ReAct agent with built-in submit() tool
         agent = react(
             prompt=instructions,
             tools=self.tools,
-            attempts=self.max_attempts,
+            attempts=attempts,
             submit=True,
         )
 
@@ -110,8 +155,10 @@ EXPLANATION: [Your explanation of what you found]"""
             Formatted prompt string - simply the repo name with the query
         """
         repo_root = f"{test_case.sandbox_path.rstrip('/')}/repo"
+        context = test_case.description.strip() if test_case.description else ""
+        context_block = f"\n\nReview context and important guidelines:\n{context}" if context else ""
         prompt = f"""Examine the repository and determine if there are any bugs.
-Repository: {repo_root}"""
+Repository: {repo_root}{context_block}"""
         return prompt
 
     def execute_tests(
@@ -136,6 +183,7 @@ Repository: {repo_root}"""
         
         # Create Inspect task with a simple scorer that accepts any submission with VERDICT
         samples = []
+        target = "findings" if self.findings_json else "VERDICT"
         for idx, test_case in enumerate(test_cases):
             sample_id = f"{Path(test_case.repo_path).name}_{idx}"
             id_to_test_case[sample_id] = test_case
@@ -143,13 +191,13 @@ Repository: {repo_root}"""
                 test_case, sandbox_prefix=test_case.sandbox_path
             )
             samples.append(Sample(
-                input=self._create_prompt(test_case), 
-                target="VERDICT", 
+                input=self._create_prompt(test_case),
+                target=target,
                 id=sample_id,
                 files=files_dict,
                 setup=setup_script,
             ))
-        
+
         task = Task(
             dataset=samples,
             solver=self._create_solver(),
@@ -165,6 +213,7 @@ Repository: {repo_root}"""
                 log_dir="./logs",
                 retry_on_error=2,
                 fail_on_error=False,
+                max_sandboxes=self.max_sandboxes,
             )
 
             # Parse results

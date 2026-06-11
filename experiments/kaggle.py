@@ -1,6 +1,7 @@
 """Simple example of using vibetest programmatically."""
 
 import argparse
+import csv
 from pathlib import Path
 import jsonlines
 
@@ -32,6 +33,70 @@ def get_tests():
     properties = load_kaggle_properties()
     print(f"Loaded {len(properties)} properties from properties.md")
     return properties
+
+
+_CORRECT_FAIL_EXAMPLE_FIELDS = (
+    "test_prompt",
+    "reason",
+    "case_score",
+    "evidence_strength",
+)
+
+
+def _load_correct_fail_examples(path: Path, limit: int) -> list[dict[str, str]]:
+    if limit <= 0:
+        return []
+    if not path.exists():
+        raise SystemExit(f"Correct FAIL examples file not found: {path}")
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        rows = [
+            {
+                key: str(row.get(key) or "").strip()
+                for key in _CORRECT_FAIL_EXAMPLE_FIELDS
+            }
+            for row in csv.DictReader(f, delimiter="\t")
+        ]
+    examples = [row for row in rows if row.get("test_prompt") and row.get("reason")]
+    if len(examples) < limit:
+        raise SystemExit(
+            f"Requested {limit} correct FAIL examples but only found {len(examples)} usable row(s) in {path}."
+        )
+    return examples[:limit]
+
+
+def _format_correct_fail_examples(examples: list[dict[str, str]]) -> str:
+    if not examples:
+        return ""
+    blocks = []
+    for idx, row in enumerate(examples, start=1):
+        reason = row["reason"]
+        if len(reason) > 360:
+            reason = reason[:357].rstrip() + "..."
+        lines = [
+            f"{idx}. test={row['test_prompt']}",
+            f"   audit_note={reason}",
+        ]
+        if row.get("case_score"):
+            lines.append(f"   calibration_case_score={row['case_score']}")
+        if row.get("evidence_strength"):
+            lines.append(f"   calibration_evidence_strength={row['evidence_strength']}")
+        blocks.append("\n".join(lines))
+    return (
+        "Calibration notes from a manual audit. These are not answers for the current repository; "
+        "do not copy their wording or format. Use them only to calibrate what made prior FAIL "
+        "judgments concrete and independently checkable.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _examples_prompt(correct_fail_examples: int | None, correct_fail_examples_path: str | None) -> str | None:
+    count = int(correct_fail_examples or 0)
+    if count <= 0:
+        return None
+    path = Path(correct_fail_examples_path or "results/synthetic/manual_audit_representative_fails_20.tsv")
+    examples = _load_correct_fail_examples(path, count)
+    print(f"Injecting correct FAIL calibration examples into prompt: {len(examples)}")
+    return _format_correct_fail_examples(examples)
 
 
 def _augment_tests_with_review(
@@ -85,7 +150,7 @@ def _all_inconclusive_tests(
         tests.append(
             {
                 "description": reason,
-                "passed": False,
+                "passed": None,
                 "evidence": [],
                 "execution_log": "",
                 "metadata": {
@@ -99,6 +164,26 @@ def _all_inconclusive_tests(
             }
         )
     return tests
+
+
+def _traincheck_mark_unmapped_properties_pass(tests: list[dict]) -> None:
+    for test in tests:
+        metadata = test.setdefault("metadata", {})
+        verdict = str(metadata.get("verdict") or "").strip().upper()
+        if verdict != "INCONCLUSIVE":
+            continue
+        metadata["verdict"] = "PASS"
+        metadata["fail_support_score"] = 0.0
+        metadata["evidence_text"] = str(metadata.get("evidence_text") or "")
+        reason = str(test.get("description") or "").strip()
+        if reason:
+            test["description"] = (
+                reason
+                + " No TrainCheck failed invariant clearly maps to this property, so the TrainCheck baseline does not flag it."
+            )
+        else:
+            test["description"] = "No TrainCheck failed invariant clearly maps to this property."
+        test["passed"] = True
 
 
 def run_traincheck_baseline(
@@ -199,6 +284,7 @@ def run_traincheck_baseline(
                 reviewer="traincheck",
                 mapper_model=mapper_model,
             )
+            _traincheck_mark_unmapped_properties_pass(tests)
         _augment_tests_with_review(
             tests,
             review_text,
@@ -208,6 +294,7 @@ def run_traincheck_baseline(
                 "trace_dir": result.get("trace_dir"),
                 "report_files": result.get("report_files", []),
                 "failed_invariants_count": result.get("failed_invariants_count", 0),
+                "check_summary": result.get("check_summary", {}),
                 "converted_notebook": result.get("converted_notebook"),
                 "reference_invariants": str(invariants_path),
             },
@@ -432,7 +519,19 @@ def run_baseline(subset: str, model: str, static: bool):
     print(f"{'=' * 80}")
 
 
-def run_vibetest(subset: str, model: str, static: bool):
+def run_vibetest(
+    subset: str,
+    model: str,
+    static: bool,
+    *,
+    repo_limit: int | None = None,
+    repo_offset: int | None = None,
+    output_path: str | None = None,
+    correct_fail_examples: int | None = None,
+    correct_fail_examples_path: str | None = None,
+    max_samples: int | None = None,
+    max_sandboxes: int | None = None,
+):
     """Run vibetest with specific test cases across all repositories."""
     print("=" * 80)
     print("Starting Kaggle Repository Tests - VibeTest Method")
@@ -440,27 +539,36 @@ def run_vibetest(subset: str, model: str, static: bool):
     
     # Step 1: Collect all repositories and create test cases
     test_strs = get_tests()
+    examples_prompt = _examples_prompt(correct_fail_examples, correct_fail_examples_path)
     all_test_cases = []
     repo_paths = []
     tests_per_repo = len(test_strs)
     
     total_repos = 0
-    for repo_path in Path(f"./data/kaggle/kaggle-{subset}").iterdir():
-        if total_repos >= 50:
+    limit = repo_limit if repo_limit and repo_limit > 0 else 50
+    offset = repo_offset if repo_offset and repo_offset > 0 else 0
+    subset_root = Path(f"./data/kaggle/kaggle-{subset}")
+    if not subset_root.exists():
+        raise SystemExit(f"Kaggle subset directory not found: {subset_root}")
+    for repo_path in sorted(subset_root.iterdir()):
+        if total_repos >= limit:
             break
 
         if repo_path.is_dir():
+            if offset > 0:
+                offset -= 1
+                continue
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
             
             # Create test cases for this repo
             for i, desc in enumerate(test_strs):
                 if "titanic" in subset:
-                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic-kaggle-data": "/kaggle/input"}))
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, extra_instructions=examples_prompt, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./titanic-kaggle-data": "/kaggle/input"}))
                 elif "nlp" in subset:
-                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./nlp-kaggle-data": "/kaggle/input"}))
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, extra_instructions=examples_prompt, repo_path=repo_path, sandbox_path="/kaggle", additional_data={"./nlp-kaggle-data": "/kaggle/input"}))
                 else:
-                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, repo_path=repo_path, sandbox_path="/kaggle"))
+                    all_test_cases.append(TestCase(name=f"{repo_path.name}_prop{i}", description=desc, extra_instructions=examples_prompt, repo_path=repo_path, sandbox_path="/kaggle"))
             
             total_repos += 1
     
@@ -472,17 +580,26 @@ def run_vibetest(subset: str, model: str, static: bool):
     
     # Step 2: Execute ALL tests in parallel across all repositories
     agent = VibeTestAgent(model=model, static=static)
-    all_results = agent.execute_tests(all_test_cases, sandbox="docker")
+    all_results = agent.execute_tests(
+        all_test_cases,
+        sandbox="docker",
+        max_samples=max_samples,
+        max_sandboxes=max_sandboxes,
+    )
     
     print(f"\n{'=' * 80}")
     print("Processing Results")
     print(f"{'=' * 80}\n")
     
     dataset_name = f"kaggle_{subset}"
-    output_path = standardized_results_path(
-        dataset_name,
-        "AT",
-        model_name=agent.model_name,
+    output_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path(
+            dataset_name,
+            "AT",
+            model_name=agent.model_name,
+        )
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -507,13 +624,13 @@ def run_vibetest(subset: str, model: str, static: bool):
             for r in repo_results:
                 if r.passed:
                     repo_passed += 1
-                    status = "✓ PASSED"
+                    status = "PASSED"
                 elif "INCONCLUSIVE" in r.message:
-                    status = "⚠ INCONCLUSIVE"
+                    status = "INCONCLUSIVE"
                 elif "NOT APPLICABLE" in r.message:
-                    status = "ℹ NOT APPLICABLE"
+                    status = "NOT APPLICABLE"
                 else:
-                    status = "✗ FAILED"
+                    status = "FAILED"
                 
                 print(f"\n{status}: {r.test_case.description}")
                 if r.evidence:
@@ -739,6 +856,28 @@ if __name__ == "__main__":
         type=str,
         help="Model name for mapping reviews to test cases",
     )
+    parser.add_argument(
+        "--correct-fail-examples",
+        type=int,
+        default=0,
+        help="Inject this many compact manual-audit correct FAIL calibration examples into VibeTest prompts.",
+    )
+    parser.add_argument(
+        "--correct-fail-examples-path",
+        type=str,
+        default="results/synthetic/manual_audit_representative_fails_20.tsv",
+        help="TSV file containing manual-audit correct FAIL calibration examples.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        help="Optional maximum number of Inspect samples to run concurrently.",
+    )
+    parser.add_argument(
+        "--max-sandboxes",
+        type=int,
+        help="Optional maximum number of Inspect Docker sandboxes to keep active.",
+    )
     args = parser.parse_args()
     
     if args.method == "baseline":
@@ -779,4 +918,15 @@ if __name__ == "__main__":
     elif args.method == "codex-vibetest":
         run_codex_vibetest(args.subset, args.model)
     else:
-        run_vibetest(args.subset, args.model, args.static)
+        run_vibetest(
+            args.subset,
+            args.model,
+            args.static,
+            repo_limit=args.repo_limit,
+            repo_offset=args.repo_offset,
+            output_path=args.output_path,
+            correct_fail_examples=args.correct_fail_examples,
+            correct_fail_examples_path=args.correct_fail_examples_path,
+            max_samples=args.max_samples,
+            max_sandboxes=args.max_sandboxes,
+        )

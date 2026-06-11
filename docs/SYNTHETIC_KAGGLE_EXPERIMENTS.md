@@ -77,10 +77,11 @@ uv run --active python experiments/synthetic.py \
 ```
 
 Synthetic VibeTest runs place injected repos under `/kaggle/repo`, matching the
-real Kaggle experiment sandbox. Titanic and NLP runs also mount
-`titanic-kaggle-data/` and `nlp-kaggle-data/` under `/kaggle/input/` when those
-local data directories are present. Diabetic synthetic runs currently match the
-real Diabetic runner and do not mount an additional local data directory.
+real Kaggle experiment sandbox. Titanic runs mount `titanic-kaggle-data/` at
+`/kaggle/input/titanic/`, and NLP runs mount `nlp-kaggle-data/` at
+`/kaggle/input/nlp-getting-started/`, when those local data directories are
+present. Diabetic synthetic runs currently match the real Diabetic runner and do
+not mount an additional local data directory.
 
 Run all three Kaggle splits:
 
@@ -121,7 +122,7 @@ uv run --active python experiments/synthetic.py \
   --method traincheck \
   --labels-path synth-data/injected/labels_kaggle_titanic.jsonl \
   --datasets kaggle_titanic \
-  --traincheck-reference data/traincheck/mnist.py \
+  --traincheck-invariants results/traincheck_qwen36_mapper/simple/trace/invariants.json \
   --traincheck-timeout 1200 \
   --review-mapper-model openai/gpt-5-mini \
   --scorer-model openai/gpt-5-mini

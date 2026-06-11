@@ -161,6 +161,33 @@ def _model_suffix(model_name: str) -> str:
 
 def _source_sample_id(entry: dict[str, Any], test: dict[str, Any], row_idx: int) -> str | None:
     return source_sample_id(entry, test, row_idx)
+    candidates = _source_sample_id_candidates(entry, test, row_idx)
+    return candidates[0] if candidates else None
+
+
+def _source_sample_id_candidates(entry: dict[str, Any], test: dict[str, Any], row_idx: int) -> list[str]:
+    metadata = test.get("metadata") or {}
+    candidates: list[str] = []
+    for obj in (metadata, test, entry):
+        for key in ("source_sample_id", "sample_id", "test_case_name", "name", "id"):
+            value = obj.get(key) if isinstance(obj, dict) else None
+            if str(value or "").strip():
+                sample_id = str(value).strip()
+                if sample_id not in candidates:
+                    candidates.append(sample_id)
+
+    synthetic_row = entry.get("synthetic_row_index", row_idx)
+    property_id = str(metadata.get("property_id") or test.get("property_id") or "").strip()
+    if property_id:
+        dataset = str(entry.get("dataset") or "").strip()
+        if dataset:
+            dataset_sample_id = f"{dataset}_row{synthetic_row}_{property_id}"
+            if dataset_sample_id not in candidates:
+                candidates.append(dataset_sample_id)
+        legacy_sample_id = f"row{synthetic_row}_{property_id}"
+        if legacy_sample_id not in candidates:
+            candidates.append(legacy_sample_id)
+    return candidates
 
 
 def _evidence_tar_path(
@@ -186,6 +213,38 @@ def _is_safe_tar_member(dest_root: Path, member_path: Path) -> bool:
         return True
     except ValueError:
         return member_path == dest_root
+    metadata = test.get("metadata") or {}
+    explicit = (
+        metadata.get("evidence_tar")
+        or metadata.get("evidence_tar_path")
+        or test.get("evidence_tar")
+        or entry.get("evidence_tar")
+        or entry.get("evidence_tar_path")
+    )
+    if str(explicit or "").strip():
+        path = Path(str(explicit))
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        return path, _source_sample_id(entry, test, row_idx)
+
+    sample_ids = _source_sample_id_candidates(entry, test, row_idx)
+    if not sample_ids:
+        return None, None
+
+    model_name = (
+        evidence_model
+        or str(metadata.get("model") or "")
+        or str(entry.get("method_model") or "")
+    )
+    if not model_name:
+        return None, sample_ids[0]
+
+    model_dir = evidence_root / _model_suffix(model_name)
+    for sample_id in sample_ids:
+        path = model_dir / f"evidence-{sample_id}.tar.gz"
+        if path.exists():
+            return path, sample_id
+    return model_dir / f"evidence-{sample_ids[0]}.tar.gz", sample_ids[0]
 
 
 def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:

@@ -17,6 +17,7 @@ from inspect_ai.model import GenerateConfig, get_model
 class MappingItem:
     property_index: int
     verdict: str
+    fail_support_score: float
     reason: str
     evidence: str
 
@@ -105,6 +106,14 @@ HALLUCINATION_EVIDENCE_INSTRUCTIONS = (
     "If no concrete offending citation is provided in the review, prefer INCONCLUSIVE."
 )
 
+BASELINE_FINDINGS_INSTRUCTIONS = (
+    "The review text may be JSON with a top-level findings list. Each finding is a claimed bug "
+    "with title, body, and confidence. Map only those explicit bug findings to property failures. "
+    "A missing finding about a property is not evidence that the property passes; mark that property INCONCLUSIVE "
+    "unless the review explicitly says the property is satisfied. Treat the finding confidence as useful context, "
+    "but still assign fail_support_score based on how clearly the finding supports the specific property failing."
+)
+
 
 def _normalize_verdict(raw: str) -> str:
     if not raw:
@@ -117,6 +126,18 @@ def _normalize_verdict(raw: str) -> str:
     if raw.startswith("F"):
         return "FAIL"
     return "INCONCLUSIVE"
+
+
+def _normalize_score(raw: Any) -> float:
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
 
 
 async def _map_review_async(
@@ -138,9 +159,15 @@ async def _map_review_async(
 
     rules = (
         "You are mapping a general code review to a set of test properties.\n"
-        "For each property, determine whether the review provides evidence that the property is violated.\n"
+        "For each property, determine whether the review provides evidence that the property is violated, and score how strongly the review supports a property failure.\n"
         "Rules:\n"
-        "- Use FAIL only if the review explicitly indicates a violation of the property.\n"
+        "- fail_support_score is a 0.0 to 1.0 score for how clearly the review supports the property failing.\n"
+        "- Score 1.0 when concrete, explicit review evidence clearly supports the property failing.\n"
+        "- Score 0.7 when the review mostly supports failure with only minor gaps.\n"
+        "- Score 0.4 when support is partial, ambiguous, or indirect.\n"
+        "- Score 0.1 when support is only a weak mention, best-practice concern, or absence-only claim.\n"
+        "- Score 0.0 when there is no support for failure or the review says the property is satisfied.\n"
+        "- Use FAIL only if the review explicitly indicates a violation of the property and fail_support_score is at least 0.7.\n"
         "- Use PASS only if the review explicitly indicates the property is satisfied.\n"
         "- Use INCONCLUSIVE if the property is not mentioned or evidence is partial/ambiguous.\n"
         "- For determining the verdict for each property, be sure that the review provides evidence for the specific property rather than any relaxation or simplification of the property.\n"
@@ -151,7 +178,7 @@ async def _map_review_async(
     prompt = (
         f"{rules}"
         "Return a JSON array with one object per property, with keys:\n"
-        "  property_index (int), verdict (PASS/FAIL/INCONCLUSIVE), reason (string), evidence (string)\n"
+        "  property_index (int), verdict (PASS/FAIL/INCONCLUSIVE), fail_support_score (number from 0.0 to 1.0), reason (string), evidence (string)\n"
         "Constraints:\n"
         "- Output only JSON. Do not use markdown or code fences.\n"
         "- Evidence should provide the full evidence from the review in support or against the test property and the reason should be a summary of this evidence.\n\n"
@@ -179,10 +206,14 @@ async def _map_review_async(
             idx = int(idx_raw)
         except Exception:
             continue
+        score = _normalize_score(
+            entry.get("fail_support_score", entry.get("support_score", entry.get("score")))
+        )
         items.append(
             MappingItem(
                 property_index=idx,
                 verdict=_normalize_verdict(str(entry.get("verdict") or "")),
+                fail_support_score=score,
                 reason=str(entry.get("reason") or "").strip(),
                 evidence=str(entry.get("evidence") or "").strip(),
             )
@@ -228,9 +259,12 @@ def map_review_to_kaggle_tests(
     props_payload = [
         {"property_index": idx, "text": prop} for idx, prop in enumerate(properties)
     ]
-    extra_instructions = (
-        TRAINCHECK_INVARIANT_INSTRUCTIONS if reviewer == "traincheck" else None
-    )
+    if reviewer == "traincheck":
+        extra_instructions = TRAINCHECK_INVARIANT_INSTRUCTIONS
+    elif reviewer == "baseline-reviewer":
+        extra_instructions = BASELINE_FINDINGS_INSTRUCTIONS
+    else:
+        extra_instructions = None
 
     items = _run_async(
         _map_review_async(
@@ -248,6 +282,7 @@ def map_review_to_kaggle_tests(
         verdict = item.verdict if item else "INCONCLUSIVE"
         reason = item.reason if item else "Not mentioned in review."
         evidence = item.evidence if item else ""
+        fail_support_score = item.fail_support_score if item else 0.0
         passed = verdict == "PASS"
         tests.append(
             {
@@ -261,6 +296,7 @@ def map_review_to_kaggle_tests(
                     "property_index": idx,
                     "property_text": prop,
                     "verdict": verdict,
+                    "fail_support_score": fail_support_score,
                     "evidence_text": evidence,
                 },
             }
@@ -296,6 +332,7 @@ def map_review_to_hallucination_tests(
         verdict = item.verdict if item else "INCONCLUSIVE"
         reason = item.reason if item else "Not mentioned in review."
         evidence = item.evidence if item else ""
+        fail_support_score = item.fail_support_score if item else 0.0
         passed = verdict == "PASS"
         tests.append(
             {
@@ -309,6 +346,7 @@ def map_review_to_hallucination_tests(
                     "property_index": idx,
                     "property_text": prop,
                     "verdict": verdict,
+                    "fail_support_score": fail_support_score,
                     "evidence_text": evidence,
                 },
             }
@@ -400,6 +438,7 @@ def map_review_to_vuln_tests(
             verdict = item.verdict if item else "INCONCLUSIVE"
             reason = item.reason if item else "Not mentioned in review."
             evidence = item.evidence if item else ""
+            fail_support_score = item.fail_support_score if item else 0.0
             passed = verdict == "PASS"
             tests.append(
                 {
@@ -414,6 +453,7 @@ def map_review_to_vuln_tests(
                         "property_index": idx,
                         "property_text": prop_text,
                         "verdict": verdict,
+                        "fail_support_score": fail_support_score,
                         "evidence_text": evidence,
                     },
                 }
@@ -425,6 +465,7 @@ def map_review_to_vuln_tests(
         verdict = item.verdict if item else "INCONCLUSIVE"
         reason = item.reason if item else "Not mentioned in review."
         evidence = item.evidence if item else ""
+        fail_support_score = item.fail_support_score if item else 0.0
         passed = verdict == "PASS"
         tests.append(
             {
@@ -439,6 +480,7 @@ def map_review_to_vuln_tests(
                     "property_index": idx,
                     "property_text": prop_text,
                     "verdict": verdict,
+                    "fail_support_score": fail_support_score,
                     "evidence_text": evidence,
                 },
             }

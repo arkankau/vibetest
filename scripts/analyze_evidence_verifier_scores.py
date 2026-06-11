@@ -1,8 +1,10 @@
 """Analyze clean-context evidence verifier scores on synthetic VibeTest results.
 
 The verifier score is evaluated only on predicted FAIL verdicts. A predicted
-FAIL is treated as a true positive when the synthetic ground-truth label for the
-property is FAIL, and as a false positive when the ground-truth label is PASS.
+FAIL can be evaluated either against the synthetic ground-truth property label
+or, preferably, against the synthetic scorer's evidence_match_grade. The
+evidence-match target treats a predicted FAIL as positive only when the scorer
+judged the FAIL evidence to match the ground-truth violation.
 
 The script reports:
 - baseline VibeTest precision/recall/F1 for predicting ground-truth FAIL,
@@ -37,6 +39,7 @@ class FailItem:
     test_index: int
     property_id: str
     gt_label: int
+    evidence_match_label: int
     predicted_verdict: str
     verifier_score: float | None
 
@@ -108,6 +111,12 @@ def _verifier_score(test: dict[str, Any]) -> float | None:
     if math.isnan(score):
         return None
     return max(0.0, min(1.0, score))
+
+
+def _evidence_match_label(test: dict[str, Any]) -> int:
+    metadata = test.get("metadata") or {}
+    synthetic_score = metadata.get("synthetic_score") or {}
+    return 1 if str(synthetic_score.get("evidence_match_grade") or "").strip().upper() == "C" else 0
 
 
 def _safe_ratio(num: int, den: int) -> float | None:
@@ -229,6 +238,7 @@ def _collect_items(path: Path) -> tuple[list[FailItem], dict[str, int]]:
                     test_index=test_index,
                     property_id=str(metadata.get("property_id") or ""),
                     gt_label=gt,
+                    evidence_match_label=_evidence_match_label(test),
                     predicted_verdict=verdict,
                     verifier_score=score,
                 )
@@ -239,10 +249,11 @@ def _collect_items(path: Path) -> tuple[list[FailItem], dict[str, int]]:
 def _threshold_metrics(
     items: list[FailItem],
     *,
-    total_gt_fail: int,
-    total_gt_pass: int,
+    total_positive: int,
+    total_negative: int,
     threshold: float | None,
     missing_score: str,
+    target: str,
 ) -> dict[str, Any]:
     tp = fp = 0
     for item in items:
@@ -255,12 +266,13 @@ def _threshold_metrics(
             accept = score >= threshold
         if not accept:
             continue
-        if item.gt_label == 1:
+        label = item.evidence_match_label if target == "evidence-match" else item.gt_label
+        if label == 1:
             tp += 1
         else:
             fp += 1
-    fn = total_gt_fail - tp
-    tn = total_gt_pass - fp
+    fn = total_positive - tp
+    tn = total_negative - fp
     metrics = _confusion_metrics(tp, fp, fn, tn)
     metrics["threshold"] = threshold
     metrics["accepted_fail_predictions"] = tp + fp
@@ -313,30 +325,41 @@ def _summarize_collected(
     *,
     default_threshold: float,
     missing_score: str,
+    target: str,
 ) -> dict[str, Any]:
+    if target == "evidence-match":
+        total_positive = sum(1 for item in items if item.evidence_match_label == 1)
+        total_negative = sum(1 for item in items if item.evidence_match_label == 0)
+    else:
+        total_positive = totals["gt_fail"]
+        total_negative = totals["gt_pass"]
+
     baseline = _threshold_metrics(
         items,
-        total_gt_fail=totals["gt_fail"],
-        total_gt_pass=totals["gt_pass"],
+        total_positive=total_positive,
+        total_negative=total_negative,
         threshold=None,
         missing_score=missing_score,
+        target=target,
     )
     at_default = _threshold_metrics(
         items,
-        total_gt_fail=totals["gt_fail"],
-        total_gt_pass=totals["gt_pass"],
+        total_positive=total_positive,
+        total_negative=total_negative,
         threshold=default_threshold,
         missing_score=missing_score,
+        target=target,
     )
 
     best = None
     for threshold in _candidate_thresholds(items):
         metrics = _threshold_metrics(
             items,
-            total_gt_fail=totals["gt_fail"],
-            total_gt_pass=totals["gt_pass"],
+            total_positive=total_positive,
+            total_negative=total_negative,
             threshold=threshold,
             missing_score=missing_score,
+            target=target,
         )
         if best is None:
             best = metrics
@@ -351,14 +374,20 @@ def _summarize_collected(
             best = metrics
 
     scored = [item for item in items if item.verifier_score is not None]
-    labels = [item.gt_label for item in scored]
+    labels = [
+        item.evidence_match_label if target == "evidence-match" else item.gt_label
+        for item in scored
+    ]
     scores = [float(item.verifier_score) for item in scored if item.verifier_score is not None]
     auroc = _roc_auc(labels, scores) if scored else None
     ap = _average_precision(labels, scores) if scored else None
 
     return {
         "file": name,
+        "target": target,
         **totals,
+        "target_positive": total_positive,
+        "target_negative": total_negative,
         "missing_verifier_scores": totals["predicted_fail"] - totals["scored_predicted_fail"],
         "baseline": baseline,
         "default_threshold": at_default,
@@ -371,8 +400,16 @@ def _summarize_collected(
         ),
         "verifier_auroc": auroc,
         "verifier_average_precision": ap,
-        "scored_tp_fail": sum(1 for item in scored if item.gt_label == 1),
-        "scored_fp_fail": sum(1 for item in scored if item.gt_label == 0),
+        "scored_positive_fail": sum(
+            1
+            for item in scored
+            if (item.evidence_match_label if target == "evidence-match" else item.gt_label) == 1
+        ),
+        "scored_negative_fail": sum(
+            1
+            for item in scored
+            if (item.evidence_match_label if target == "evidence-match" else item.gt_label) == 0
+        ),
     }
 
 
@@ -380,10 +417,13 @@ def _summary_row(summary: dict[str, Any], metric_name: str, metrics: dict[str, A
     baseline = summary["baseline"]
     return {
         "file": summary["file"],
+        "target": summary["target"],
         "metric": metric_name,
         "threshold": "" if metrics.get("threshold") is None else metrics.get("threshold"),
         "tests": summary["tests"],
         "gt_fail": summary["gt_fail"],
+        "target_positive": summary["target_positive"],
+        "target_negative": summary["target_negative"],
         "predicted_fail": summary["predicted_fail"],
         "scored_predicted_fail": summary["scored_predicted_fail"],
         "missing_verifier_scores": summary["missing_verifier_scores"],
@@ -410,14 +450,15 @@ def _print_summary(summary: dict[str, Any]) -> None:
     best = summary["best_threshold"]
     print(f"\n{summary['file']}")
     print(
-        f"  tests={summary['tests']} gt_fail={summary['gt_fail']} "
+        f"  target={summary['target']} tests={summary['tests']} gt_fail={summary['gt_fail']} "
+        f"target_positive={summary['target_positive']} target_negative={summary['target_negative']} "
         f"predicted_fail={summary['predicted_fail']} scored_fail={summary['scored_predicted_fail']} "
         f"missing_scores={summary['missing_verifier_scores']}"
     )
     print(
         f"  verifier AUROC={_fmt(summary['verifier_auroc'])} "
         f"AP={_fmt(summary['verifier_average_precision'])} "
-        f"(scored TP FAILs={summary['scored_tp_fail']}, scored FP FAILs={summary['scored_fp_fail']})"
+        f"(scored positives={summary['scored_positive_fail']}, scored negatives={summary['scored_negative_fail']})"
     )
     print(
         "  baseline: "
@@ -455,6 +496,12 @@ def _write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", nargs="+", help="Synthetic result JSONL files with metadata.evidence_verifier scores.")
+    parser.add_argument(
+        "--target",
+        choices=["evidence-match", "gt-label"],
+        default="evidence-match",
+        help="Verifier evaluation target. evidence-match treats only scorer grade C FAILs as positives; gt-label uses synthetic property labels.",
+    )
     parser.add_argument("--threshold", type=float, default=0.7, help="Verifier score threshold to report.")
     parser.add_argument(
         "--missing-score",
@@ -494,6 +541,7 @@ def main() -> None:
             totals,
             default_threshold=args.threshold,
             missing_score=args.missing_score,
+            target=args.target,
         )
         all_items.extend(items)
         for key, value in totals.items():
@@ -514,6 +562,7 @@ def main() -> None:
             all_totals,
             default_threshold=args.threshold,
             missing_score=args.missing_score,
+            target=args.target,
         )
         _print_summary(combined)
         csv_rows.append(_summary_row(combined, "baseline", combined["baseline"]))

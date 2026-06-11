@@ -70,7 +70,7 @@ def _should_comment_line(stripped: str) -> bool:
         return False
     if stripped.startswith("def "):
         return False
-    if stripped.startswith("!") or stripped.startswith("%"):
+    if stripped.startswith("!") or stripped.startswith("%") or stripped.startswith("?"):
         return True
     cmd = stripped.split(None, 1)[0]
     if cmd in {"pip", "pip3", "conda", "apt", "apt-get", "yum", "brew", "git", "wget", "curl"}:
@@ -124,15 +124,31 @@ def _ensure_parseable(text: str) -> str:
                 return "print('skipped')\n"
 
 
-def _rewrite_relative_csv_paths(text: str, repo_path: Path) -> str:
-    def _replace(match: re.Match[str]) -> str:
-        rel_path = match.group(1)
-        if rel_path.startswith("/") or re.match(r"^[A-Za-z]:", rel_path):
-            return match.group(0)
-        target = (repo_path / rel_path).resolve().as_posix()
-        return f"'{target}'"
+def _move_future_imports_to_top(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    future_lines: list[str] = []
+    other_lines: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        if line.lstrip().startswith("from __future__ import "):
+            key = line.strip()
+            if key not in seen:
+                future_lines.append(line)
+                seen.add(key)
+        else:
+            other_lines.append(line)
+    if not future_lines:
+        return text
+    return "".join(future_lines + ["\n"] + other_lines)
 
-    return re.sub(r"['\"]([^'\":]+\.csv)['\"]", _replace, text)
+
+def _rewrite_relative_csv_paths(text: str, repo_path: Path) -> str:
+    # Keep relative data paths relative. TrainCheck runs a copied script
+    # directory when --copy-all-files is enabled, and _seed_from_script_paths()
+    # materializes the referenced CSV/ZIP inputs there. Rewriting bare literals
+    # to absolute paths breaks idioms like `path / "train.csv"` because pathlib
+    # treats the absolute RHS as replacing the left-hand side.
+    return text
 
 
 def _traincheck_safe_getattr_patch() -> str:
@@ -494,10 +510,18 @@ def _convert_ipynb_to_py(
         if isinstance(source, str):
             source = source.splitlines(keepends=True)
         if isinstance(source, list):
+            cell_lines: list[str] = []
             for line in source:
                 if isinstance(line, str):
-                    lines.append(_sanitize_notebook_line(line))
-            lines.append("\n")
+                    cell_lines.append(_sanitize_notebook_line(line))
+            cell_lines.append("\n")
+            candidate = "".join(lines + cell_lines)
+            try:
+                ast.parse(_move_future_imports_to_top(candidate))
+            except (SyntaxError, IndentationError):
+                lines.append("# Skipped notebook cell that is not valid Python after sanitization.\n\n")
+            else:
+                lines.extend(cell_lines)
         included += 1
 
     if len(lines) == 1:
@@ -505,7 +529,7 @@ def _convert_ipynb_to_py(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / (notebook_path.stem + ".py")
-    out_path.write_text("".join(lines), encoding="utf-8")
+    out_path.write_text(_move_future_imports_to_top("".join(lines)), encoding="utf-8")
     return out_path
 
 
@@ -653,6 +677,15 @@ def _write_zip_with_csv(zip_path: Path, csv_name: str, header: list[str], rows: 
         zf.writestr(csv_name, buffer.getvalue())
 
 
+def _write_zip_with_text_files(zip_path: Path, files: dict[str, str]) -> None:
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    if zip_path.exists() and zip_path.is_dir():
+        shutil.rmtree(zip_path)
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for name, text in files.items():
+            zf.writestr(name, text)
+
+
 def _seed_titanic(target_dir: Path) -> None:
     source = _repo_root() / "titanic-kaggle-data"
     if source.exists():
@@ -677,6 +710,13 @@ def _seed_titanic(target_dir: Path) -> None:
                 [893, 3, "Wilkes, Mrs. James", "female", 47.0, 1, 0, "363272", 7.0, "", "S"],
             ],
         )
+    csv_files = {}
+    for name in ("train.csv", "test.csv", "gender_submission.csv"):
+        path = target_dir / name
+        if path.exists() and path.is_file():
+            csv_files[name] = path.read_text(encoding="utf-8", errors="replace")
+    if csv_files:
+        _write_zip_with_text_files(target_dir / "titanic.zip", csv_files)
 
 
 def _seed_nlp(target_dir: Path) -> None:
@@ -810,6 +850,13 @@ def _seed_from_script_paths(script_text: str, kaggle_root: Path, repo_path: Path
     }
     image_dirs: set[Path] = set()
 
+    def _is_within(path: Path, base: Path) -> bool:
+        try:
+            path.resolve().relative_to(base.resolve())
+            return True
+        except ValueError:
+            return False
+
     for prefix_name, prefix_path in prefixes.items():
         pattern = re.compile(re.escape(str(prefix_path)) + r"/([^'\"\s\)]+)")
         matches = pattern.findall(script_text)
@@ -835,6 +882,8 @@ def _seed_from_script_paths(script_text: str, kaggle_root: Path, repo_path: Path
 
             if remainder:
                 target = target_base / remainder
+                if not _is_within(target, target_base):
+                    continue
                 target_exists = target.exists()
                 target_empty = target_exists and target.is_file() and target.stat().st_size == 0
                 target_small_csv = (
@@ -939,14 +988,44 @@ def _seed_from_script_paths(script_text: str, kaggle_root: Path, repo_path: Path
                 pass
 
     if repo_path is not None:
-        rel_csv_pattern = re.compile(r"['\\\"]([^'\\\":]+\\.csv)['\\\"]")
-        for rel_name in rel_csv_pattern.findall(script_text):
+        rel_data_pattern = re.compile(r"['\\\"]([^'\\\":]+\\.(?:csv|zip))['\\\"]")
+        for rel_name in rel_data_pattern.findall(script_text):
             if rel_name.startswith("/") or re.match(r"^[A-Za-z]:", rel_name):
                 continue
             target = (repo_path / rel_name).resolve()
+            try:
+                target.relative_to(repo_path.resolve())
+            except ValueError:
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists() or target.stat().st_size < 5000:
+            if target.suffix.lower() == ".zip" and (not target.exists() or target.stat().st_size == 0):
+                lower = target.name.lower()
+                if lower == "titanic.zip":
+                    source_dir = (kaggle_root / "input" / "titanic").resolve()
+                    _seed_titanic(source_dir)
+                    files = {
+                        name: (source_dir / name).read_text(encoding="utf-8", errors="replace")
+                        for name in ("train.csv", "test.csv", "gender_submission.csv")
+                        if (source_dir / name).exists()
+                    }
+                    if files:
+                        _write_zip_with_text_files(target, files)
+                else:
+                    _write_zip_with_csv(target, "data.csv", ["col1"], [[1]])
+            elif not target.exists() or target.stat().st_size < 5000:
                 _write_csv_placeholder(target)
+        if "zipfile.ZipFile" in script_text and "titanic" in script_text.lower():
+            target = (repo_path / "titanic.zip").resolve()
+            if not target.exists() or target.stat().st_size == 0:
+                source_dir = (kaggle_root / "input" / "titanic").resolve()
+                _seed_titanic(source_dir)
+                files = {
+                    name: (source_dir / name).read_text(encoding="utf-8", errors="replace")
+                    for name in ("train.csv", "test.csv", "gender_submission.csv")
+                    if (source_dir / name).exists()
+                }
+                if files:
+                    _write_zip_with_text_files(target, files)
 
 
 def find_train_script(repo_path: Path, explicit: str | None = None) -> Path | None:
@@ -1020,7 +1099,7 @@ def _load_json_objects(text: str) -> list[Any]:
 def _summarize_failed_invariant(obj: Any) -> str:
     if not isinstance(obj, dict):
         return ""
-    inv = obj.get("invariant") if isinstance(obj.get("invariant"), dict) else {}
+    inv = obj.get("invariant") if isinstance(obj.get("invariant"), dict) else obj
     text = ""
     if isinstance(inv, dict):
         text = str(inv.get("text_description") or inv.get("description") or "")
@@ -1037,12 +1116,14 @@ def _summarize_failed_invariant(obj: Any) -> str:
 def _compact_failed_invariant(obj: Any) -> dict[str, Any] | None:
     if not isinstance(obj, dict):
         return None
-    inv = obj.get("invariant") if isinstance(obj.get("invariant"), dict) else {}
+    inv = obj.get("invariant") if isinstance(obj.get("invariant"), dict) else obj
     compact_inv: dict[str, Any] = {}
     if isinstance(inv, dict):
         for key in ("text_description", "relation", "params", "precondition"):
             if key in inv:
                 compact_inv[key] = inv.get(key)
+    if not compact_inv:
+        return None
     compact: dict[str, Any] = {
         "invariant": compact_inv,
         "check_passed": obj.get("check_passed"),
@@ -1068,11 +1149,13 @@ def _collect_reports(trace_dir: Path) -> tuple[list[str], list[Path], list[dict[
     failed_invariants: list[dict[str, Any]] = []
 
     for failed_path in trace_dir.rglob("failed.log"):
-        report_files.append(failed_path)
         try:
             text = failed_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
+        if not text.strip():
+            continue
+        report_files.append(failed_path)
         for obj in _load_json_objects(text):
             compact = _compact_failed_invariant(obj)
             if compact:
@@ -1083,11 +1166,31 @@ def _collect_reports(trace_dir: Path) -> tuple[list[str], list[Path], list[dict[
 
     for path in trace_dir.rglob("*.json"):
         name = path.name.lower()
-        if any(k in name for k in ("violation", "check", "result", "report")):
+        if name == "invariants.json":
+            continue
+        if "failed" in name or any(k in name for k in ("violation", "check", "result", "report")):
             report_files.append(path)
             try:
                 data = path.read_text(encoding="utf-8", errors="replace")
-                violations.extend(_extract_violations(_safe_json_load(data)))
+                parsed = _safe_json_load(data)
+                if parsed:
+                    violations.extend(_extract_violations(parsed))
+                    parsed_items = parsed if isinstance(parsed, list) else [parsed]
+                    for obj in parsed_items:
+                        compact = _compact_failed_invariant(obj)
+                        if compact:
+                            failed_invariants.append(compact)
+                        summary = _summarize_failed_invariant(obj)
+                        if summary:
+                            violations.append(summary)
+                else:
+                    for obj in _load_json_objects(data):
+                        compact = _compact_failed_invariant(obj)
+                        if compact:
+                            failed_invariants.append(compact)
+                        summary = _summarize_failed_invariant(obj)
+                        if summary:
+                            violations.append(summary)
             except Exception:
                 continue
     return violations, report_files, failed_invariants
@@ -1100,6 +1203,24 @@ def _safe_json_load(text: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return {}
+
+
+def _parse_check_summary(text: str) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    patterns = {
+        "checked": r"Checking finished\.\s+(\d+)\s+invariants checked",
+        "failed": r"Total failed invariants:\s+(\d+)/(\d+)",
+        "passed": r"Total passed invariants:\s+(\d+)/(\d+)",
+        "not_triggered": r"Total invariants that are not triggered:\s+(\d+)/(\d+)",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        summary[key] = int(match.group(1))
+        if len(match.groups()) > 1:
+            summary.setdefault("total", int(match.group(2)))
+    return summary
 
 
 def run_traincheck(
@@ -1132,8 +1253,7 @@ def run_traincheck(
         notebooks = _iter_ipynb_files(repo_path)
         if notebooks:
             tmp_dir = Path(tempfile.mkdtemp(prefix="traincheck-nb-"))
-            max_cells = 10 if max_iters is not None and max_iters > 0 else None
-            converted_notebook = _convert_ipynb_to_py(notebooks[0], tmp_dir, max_cells=max_cells)
+            converted_notebook = _convert_ipynb_to_py(notebooks[0], tmp_dir)
             script = converted_notebook
     if script:
         script = Path(script).resolve()
@@ -1158,9 +1278,10 @@ def run_traincheck(
             if max_iters is not None and max_iters > 0:
                 script_text = _rewrite_range_calls(script_text)
             script_text = _rewrite_relative_csv_paths(script_text, repo_path)
+            script_text = _move_future_imports_to_top(script_text)
             script_text = _ensure_parseable(script_text)
             script.write_text(script_text, encoding="utf-8")
-            _seed_from_script_paths(script_text, kaggle_root, repo_path)
+            _seed_from_script_paths(script_text, kaggle_root, script.parent)
         else:
             script_text = _sanitize_script_text(
                 script.read_text(encoding="utf-8", errors="replace")
@@ -1188,13 +1309,14 @@ def run_traincheck(
                         + script_text
                     )
                 script_text = _rewrite_relative_csv_paths(script_text, repo_path)
+                script_text = _move_future_imports_to_top(script_text)
                 script_text = _ensure_parseable(script_text)
                 tmp_script.write_text(script_text, encoding="utf-8")
                 if needs_kaggle_rewrite:
                     _rewrite_kaggle_paths(tmp_script, kaggle_root)
                 script = tmp_script
                 script_text = script.read_text(encoding="utf-8", errors="replace")
-                _seed_from_script_paths(script_text, kaggle_root, repo_path)
+                _seed_from_script_paths(script_text, kaggle_root, script.parent)
 
     base_env = os.environ.copy()
     base_env.update(
@@ -1212,12 +1334,14 @@ def run_traincheck(
         "traincheck-collect",
         "--pyscript",
         str(script),
+        "--copy-all-files",
         "--output-dir",
         str(trace_dir),
     ]
     if model_var:
         collect_cmd.extend(["--models-to-track", model_var])
 
+    collect_error = None
     try:
         collect = _run_cmd(collect_cmd, cwd=repo_path, timeout_s=timeout_s, env=base_env)
     except FileNotFoundError as exc:
@@ -1244,16 +1368,24 @@ def run_traincheck(
         }
 
     if collect.returncode != 0:
-        return {
-            "ok": False,
-            "error": f"traincheck-collect exited {collect.returncode}",
-            "review": "",
-            "trace_dir": str(trace_dir),
-            "stdout": collect.stdout,
-            "stderr": collect.stderr,
-            "converted_notebook": str(converted_notebook) if converted_notebook else None,
-            "script": str(script) if script else None,
-        }
+        collect_error = f"traincheck-collect exited {collect.returncode}"
+        # traincheck-collect can return nonzero after writing usable partial traces,
+        # for example when a Kaggle script finishes with an output-file error. Keep
+        # those traces so traincheck-check can still report any invariant failures.
+        if not list(trace_dir.rglob("trace_API_*.log")):
+            return {
+                "ok": False,
+                "error": collect_error,
+                "review": "",
+                "trace_dir": str(trace_dir),
+                "stdout": collect.stdout,
+                "stderr": collect.stderr,
+                "converted_notebook": str(converted_notebook) if converted_notebook else None,
+                "script": str(script) if script else None,
+            }
+
+    collect_stdout = collect.stdout
+    collect_stderr = collect.stderr
 
     invariants = (
         Path(invariants_path).resolve()
@@ -1345,6 +1477,7 @@ def run_traincheck(
         }
 
     violations, report_files, failed_invariants = _collect_reports(trace_dir)
+    check_summary = _parse_check_summary("\n".join(p for p in (check.stdout, check.stderr) if p))
     review_parts = []
     if violations:
         review_parts.append("TrainCheck violations:")
@@ -1361,19 +1494,26 @@ def run_traincheck(
 
     check_ok = check.returncode == 0
     check_error = None if check_ok else f"traincheck-check exited {check.returncode}"
-    if not check_ok and "time column not found" in (check.stderr or "").lower():
+    if not check_ok and (failed_invariants or violations):
         check_ok = True
-        check_error = None
+    checked = check_summary.get("checked") or check_summary.get("total") or 0
+    not_triggered = check_summary.get("not_triggered") or 0
+    if checked and not_triggered >= checked and not failed_invariants and not violations:
+        check_ok = False
+        check_error = "traincheck-check did not trigger any invariants"
+
+    errors = [e for e in (collect_error, check_error) if e]
     return {
         "ok": check_ok,
-        "error": check_error,
+        "error": "; ".join(errors) if errors else None,
         "review": review_text,
         "trace_dir": str(trace_dir),
-        "stdout": check.stdout,
-        "stderr": check.stderr,
+        "stdout": "\n".join(p for p in (collect_stdout, check.stdout) if p),
+        "stderr": "\n".join(p for p in (collect_stderr, check.stderr) if p),
         "report_files": [str(p) for p in report_files],
         "failed_invariants": failed_invariants,
         "failed_invariants_count": len(failed_invariants),
+        "check_summary": check_summary,
         "converted_notebook": str(converted_notebook) if converted_notebook else None,
         "script": str(script) if script else None,
     }
@@ -1401,6 +1541,7 @@ def prepare_reference_invariants(
     script_text = reference_script.read_text(encoding="utf-8", errors="replace")
     if "_vibetest_safe_getattr" not in script_text:
         script_text = _traincheck_safe_getattr_patch() + script_text
+    script_text = _move_future_imports_to_top(script_text)
     patched_script.write_text(script_text, encoding="utf-8")
 
     # Create a shell script to pass safe runtime args (disable GPU)

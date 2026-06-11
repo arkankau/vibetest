@@ -42,6 +42,70 @@ def test_react_resume_parser_keeps_case_score() -> None:
     assert results[0].metadata["evidence_text"] == "trace"
 
 
+def test_react_resume_parser_keeps_two_decimal_scores() -> None:
+    output = (
+        "VERDICT: PASS\n"
+        "CASE_SCORE: 0.17\n"
+        "EVIDENCE_STRENGTH: 0.83\n"
+        "REASON: looks good\n"
+        "EVIDENCE: [/repo/file.py:1-5]"
+    )
+    sample = SimpleNamespace(
+        id="case-2",
+        output=SimpleNamespace(completion=output),
+        messages=[],
+        score=None,
+        total_time=None,
+        working_time=None,
+        model_usage=None,
+    )
+    eval_log = SimpleNamespace(samples=[sample])
+    agent = SimpleNamespace(model_name="vllm/Qwen/Qwen3.6-35B-A3B-FP8")
+
+    results = VibeTestAgent._parse_results_from_log(
+        agent,
+        eval_log,
+        {"case-2": _test_case()},
+        {"case-2"},
+    )
+
+    assert len(results) == 1
+    assert results[0].metadata["verdict"] == "PASS"
+    assert results[0].metadata["case_score"] == 0.17
+    assert results[0].metadata["evidence_strength"] == 0.83
+    assert results[0].metadata["reason_text"] == "looks good"
+
+
+def test_react_resume_parser_maps_legacy_confidence_to_case_score() -> None:
+    output = (
+        "VERDICT: FAIL\n"
+        "CONFIDENCE: 0.83\n"
+        "REASON: legacy field\n"
+        "EVIDENCE: trace"
+    )
+    sample = SimpleNamespace(
+        id="case-3",
+        output=SimpleNamespace(completion=output),
+        messages=[],
+        score=None,
+        total_time=None,
+        working_time=None,
+        model_usage=None,
+    )
+    eval_log = SimpleNamespace(samples=[sample])
+    agent = SimpleNamespace(model_name="vllm/Qwen/Qwen3.6-35B-A3B-FP8")
+
+    results = VibeTestAgent._parse_results_from_log(
+        agent,
+        eval_log,
+        {"case-3": _test_case()},
+        {"case-3"},
+    )
+
+    assert len(results) == 1
+    assert results[0].metadata["case_score"] == 0.83
+
+
 def test_codex_parser_keeps_case_score() -> None:
     output = "VERDICT: PASS\nCASE_SCORE: 0.25\nREASON: looks good\nEVIDENCE: none"
     sample = SimpleNamespace(
