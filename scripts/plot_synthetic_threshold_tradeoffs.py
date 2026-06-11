@@ -4,6 +4,9 @@ At each threshold, predicted FAIL outputs below the selected score are converted
 to INCONCLUSIVE. By default, original PASS and INCONCLUSIVE outputs are left unchanged.
 With --threshold-pass-low-score, original PASS outputs below the threshold are
 also converted to INCONCLUSIVE.
+With --inconclusive-band-low T1, the plotted threshold is treated as T2 and
+scored PASS/FAIL rows are remapped as PASS for score <= T1, INCONCLUSIVE for
+T1 < score < T2, and FAIL for score >= T2.
 This makes abstention part of the plotted metric instead of only filtering a
 conditional FAIL set.
 """
@@ -163,13 +166,33 @@ def _f1(precision: float | None, recall: float | None) -> float | None:
     return 2 * precision * recall / (precision + recall)
 
 
-def _thresholds(items: list[TestItem], *, threshold_pass_low_score: bool) -> list[float]:
-    score_verdicts = {"FAIL", "PASS"} if threshold_pass_low_score else {"FAIL"}
+def _thresholds(
+    items: list[TestItem],
+    *,
+    threshold_pass_low_score: bool,
+    inconclusive_band_low: float | None,
+) -> list[float]:
+    score_verdicts = {"FAIL", "PASS"} if threshold_pass_low_score or inconclusive_band_low is not None else {"FAIL"}
     scores = {item.score for item in items if item.verdict in score_verdicts and item.score is not None}
+    if inconclusive_band_low is not None:
+        scores = {score for score in scores if score >= inconclusive_band_low}
+        return sorted({inconclusive_band_low, 1.0, *scores})
     return sorted({0.0, 1.0, *scores})
 
 
-def _thresholded_verdict(item: TestItem, threshold: float, *, threshold_pass_low_score: bool) -> str:
+def _thresholded_verdict(
+    item: TestItem,
+    threshold: float,
+    *,
+    threshold_pass_low_score: bool,
+    inconclusive_band_low: float | None,
+) -> str:
+    if inconclusive_band_low is not None and item.verdict in {"PASS", "FAIL"} and item.score is not None:
+        if item.score <= inconclusive_band_low:
+            return "PASS"
+        if item.score < threshold:
+            return "INCONCLUSIVE"
+        return "FAIL"
     if item.verdict == "FAIL":
         if item.score is not None and item.score >= threshold:
             return "FAIL"
@@ -181,14 +204,29 @@ def _thresholded_verdict(item: TestItem, threshold: float, *, threshold_pass_low
     return item.verdict
 
 
-def _rows_for_group(items: list[TestItem], *, target: str, threshold_pass_low_score: bool) -> list[dict[str, Any]]:
+def _rows_for_group(
+    items: list[TestItem],
+    *,
+    target: str,
+    threshold_pass_low_score: bool,
+    inconclusive_band_low: float | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     total = len(items)
     gt_fail = sum(1 for item in items if item.gt == 1)
     gt_pass = total - gt_fail
-    for threshold in _thresholds(items, threshold_pass_low_score=threshold_pass_low_score):
+    for threshold in _thresholds(
+        items,
+        threshold_pass_low_score=threshold_pass_low_score,
+        inconclusive_band_low=inconclusive_band_low,
+    ):
         verdicts = [
-            _thresholded_verdict(item, threshold, threshold_pass_low_score=threshold_pass_low_score)
+            _thresholded_verdict(
+                item,
+                threshold,
+                threshold_pass_low_score=threshold_pass_low_score,
+                inconclusive_band_low=inconclusive_band_low,
+            )
             for item in items
         ]
         fail_tp = 0
@@ -305,6 +343,7 @@ def _rows_for_group(items: list[TestItem], *, target: str, threshold_pass_low_sc
         rows.append(
             {
                 "threshold": threshold,
+                "threshold_low": inconclusive_band_low,
                 "total": total,
                 "gt_fail": gt_fail,
                 "gt_pass": gt_pass,
@@ -370,6 +409,7 @@ def _write_csv(path: Path, curves: dict[str, list[dict[str, Any]]]) -> None:
     fieldnames = [
         "series",
         "threshold",
+        "threshold_low",
         "total",
         "gt_fail",
         "gt_pass",
@@ -434,15 +474,45 @@ def _write_csv(path: Path, curves: dict[str, list[dict[str, Any]]]) -> None:
                 writer.writerow({"series": series, **row})
 
 
+# Light → dark blue for 0 / 10 / 20 calibration-example static VibeTest curves.
+_VIBETEST_STATIC_BLUE = {
+    0: "#B3D9F2",
+    10: "#1F78B4",
+    20: "#08306B",
+}
+
+_VIBETEST_MIXED_GREEN = {
+    10: "#66C2A4",
+    20: "#006D2C",
+}
+
+
+def _vibetest_static_example_count(series: str) -> int | None:
+    if "VibeTest static + mixed ex" in series:
+        return None
+    if "VibeTest static + ex20" in series:
+        return 20
+    if "VibeTest static + ex10" in series:
+        return 10
+    if series.startswith("VibeTest static"):
+        return 0
+    return None
+
+
 def _series_color(series: str) -> str | None:
+    if "VibeTest static + mixed ex20" in series:
+        return _VIBETEST_MIXED_GREEN[20]
+    if "VibeTest static + mixed ex10" in series:
+        return _VIBETEST_MIXED_GREEN[10]
+    example_count = _vibetest_static_example_count(series)
+    if example_count is not None:
+        return _VIBETEST_STATIC_BLUE[example_count]
     if series.startswith("Reviewer mode 0"):
         return "#DDA0C6"
     if series.startswith("Reviewer mode 1"):
         return "#CC79A7"
     if series.startswith("Reviewer mode 2"):
         return "#8F4A73"
-    if series.startswith("VibeTest static"):
-        return "#0072B2"
     if series.startswith("VibeTest dynamic"):
         return "#E69F00"
     if series.startswith("TrainCheck"):
@@ -721,6 +791,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Also convert original PASS outputs with case_score below the threshold to INCONCLUSIVE.",
     )
     parser.add_argument(
+        "--inconclusive-band-low",
+        type=float,
+        help=(
+            "Use two-sided score thresholds. The sweep threshold is T2: scored "
+            "PASS/FAIL rows with score <= T1 become PASS, T1 < score < T2 "
+            "become INCONCLUSIVE, and score >= T2 become FAIL."
+        ),
+    )
+    parser.add_argument(
         "--inconclusive-as-pass-series",
         action="append",
         default=[],
@@ -732,6 +811,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.inconclusive_band_low is not None and not (0.0 <= args.inconclusive_band_low < 1.0):
+        raise SystemExit("--inconclusive-band-low must be >= 0 and < 1.")
     grouped: dict[str, list[TestItem]] = {}
     if args.series:
         for label, paths in args.series:
@@ -763,6 +844,7 @@ def main() -> None:
             items,
             target=args.target,
             threshold_pass_low_score=args.threshold_pass_low_score,
+            inconclusive_band_low=args.inconclusive_band_low,
         )
     csv_path = args.output_prefix.with_suffix(".csv")
     _write_csv(csv_path, curves)

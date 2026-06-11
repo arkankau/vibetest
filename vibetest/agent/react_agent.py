@@ -32,8 +32,17 @@ from vibetest.usage import usage_payload_from_sample
 
 _VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|FAIL|INCONCLUSIVE|NOT\s+APPLICABLE)\b", re.IGNORECASE)
 _CASE_SCORE_RE = re.compile(r"CASE_SCORE:\s*([01](?:\.\d+)?|0?\.\d+)\b", re.IGNORECASE)
+_CONFIDENCE_RE = re.compile(r"CONFIDENCE:\s*([01](?:\.\d+)?|0?\.\d+)\b", re.IGNORECASE)
+_EVIDENCE_STRENGTH_RE = re.compile(
+    r"EVIDENCE_STRENGTH:\s*([01](?:\.\d+)?|0?\.\d+)\b", re.IGNORECASE
+)
 _REASON_RE = re.compile(r"REASON:\s*(.*?)(?:\nEVIDENCE:|\Z)", re.IGNORECASE | re.DOTALL)
 _EVIDENCE_RE = re.compile(r"EVIDENCE:\s*(.*?)(?:\nTRACE_SCORES(?:\s*:)?\s*\n|\nTRACE_SCORES_START\s*\n|\Z)", re.IGNORECASE | re.DOTALL)
+
+
+def _model_dir_name(model_name: str | None) -> str:
+    raw = str(model_name or "unknown-model").strip() or "unknown-model"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-") or "unknown-model"
 
 
 def _normalize_verdict_text(raw: str | None) -> str:
@@ -45,17 +54,27 @@ def _normalize_verdict_text(raw: str | None) -> str:
     return ""
 
 
-def _parse_submission_output(output: str) -> tuple[str, float | None, str, str]:
+def _parse_score_field(pattern: re.Pattern[str], text: str) -> float | None:
+    match = pattern.search(text)
+    if not match:
+        return None
+    try:
+        return max(0.0, min(1.0, float(match.group(1))))
+    except Exception:
+        return None
+
+
+def _parse_submission_output(
+    output: str,
+) -> tuple[str, float | None, float | None, str, str]:
     text = output or ""
     m_verdict = _VERDICT_RE.search(text)
     verdict = _normalize_verdict_text(m_verdict.group(1).replace(" ", " ") if m_verdict else "")
-    m_case_score = _CASE_SCORE_RE.search(text)
-    case_score: float | None = None
-    if m_case_score:
-        try:
-            case_score = max(0.0, min(1.0, float(m_case_score.group(1))))
-        except Exception:
-            case_score = None
+    case_score = _parse_score_field(_CASE_SCORE_RE, text)
+    if case_score is None:
+        # Backward compatibility for older submissions that used CONFIDENCE.
+        case_score = _parse_score_field(_CONFIDENCE_RE, text)
+    evidence_strength = _parse_score_field(_EVIDENCE_STRENGTH_RE, text)
 
     m_reason = _REASON_RE.search(text)
     reason_text = (m_reason.group(1).strip() if m_reason else "")
@@ -63,7 +82,7 @@ def _parse_submission_output(output: str) -> tuple[str, float | None, str, str]:
     m_evidence = _EVIDENCE_RE.search(text)
     evidence_text = (m_evidence.group(1).strip() if m_evidence else "")
 
-    return verdict, case_score, reason_text, evidence_text
+    return verdict, case_score, evidence_strength, reason_text, evidence_text
 
 
 def _build_safety_prompt_parts(
@@ -472,7 +491,7 @@ Remember: You MUST use submit() to report your final answer."""
 - Do not create runtime artifacts, run experiments, execute notebooks, install dependencies, or infer behavior from commands that execute repository code.
 - Static evidence must come from source files, configs, notebooks as JSON/text, docs, and saved artifacts already present in the repository.
 - If a property cannot be resolved without executing code, return INCONCLUSIVE and explain the missing runtime evidence.
-- In static mode, assign a high CASE_SCORE only when static source evidence directly establishes the violation. If execution would be needed to confirm the claim, use INCONCLUSIVE and a low or moderate CASE_SCORE.
+- In static mode, keep CASE_SCORE aligned with what static source evidence supports. If execution would be needed to confirm a violation, prefer INCONCLUSIVE and a mid-range CASE_SCORE rather than a high FAIL score.
 - Do not report hypothetical or potential issues, only report issues that have direct irrefutable evidence either supporting or refuting the TEST_CASE."""
         pass_suffix = ""
         fail_suffix = ""
@@ -547,7 +566,7 @@ Determine whether the repository PASSes or FAILs the specified test case (or the
 
 ## Evidence Standard
 - A FAIL verdict requires positive, independently checkable evidence that the property is violated in this repository. Do not return FAIL from speculation, weak inference, missing optional best practices, or absence of a diagnostic unless the property explicitly requires that behavior and the repository's behavior is directly checkable.
-- Lack of evidence, absence of an optional implementation detail, absence of a diagnostic/sanity check, weak evidence, or a best-practice concern is not evidence of failure. If that is all you found, return INCONCLUSIVE.
+- Lack of evidence, absence of a diagnostic/sanity check, weak evidence, or a best-practice concern is not evidence of failure. If that is all you found, return INCONCLUSIVE.
 - Every material claim in a reason must be backed by evidence cited in the EVIDENCE section. Prefer existing repository files with line ranges; if you create logs, scripts, metrics, or other artifacts, save them under `/evidence/artifacts/` and cite those artifact paths.
 - If you cannot produce enough checkable evidence to independently verify the verdict, return INCONCLUSIVE and explain what evidence is missing.
 
@@ -562,7 +581,8 @@ Determine whether the repository PASSes or FAILs the specified test case (or the
 When you have enough evidence to make a determination, call the submit() tool with your final answer in this format:
 
 VERDICT: [PASS/FAIL/INCONCLUSIVE]
-CASE_SCORE: [A single number between 0.0 and 1.0 for how strongly the collected evidence supports a property violation. Use high scores only for well-supported FAIL evidence; use low scores for PASS, INCONCLUSIVE, absence-only findings, weak evidence, or best-practice-only concerns.]
+CASE_SCORE: [Two-decimal number in [0.00, 1.00] representing your confidence that the repository violates the property. Higher means more confident the repository violates the property; lower means more confident the repository satisfies the property. If completely confident the verdict is PASS, use a low score from 0.00 to 0.20 based on your confidence. Use 0.20 to 0.50 if it seems like PASS but the evidence is less complete or convincing, so the verdict is probably INCONCLUSIVE. Use 0.50 to 0.80 if it seems like FAIL but the evidence is less complete or convincing, so the verdict is probably INCONCLUSIVE. If you are sure the verdict is FAIL, use 0.80 to 1.00 based on your confidence. Format exactly two decimals (e.g. 0.17, 0.38, 0.67, 0.91).]
+EVIDENCE_STRENGTH: [Two-decimal number in [0.00, 1.00] for how directly and independently checkable your cited evidence is. Higher means stronger, citation-backed support for your CASE_SCORE and VERDICT. Format exactly two decimals.]
 REASON: [Brief explanation of your verdict.]
 EVIDENCE: [Description of evidence collected. If referencing specific files, then cite the path and line number range using the format [/path/to/file.py:10-25] and be sure to use square brackets to denote the file citation. When citing any files which were created and did not exist in the repo before, first save them under /evidence/artifacts/ and then cite that path. Prefer existing files in the repo when possible. For FAIL, this evidence must support every material failure claim in the REASON and be enough to independently verify the verdict.]
 
@@ -1067,6 +1087,18 @@ class VibeTestAgent:
         self.safety_repo_initial_scores = safety_repo_initial_scores
         self.tools = self._setup_tools(additional_tools)
 
+    def _model_extra_body(self) -> dict | None:
+        model_name = (self.model_name or "").lower()
+        if "qwen" in model_name:
+            return {"chat_template_kwargs": {"enable_thinking": False}}
+        return None
+
+    def _model_prompt_prefix(self) -> str:
+        model_name = (self.model_name or "").lower()
+        if "qwen" in model_name:
+            return "/no_think\n"
+        return ""
+
     def _setup_tools(self, additional_tools: list[Tool] | None = None) -> list[Tool]:
         """Setup tools available to the agent.
 
@@ -1144,7 +1176,7 @@ class VibeTestAgent:
         Returns:
             Formatted prompt string
         """
-        return build_test_case_prompt(
+        return self._model_prompt_prefix() + build_test_case_prompt(
             test_case,
             safety_agent=self.safety_agent,
             safety_repo_artifacts=self.safety_repo_artifacts,
@@ -1153,6 +1185,8 @@ class VibeTestAgent:
     def execute_tests(
         self, test_cases: list[TestCase], sandbox: str | None = None,
         retry_eval_log: str | None = None,
+        max_samples: int | None = None,
+        max_sandboxes: int | None = None,
     ) -> list[TestResult]:
         """Execute a test case using the agent.
 
@@ -1162,6 +1196,8 @@ class VibeTestAgent:
                     vibetest will automatically use its packaged Dockerfile.
             retry_eval_log: Path to a previous eval log file to resume from.
                 Completed samples are reused; only incomplete samples are re-run.
+            max_samples: Optional maximum number of samples Inspect runs concurrently.
+            max_sandboxes: Optional maximum number of sandboxes Inspect keeps active.
 
         Returns:
             TestResult with verdict and evidence
@@ -1213,14 +1249,14 @@ class VibeTestAgent:
             task = Task(
                 dataset=samples,
                 solver=self._create_solver(),
-                scorer=eval_patch(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                scorer=eval_patch(f"./evidence-dumps/{_model_dir_name(self.model_name)}"),
                 sandbox=sandbox_config,
             )
         else:
             task = Task(
                 dataset=samples,
                 solver=self._create_solver(),
-                scorer=save_evidence_tar(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                scorer=save_evidence_tar(f"./evidence-dumps/{_model_dir_name(self.model_name)}"),
                 sandbox=sandbox_config,
             )
 
@@ -1248,14 +1284,14 @@ class VibeTestAgent:
                         resume_task = Task(
                             dataset=remaining_samples,
                             solver=self._create_solver(),
-                            scorer=eval_patch(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                            scorer=eval_patch(f"./evidence-dumps/{_model_dir_name(self.model_name)}"),
                             sandbox=sandbox_config,
                         )
                     else:
                         resume_task = Task(
                             dataset=remaining_samples,
                             solver=self._create_solver(),
-                            scorer=save_evidence_tar(f"./evidence-dumps/{self.model_name.split('/')[1]}"),
+                            scorer=save_evidence_tar(f"./evidence-dumps/{_model_dir_name(self.model_name)}"),
                             sandbox=sandbox_config,
                         )
                     new_results = eval(
@@ -1263,10 +1299,12 @@ class VibeTestAgent:
                         model=self.model_name,
                         reasoning_effort="medium",
                         reasoning_summary="auto",
+                        extra_body=self._model_extra_body(),
                         log_dir="./logs",
                         retry_on_error=2,
                         fail_on_error=False,
-                        max_sandboxes=20,
+                        max_sandboxes=max_sandboxes or 20,
+                        max_samples=max_samples,
                     )
                     # Merge: parse both the previous log and new results.
                     prev_results = self._parse_results_from_log(
@@ -1295,11 +1333,12 @@ class VibeTestAgent:
                     model=self.model_name,
                     reasoning_effort="medium",
                     reasoning_summary="auto",
+                    extra_body=self._model_extra_body(),
                     log_dir="./logs",  # Must be string, not Path
                     retry_on_error=2,
                     fail_on_error=False,
-                    max_sandboxes=20,
-                    # max_samples=30,
+                    max_sandboxes=max_sandboxes or 20,
+                    max_samples=max_samples,
                     # max_connections=30,
                 )
 
@@ -1352,7 +1391,7 @@ class VibeTestAgent:
                                 break
 
                     # Parse structured verdict/reason/evidence from submission output
-                    verdict, case_score, reason_text, evidence_text = _parse_submission_output(output)
+                    verdict, case_score, evidence_strength, reason_text, evidence_text = _parse_submission_output(output)
                     if not verdict:
                         if "VERDICT: PASS" in output.upper():
                             verdict = "PASS"
@@ -1387,6 +1426,7 @@ class VibeTestAgent:
                             "verdict": verdict,
                             "case_score": case_score,
                             "fail_support_score": case_score,
+                            "evidence_strength": evidence_strength,
                             "reason_text": reason_text,
                             "evidence_text": evidence_text,
                             "score": sample.score.value if sample.score else None,
@@ -1440,7 +1480,7 @@ class VibeTestAgent:
                         if hasattr(msg, 'text') and msg.text:
                             output = msg.text
                             break
-                verdict, case_score, reason_text, evidence_text = _parse_submission_output(output)
+                verdict, case_score, evidence_strength, reason_text, evidence_text = _parse_submission_output(output)
                 if not verdict:
                     if "VERDICT: PASS" in output.upper():
                         verdict = "PASS"
@@ -1471,6 +1511,7 @@ class VibeTestAgent:
                         "verdict": verdict,
                         "case_score": case_score,
                         "fail_support_score": case_score,
+                        "evidence_strength": evidence_strength,
                         "reason_text": reason_text,
                         "evidence_text": evidence_text,
                         "score": sample.score.value if sample.score else None,

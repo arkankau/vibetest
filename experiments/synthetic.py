@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import re
 import shutil
@@ -114,6 +115,146 @@ def _normalize_score(raw: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return min(1.0, max(0.0, score))
+
+
+_CORRECT_FAIL_EXAMPLE_FIELDS = (
+    "test_prompt",
+    "reason",
+    "case_score",
+    "evidence_strength",
+)
+
+_MIXED_FAIL_EXAMPLE_FIELDS = (
+    "audited_outcome",
+    "test_prompt",
+    "reason",
+    "case_score",
+    "evidence_strength",
+)
+
+
+def _load_correct_fail_examples(path: Path, limit: int) -> list[dict[str, str]]:
+    if limit <= 0:
+        return []
+    if not path.exists():
+        raise SystemExit(f"Correct FAIL examples file not found: {path}")
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        rows = [
+            {
+                key: str(row.get(key) or "").strip()
+                for key in _CORRECT_FAIL_EXAMPLE_FIELDS
+            }
+            for row in csv.DictReader(f, delimiter="\t")
+        ]
+    examples = [
+        row
+        for row in rows
+        if row.get("test_prompt") and row.get("reason")
+    ]
+    if len(examples) < limit:
+        raise SystemExit(
+            f"Requested {limit} correct FAIL examples but only found {len(examples)} usable row(s) in {path}."
+        )
+    return examples[:limit]
+
+
+def _load_mixed_fail_examples(path: Path, limit: int) -> list[dict[str, str]]:
+    if limit <= 0:
+        return []
+    if not path.exists():
+        raise SystemExit(f"Mixed FAIL calibration examples file not found: {path}")
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        rows = [
+            {
+                key: str(row.get(key) or "").strip()
+                for key in _MIXED_FAIL_EXAMPLE_FIELDS
+            }
+            for row in csv.DictReader(f, delimiter="\t")
+        ]
+    examples = [
+        row
+        for row in rows
+        if row.get("audited_outcome") and row.get("test_prompt") and row.get("reason")
+    ]
+    if len(examples) < limit:
+        raise SystemExit(
+            f"Requested {limit} mixed FAIL calibration examples but only found {len(examples)} usable row(s) in {path}."
+        )
+    return examples[:limit]
+
+
+def _format_correct_fail_examples(examples: list[dict[str, str]]) -> str:
+    if not examples:
+        return ""
+    blocks = []
+    for idx, row in enumerate(examples, start=1):
+        reason = row["reason"]
+        if len(reason) > 360:
+            reason = reason[:357].rstrip() + "..."
+        lines = [
+            f"{idx}. test={row['test_prompt']}",
+            f"   audit_note={reason}",
+        ]
+        if row.get("case_score"):
+            lines.append(f"   calibration_case_score={row['case_score']}")
+        if row.get("evidence_strength"):
+            lines.append(f"   calibration_evidence_strength={row['evidence_strength']}")
+        blocks.append("\n".join(lines))
+    return (
+        "Calibration notes from a manual audit. These are not answers for the current repository; "
+        "do not copy their wording or format. Use them only to calibrate what made prior FAIL "
+        "judgments concrete and independently checkable.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _format_mixed_fail_examples(examples: list[dict[str, str]]) -> str:
+    if not examples:
+        return ""
+    blocks = []
+    for idx, row in enumerate(examples, start=1):
+        reason = row["reason"]
+        if len(reason) > 360:
+            reason = reason[:357].rstrip() + "..."
+        lines = [
+            f"{idx}. audited_outcome={row['audited_outcome']}",
+            f"   test={row['test_prompt']}",
+            f"   audit_note={reason}",
+        ]
+        if row.get("case_score"):
+            lines.append(f"   calibration_case_score={row['case_score']}")
+        if row.get("evidence_strength"):
+            lines.append(f"   calibration_evidence_strength={row['evidence_strength']}")
+        blocks.append("\n".join(lines))
+    return (
+        "Calibration notes from a manual audit. These are not answers for the current repository; "
+        "do not copy their wording or format. VALID_FAIL means the prior attempted FAIL had concrete "
+        "evidence. NOT_VALID_FAIL_PASS and NOT_VALID_FAIL_INCONCLUSIVE mean the prior attempted FAIL "
+        "was rejected because the evidence was missing, speculative, overly strict, or consistent with "
+        "the property passing. Use these only to calibrate evidentiary standards for the current repository.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _examples_prompt_from_args(args: argparse.Namespace) -> str | None:
+    correct_count = int(args.correct_fail_examples or 0)
+    mixed_count = int(args.mixed_fail_examples or 0)
+    if correct_count and mixed_count:
+        raise SystemExit("Use either --correct-fail-examples or --mixed-fail-examples, not both.")
+    if mixed_count:
+        examples = _load_mixed_fail_examples(Path(args.mixed_fail_examples_path), mixed_count)
+        print(f"Injecting mixed FAIL calibration examples into prompt: {len(examples)}")
+        return _format_mixed_fail_examples(examples)
+    if correct_count:
+        examples = _load_correct_fail_examples(Path(args.correct_fail_examples_path), correct_count)
+        print(f"Injecting correct FAIL examples into prompt: {len(examples)}")
+        return _format_correct_fail_examples(examples)
+    return None
+
+
+def _combine_extra_instructions(*parts: str) -> str | None:
+    cleaned = [p.strip() for p in parts if str(p or "").strip()]
+    return "\n\n".join(cleaned) if cleaned else None
 
 
 def _model_suffix(model_name: str) -> str:
@@ -542,13 +683,14 @@ def _make_vibetest_case(
     *,
     attempt: int,
     feedback: str = "",
+    extra_instructions: str = "",
 ) -> TestCase:
     base_name = _synthetic_property_sample_id(case, prop)
     name = base_name if attempt == 1 else f"{base_name}_iter{attempt}"
     return TestCase(
         name=name,
         description=prop.property_text,
-        extra_instructions=feedback or None,
+        extra_instructions=_combine_extra_instructions(extra_instructions, feedback),
         repo_path=case.repo_path,
         sandbox_path=_synthetic_sandbox_path(case),
         additional_data=_synthetic_additional_data(case),
@@ -731,6 +873,8 @@ def _run_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -> list[
     print("Running synthetic experiment with VibeTest")
     print("=" * 80)
 
+    examples_prompt = _examples_prompt_from_args(args)
+
     all_test_cases: list[TestCase] = []
     case_ranges: list[tuple[int, int]] = []
 
@@ -741,6 +885,7 @@ def _run_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -> list[
                 TestCase(
                     name=_synthetic_property_sample_id(case, prop),
                     description=prop.property_text,
+                    extra_instructions=examples_prompt,
                     repo_path=case.repo_path,
                     sandbox_path=_synthetic_sandbox_path(case),
                     additional_data=_synthetic_additional_data(case),
@@ -785,6 +930,7 @@ def _run_vibetest_iterative(cases: list[SyntheticCase], args: argparse.Namespace
     vibetest_model = args.model or "openai/gpt-5-mini"
     verifier_model = args.verifier_model or vibetest_model
     evidence_root = Path(args.evidence_root)
+    examples_prompt = _examples_prompt_from_args(args)
     agent = VibeTestAgent(model=vibetest_model, static=not bool(args.dynamic))
     verifier = EvidenceVerifierAgent(
         model=verifier_model,
@@ -823,6 +969,7 @@ def _run_vibetest_iterative(cases: list[SyntheticCase], args: argparse.Namespace
                 int(slot["prop_index"]),
                 attempt=attempt,
                 feedback=str(slot.get("feedback") or ""),
+                extra_instructions=examples_prompt or "",
             )
             for slot in pending
         ]
@@ -1631,14 +1778,20 @@ async def _verify_fail_evidence_async(
     if not items:
         return []
 
+    model_extra_body = None
+    model_prompt_prefix = ""
+    if "qwen" in str(model_name or "").lower():
+        model_extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+        model_prompt_prefix = "/no_think\n"
+
     model = get_model(
         model_name,
-        config=GenerateConfig(max_tokens=500),
+        config=GenerateConfig(max_tokens=500, extra_body=model_extra_body),
     )
     sem = asyncio.Semaphore(max(1, concurrency))
 
     async def _one(item: dict[str, Any]) -> dict[str, Any]:
-        prompt = (
+        prompt = model_prompt_prefix + (
             "You are grading whether a predicted FAIL matches the ground-truth violation for the same property in buggy code.\n"
             "Return strict JSON with keys: grade (C or I), explanation (string).\n"
             "Grade C only when the predicted failure clearly corresponds to the same underlying bug/violation as ground truth.\n"
@@ -1888,6 +2041,8 @@ def _infer_output_path(
     *,
     dynamic: bool = False,
     iterative_verifier: bool = False,
+    correct_fail_examples: int | None = None,
+    mixed_fail_examples: int | None = None,
 ) -> Path:
     datasets = sorted({c.dataset for c in cases if c.dataset})
     if len(datasets) == 1:
@@ -1910,7 +2065,12 @@ def _infer_output_path(
     if method == "vibetest" and dynamic:
         model_name = f"{model or 'unknown-model'}-dynamic"
     base_path = standardized_results_path(dataset_name, method_name, model_name=model_name)
-    return base_path.parent / "synthetic" / base_path.name
+    output_name = base_path.name
+    if method == "vibetest" and correct_fail_examples is not None:
+        output_name = f"{base_path.stem}_examples{max(0, int(correct_fail_examples))}{base_path.suffix}"
+    if method == "vibetest" and mixed_fail_examples is not None:
+        output_name = f"{base_path.stem}_mixed_examples{max(0, int(mixed_fail_examples))}{base_path.suffix}"
+    return base_path.parent / "synthetic" / output_name
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -1983,6 +2143,8 @@ def _run(args: argparse.Namespace) -> None:
             method_model,
             dynamic=bool(args.dynamic),
             iterative_verifier=bool(args.iterative_verifier),
+            correct_fail_examples=args.correct_fail_examples,
+            mixed_fail_examples=args.mixed_fail_examples,
         )
     )
     # Persist method outputs before scoring so long runs are recoverable even if scoring fails/interrupted.
@@ -2070,6 +2232,34 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--model", type=str, help="Model for vibetest/codex/baseline-reviewer methods.")
     parser.add_argument("--dynamic", action="store_true", help="Use dynamic VibeTest agent mode.")
+    parser.add_argument(
+        "--correct-fail-examples",
+        type=int,
+        help=(
+            "For --method vibetest, inject this many manually audited correct FAIL examples into "
+            "the prompt as calibration examples. Pass 0 for an explicitly named no-example control."
+        ),
+    )
+    parser.add_argument(
+        "--correct-fail-examples-path",
+        type=str,
+        default="results/synthetic/manual_audit_representative_fails_20.tsv",
+        help="TSV file containing manually audited correct FAIL examples.",
+    )
+    parser.add_argument(
+        "--mixed-fail-examples",
+        type=int,
+        help=(
+            "For --method vibetest, inject this many mixed manual-audit calibration examples "
+            "containing both valid FAILs and attempted FAILs corrected to PASS/INCONCLUSIVE."
+        ),
+    )
+    parser.add_argument(
+        "--mixed-fail-examples-path",
+        type=str,
+        default="results/synthetic/manual_audit_mixed_fail_calibration_20.tsv",
+        help="TSV file containing mixed valid/invalid FAIL calibration examples.",
+    )
     parser.add_argument("--review-mapper-model", type=str, help="Model for review->property mapping.")
     parser.add_argument(
         "--iterative-verifier",
