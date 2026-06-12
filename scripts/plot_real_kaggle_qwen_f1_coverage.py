@@ -15,6 +15,7 @@ DATASETS = ("titanic", "diabetic", "nlp")
 EXAMPLES = (0, 10, 20)
 RESULT_DIR = Path("results")
 AUDIT_CSV = RESULT_DIR / "openrouter_fail_human_audit_sample15_gpt5mini.csv"
+REAUDIT_CSV = RESULT_DIR / "openrouter_false_fail_reaudit_full_context.csv"
 FIG_DIR = RESULT_DIR / "figures"
 
 
@@ -56,11 +57,31 @@ def summarize_result(dataset: str, examples: int) -> dict[str, float]:
 
 
 def load_false_fail_rates() -> dict[tuple[str, int], dict[str, float]]:
+    overrides: dict[tuple[str, str, str, str, str], str] = {}
+    if REAUDIT_CSV.exists():
+        with REAUDIT_CSV.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                key = (
+                    row["dataset"],
+                    row["examples"],
+                    row["repo_name"],
+                    row["row_index"],
+                    row["property_index"],
+                )
+                overrides[key] = row["audited_outcome"]
+
     counts: dict[tuple[str, int], Counter[str]] = defaultdict(Counter)
     with AUDIT_CSV.open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             key = (row["dataset"], int(row["examples"]))
-            counts[key][row["audited_outcome"]] += 1
+            override_key = (
+                row["dataset"],
+                row["examples"],
+                row["repo_name"],
+                row["row_index"],
+                row["property_index"],
+            )
+            counts[key][overrides.get(override_key, row["audited_outcome"])] += 1
 
     out: dict[tuple[str, int], dict[str, float]] = {}
     for key, counter in counts.items():
@@ -137,7 +158,7 @@ def main() -> None:
 
     fig.tight_layout()
 
-    out = FIG_DIR / "real_kaggle_qwen36_f1_vs_coverage.png"
+    out = FIG_DIR / "real_kaggle_qwen36_k_examples_macro_f1_vs_coverage.png"
     fig.savefig(out, dpi=180)
     print(out.resolve())
     for row in rows:

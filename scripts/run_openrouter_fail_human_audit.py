@@ -17,6 +17,11 @@ from openai import OpenAI
 VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|FAIL|INCONCLUSIVE|NOT\s+APPLICABLE)\b", re.I)
 CELL_RE = re.compile(r"\bcell\s+(\d+)\b", re.I)
 CITATION_RE = re.compile(r"\[(/kaggle/repo/[^\]:]+)(?::([^\]]+))?\]")
+CONTEXT_LIMITS = {
+    "cited": 12000,
+    "expanded": 30000,
+    "full": 80000,
+}
 
 
 def load_prompt_template(path: Path) -> str:
@@ -53,16 +58,22 @@ def get_property(test: dict[str, Any]) -> str:
     return str(metadata.get("test_description") or metadata.get("property_text") or "").strip()
 
 
-def notebook_cell_context(path: Path, evidence: str) -> str:
+def notebook_cell_context(path: Path, evidence: str, *, expanded: bool = True) -> str:
     try:
         nb = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         return f"[Could not read notebook {path}: {exc}]"
 
     cells = nb.get("cells") or []
-    requested = sorted({int(m.group(1)) for m in CELL_RE.finditer(evidence)})
+    raw_requested = sorted({int(m.group(1)) for m in CELL_RE.finditer(evidence)})
+    requested = set(raw_requested)
+    if expanded:
+        for idx in raw_requested:
+            requested.update(range(idx - 2, idx + 3))
+            requested.update(range(idx - 3, idx + 2))
+    requested = sorted(idx for idx in requested if idx >= 0)
     if not requested:
-        requested = list(range(min(8, len(cells))))
+        requested = list(range(min(15 if expanded else 8, len(cells))))
 
     parts: list[str] = []
     for idx in requested:
@@ -80,6 +91,27 @@ def notebook_cell_context(path: Path, evidence: str) -> str:
             source = source[:2500] + "\n...[truncated]"
         parts.append(f"--- Notebook cell {idx} ({cell.get('cell_type', 'unknown')}) ---\n{source}")
     return "\n\n".join(parts)
+
+
+def notebook_full_context(path: Path, *, limit: int) -> str:
+    try:
+        nb = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"[Could not read notebook {path}: {exc}]"
+
+    parts: list[str] = []
+    for idx, cell in enumerate(nb.get("cells") or []):
+        source = cell.get("source") or ""
+        if isinstance(source, list):
+            source = "".join(source)
+        source = str(source).strip()
+        if not source:
+            continue
+        parts.append(f"--- Notebook cell {idx} ({cell.get('cell_type', 'unknown')}) ---\n{source}")
+        if len("\n\n".join(parts)) >= limit:
+            break
+    text = "\n\n".join(parts)
+    return text[:limit] + ("\n...[notebook context truncated]" if len(text) > limit else "")
 
 
 def line_context(path: Path, loc: str | None) -> str:
@@ -102,7 +134,47 @@ def line_context(path: Path, loc: str | None) -> str:
     return "\n".join(excerpt)
 
 
-def build_source_context(repo_path: Path, evidence: str) -> str:
+def file_full_context(path: Path, *, limit: int) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return f"[Could not read file {path}: {exc}]"
+    return text[:limit] + ("\n...[file context truncated]" if len(text) > limit else "")
+
+
+def build_full_repo_context(repo_path: Path, *, limit: int) -> str:
+    contexts: list[str] = [f"Local repository path: {repo_path}"]
+    if not repo_path.exists():
+        return f"Local repository path: {repo_path}\n[Repository path does not exist.]"
+
+    files = [
+        path
+        for path in repo_path.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in {".ipynb", ".py", ".R", ".r", ".jl", ".md", ".txt", ".json", ".yaml", ".yml"}
+        and ".git" not in path.parts
+    ]
+    files.sort(key=lambda path: (path.suffix.lower() != ".ipynb", str(path).lower()))
+
+    for path in files:
+        rel = path.relative_to(repo_path)
+        remaining = limit - len("\n\n".join(contexts))
+        if remaining <= 500:
+            break
+        if path.suffix.lower() == ".ipynb":
+            snippet = notebook_full_context(path, limit=remaining)
+        else:
+            snippet = file_full_context(path, limit=remaining)
+        contexts.append(f"--- Repository source: {rel} ---\n{snippet}")
+    text = "\n\n".join(contexts)
+    return text[:limit] + ("\n...[source context truncated]" if len(text) > limit else "")
+
+
+def build_source_context(repo_path: Path, evidence: str, *, context_mode: str = "expanded") -> str:
+    limit = CONTEXT_LIMITS[context_mode]
+    if context_mode == "full":
+        return build_full_repo_context(repo_path, limit=limit)
+
     contexts: list[str] = [f"Local repository path: {repo_path}"]
     seen: set[Path] = set()
 
@@ -116,14 +188,15 @@ def build_source_context(repo_path: Path, evidence: str) -> str:
             contexts.append(f"--- Missing cited file ---\n{citation_path} -> {local_path}")
             continue
         if local_path.suffix.lower() == ".ipynb":
-            snippet = notebook_cell_context(local_path, evidence)
+            snippet = notebook_cell_context(local_path, evidence, expanded=context_mode == "expanded")
         else:
             snippet = line_context(local_path, loc)
         contexts.append(f"--- Cited source: {citation_path}{':' + loc if loc else ''} ---\n{snippet}")
 
-    if len("\n\n".join(contexts)) > 12000:
-        return "\n\n".join(contexts)[:12000] + "\n...[source context truncated]"
-    return "\n\n".join(contexts)
+    text = "\n\n".join(contexts)
+    if len(text) > limit:
+        return text[:limit] + "\n...[source context truncated]"
+    return text
 
 
 def collect_fail_items(paths: list[Path]) -> list[dict[str, Any]]:
@@ -196,8 +269,39 @@ def collect_csv_fail_items(csv_path: Path, *, dataset: str | None = None) -> lis
     return items
 
 
-def render_prompt(template: str, item: dict[str, Any]) -> str:
-    source_context = build_source_context(Path(item["repo_path"]), item["evidence"])
+def collect_audit_csv_items(csv_path: Path, *, audited_outcome: str | None = None) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if audited_outcome and str(row.get("audited_outcome") or "").strip().upper() != audited_outcome.upper():
+                continue
+
+            repo_name = str(row.get("repo_name") or "").strip()
+            row_dataset = str(row.get("dataset") or "").strip()
+            repo_path = Path("data") / "kaggle" / f"kaggle-{row_dataset}" / repo_name
+            repo_path = (Path.cwd() / repo_path).resolve()
+            items.append(
+                {
+                    "result_file": row.get("result_file") or str(csv_path),
+                    "row_index": row.get("row_index") or "",
+                    "property_index": row.get("property_index") or "",
+                    "dataset": row_dataset,
+                    "examples": row.get("examples") or "",
+                    "repo_name": repo_name,
+                    "repo_path": repo_path,
+                    "test_prompt": row.get("test_prompt") or "",
+                    "verdict": "FAIL",
+                    "case_score": row.get("case_score") or "",
+                    "evidence_strength": row.get("evidence_strength") or "",
+                    "reason": row.get("original_reason") or row.get("reason") or "",
+                    "evidence": row.get("original_evidence") or row.get("evidence") or "",
+                }
+            )
+    return items
+
+
+def render_prompt(template: str, item: dict[str, Any], *, context_mode: str) -> str:
+    source_context = build_source_context(Path(item["repo_path"]), item["evidence"], context_mode=context_mode)
     values = {k: "" if v is None else str(v) for k, v in item.items()}
     values["source_context"] = source_context
     rendered = template
@@ -223,8 +327,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", nargs="*", type=Path)
     parser.add_argument("--csv-input", type=Path, help="Existing fail annotation CSV to audit.")
+    parser.add_argument("--audit-input", type=Path, help="Existing audit CSV to re-audit.")
+    parser.add_argument("--audit-outcome", help="Optional audited_outcome filter when using --audit-input.")
     parser.add_argument("--dataset", help="Optional dataset filter when using --csv-input.")
-    parser.add_argument("--prompt", type=Path, default=Path("docs/fail_verdict_verifier_prompt.md"))
+    parser.add_argument("--prompt", type=Path, default=Path("docs/fail_verdict_audit_prompt.md"))
     parser.add_argument("--output", type=Path, default=Path("results/openrouter_fail_human_audit.csv"))
     parser.add_argument("--model", default="openai/gpt-4.1-mini")
     parser.add_argument("--base-url", default="https://openrouter.ai/api/v1")
@@ -236,6 +342,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--context-mode", choices=sorted(CONTEXT_LIMITS), default="expanded")
     args = parser.parse_args()
 
     api_key = os.getenv(args.api_key_env)
@@ -243,7 +350,9 @@ def main() -> None:
         raise SystemExit(f"{args.api_key_env} is not set.")
 
     template = load_prompt_template(args.prompt)
-    if args.csv_input:
+    if args.audit_input:
+        items = collect_audit_csv_items(args.audit_input, audited_outcome=args.audit_outcome)
+    elif args.csv_input:
         items = collect_csv_fail_items(args.csv_input, dataset=args.dataset)
     else:
         if not args.results:
@@ -284,7 +393,7 @@ def main() -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for idx, item in enumerate(items, start=1):
-            prompt = render_prompt(template, item)
+            prompt = render_prompt(template, item, context_mode=args.context_mode)
             if args.no_think:
                 prompt = "/no_think\n" + prompt
             extra_headers = {"X-Title": args.extra_title} if args.extra_title else None

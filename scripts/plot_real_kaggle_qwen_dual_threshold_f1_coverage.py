@@ -15,6 +15,7 @@ DATASETS = ("titanic", "diabetic", "nlp")
 EXAMPLES = (0, 10, 20)
 RESULT_DIR = Path("results")
 AUDIT_CSV = RESULT_DIR / "openrouter_fail_human_audit_sample15_gpt5mini.csv"
+REAUDIT_CSV = RESULT_DIR / "openrouter_false_fail_reaudit_full_context.csv"
 FIG_DIR = RESULT_DIR / "figures"
 
 
@@ -50,6 +51,19 @@ def load_full_items(examples: int) -> list[dict]:
 
 
 def load_audit_items(examples: int) -> list[dict]:
+    overrides: dict[tuple[str, str, str, str, str], str] = {}
+    if REAUDIT_CSV.exists():
+        with REAUDIT_CSV.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                key = (
+                    row["dataset"],
+                    row["examples"],
+                    row["repo_name"],
+                    row["row_index"],
+                    row["property_index"],
+                )
+                overrides[key] = row["audited_outcome"]
+
     out = []
     with AUDIT_CSV.open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -59,10 +73,17 @@ def load_audit_items(examples: int) -> list[dict]:
                 score = float(row["case_score"])
             except (TypeError, ValueError):
                 continue
+            override_key = (
+                row["dataset"],
+                row["examples"],
+                row["repo_name"],
+                row["row_index"],
+                row["property_index"],
+            )
             out.append(
                 {
                     "case_score": max(0.0, min(1.0, score)),
-                    "true_fail": row["audited_outcome"] == "TRUE_FAIL",
+                    "true_fail": overrides.get(override_key, row["audited_outcome"]) == "TRUE_FAIL",
                 }
             )
     return out
@@ -83,7 +104,7 @@ def curve_for_examples(examples: int) -> list[dict]:
     audit = load_audit_items(examples)
     total = len(full)
 
-    thresholds = sorted({0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99})
+    thresholds = sorted({0.51, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99})
     rows = []
     global_true_rate = sum(1 for item in audit if item["true_fail"]) / len(audit) if audit else 0.0
     for t in thresholds:
@@ -146,14 +167,13 @@ def main() -> None:
 
     ax.set_title("Real Kaggle Qwen3.6: Dual-Threshold Selective F1 vs Coverage", fontsize=17, pad=12)
     ax.set_xlabel("Coverage (accepted PASS + accepted FAIL rate)", fontsize=13)
-    ax.set_ylabel("Macro F1 (log scale)", fontsize=13)
-    ax.set_yscale("log")
+    ax.set_ylabel("Macro F1", fontsize=13)
     ax.set_ylim(0.45, 1.02)
     ax.grid(alpha=0.25)
     ax.legend(loc="lower right", frameon=True)
 
     fig.tight_layout()
-    out = FIG_DIR / "real_kaggle_qwen36_dual_threshold_f1_vs_coverage_log_y.png"
+    out = FIG_DIR / "real_kaggle_qwen36_dual_threshold_f1_vs_coverage_corrected.png"
     fig.savefig(out, dpi=180)
     print(out.resolve())
 
