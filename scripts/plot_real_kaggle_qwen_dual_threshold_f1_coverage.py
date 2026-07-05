@@ -15,7 +15,6 @@ DATASETS = ("titanic", "diabetic", "nlp")
 EXAMPLES = (0, 10, 20)
 RESULT_DIR = Path("results")
 AUDIT_CSV = RESULT_DIR / "openrouter_fail_human_audit_sample15_gpt5mini.csv"
-REAUDIT_CSV = RESULT_DIR / "openrouter_false_fail_reaudit_full_context.csv"
 FIG_DIR = RESULT_DIR / "figures"
 
 
@@ -51,19 +50,6 @@ def load_full_items(examples: int) -> list[dict]:
 
 
 def load_audit_items(examples: int) -> list[dict]:
-    overrides: dict[tuple[str, str, str, str, str], str] = {}
-    if REAUDIT_CSV.exists():
-        with REAUDIT_CSV.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                key = (
-                    row["dataset"],
-                    row["examples"],
-                    row["repo_name"],
-                    row["row_index"],
-                    row["property_index"],
-                )
-                overrides[key] = row["audited_outcome"]
-
     out = []
     with AUDIT_CSV.open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -73,17 +59,10 @@ def load_audit_items(examples: int) -> list[dict]:
                 score = float(row["case_score"])
             except (TypeError, ValueError):
                 continue
-            override_key = (
-                row["dataset"],
-                row["examples"],
-                row["repo_name"],
-                row["row_index"],
-                row["property_index"],
-            )
             out.append(
                 {
                     "case_score": max(0.0, min(1.0, score)),
-                    "true_fail": overrides.get(override_key, row["audited_outcome"]) == "TRUE_FAIL",
+                    "true_fail": row["audited_outcome"] == "TRUE_FAIL",
                 }
             )
     return out
@@ -165,7 +144,7 @@ def main() -> None:
             f"audit_n_at_threshold={best['audit_n']} true_rate={best['true_rate']:.3f}"
         )
 
-    ax.set_title("Real Kaggle Qwen3.6: Dual-Threshold Selective F1 vs Coverage", fontsize=17, pad=12)
+    ax.set_title("Real Kaggle Qwen3.6: Conservative Dual-Threshold F1 vs Coverage", fontsize=17, pad=12)
     ax.set_xlabel("Coverage (accepted PASS + accepted FAIL rate)", fontsize=13)
     ax.set_ylabel("Macro F1", fontsize=13)
     ax.set_ylim(0.45, 1.02)
@@ -173,7 +152,7 @@ def main() -> None:
     ax.legend(loc="lower right", frameon=True)
 
     fig.tight_layout()
-    out = FIG_DIR / "real_kaggle_qwen36_dual_threshold_f1_vs_coverage_corrected.png"
+    out = FIG_DIR / "real_kaggle_qwen36_conservative_dual_threshold_f1_vs_coverage.png"
     fig.savefig(out, dpi=180)
     print(out.resolve())
 

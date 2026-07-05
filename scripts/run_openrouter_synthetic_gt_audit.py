@@ -1,4 +1,4 @@
-"""Audit synthetic Kaggle ground-truth labels for sampled high-confidence errors."""
+"""Audit synthetic Kaggle ground-truth labels for sampled high-confidence predictions."""
 
 from __future__ import annotations
 
@@ -110,6 +110,7 @@ def render_prompt(template: str, row: dict[str, str], source_context: str) -> st
         "ground_truth_violation_description": row.get("ground_truth_violation_description", ""),
         "prediction": row.get("prediction", ""),
         "error_type": row.get("error_type", ""),
+        "qwen_correctness": row.get("qwen_correctness", ""),
         "case_score": row.get("case_score", ""),
         "reason": row.get("reason", ""),
         "evidence": row.get("evidence", ""),
@@ -123,9 +124,16 @@ def render_prompt(template: str, row: dict[str, str], source_context: str) -> st
 
 def stratified_sample(rows: list[dict[str, str]], *, fraction: float, seed: int) -> list[dict[str, str]]:
     rng = random.Random(seed)
-    groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
-        groups[(row.get("examples", ""), row.get("dataset", ""), row.get("error_type", ""))].append(row)
+        groups[
+            (
+                row.get("examples", ""),
+                row.get("dataset", ""),
+                row.get("qwen_correctness", ""),
+                row.get("error_type", ""),
+            )
+        ].append(row)
 
     selected: list[dict[str, str]] = []
     for key in sorted(groups):
@@ -133,14 +141,23 @@ def stratified_sample(rows: list[dict[str, str]], *, fraction: float, seed: int)
         rng.shuffle(group)
         n = max(1, round(len(group) * fraction))
         selected.extend(group[:n])
-    selected.sort(key=lambda row: (int(row.get("examples") or 0), row.get("dataset", ""), row.get("error_type", ""), int(row.get("row_index") or 0), int(row.get("property_index") or 0)))
+    selected.sort(
+        key=lambda row: (
+            int(row.get("examples") or 0),
+            row.get("dataset", ""),
+            row.get("qwen_correctness", ""),
+            row.get("error_type", ""),
+            int(row.get("row_index") or 0),
+            int(row.get("property_index") or 0),
+        )
+    )
     return selected
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=Path("results/synthetic/synthetic_qwen_high_confidence_errors_for_audit.csv"))
-    parser.add_argument("--output", type=Path, default=Path("results/synthetic/openrouter_synthetic_gt_audit_15pct.csv"))
+    parser.add_argument("--input", type=Path, default=Path("results/synthetic/synthetic_qwen_accepted_predictions_for_audit.csv"))
+    parser.add_argument("--output", type=Path, default=Path("results/synthetic/openrouter_synthetic_gt_audit_accepted_15pct.csv"))
     parser.add_argument("--prompt", type=Path, default=Path("docs/synthetic_ground_truth_audit_prompt.md"))
     parser.add_argument("--sample-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
@@ -172,7 +189,7 @@ def main() -> None:
         "audited_outcome",
         "confidence",
         "ground_truth_assessment",
-        "qwen_error_assessment",
+        "qwen_prediction_assessment",
         "source_evidence_check",
         "correct_label",
         "correct_verdict",
@@ -211,7 +228,7 @@ def main() -> None:
                     "audited_outcome": "PARSE_ERROR",
                     "confidence": "",
                     "ground_truth_assessment": f"Failed to parse verifier response: {exc}",
-                    "qwen_error_assessment": "",
+                    "qwen_prediction_assessment": "",
                     "source_evidence_check": "",
                     "correct_label": "",
                     "correct_verdict": "",
@@ -228,7 +245,8 @@ def main() -> None:
             )
             print(
                 f"[{idx}/{len(sampled)}] ex{row.get('examples')} {row.get('dataset')} "
-                f"{row.get('repo_name')} {row.get('property_id')} {row.get('error_type')} "
+                f"{row.get('repo_name')} {row.get('property_id')} "
+                f"{row.get('qwen_correctness')} {row.get('error_type')} "
                 f"-> {audit.get('audited_outcome')}",
                 flush=True,
             )

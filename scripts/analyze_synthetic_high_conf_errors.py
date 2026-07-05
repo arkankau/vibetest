@@ -85,6 +85,7 @@ def load_errors() -> list[dict[str, Any]]:
                                 "property_id": prop_id,
                                 "ground_truth_label": label,
                                 "prediction": pred,
+                                "qwen_correctness": "wrong",
                                 "error_type": "FP" if pred == 1 else "FN",
                                 "case_score": score,
                                 "property": compact(

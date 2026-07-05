@@ -35,6 +35,7 @@ from vibetest.agent import (
     ClaudeCodeVibeTestAgent,
     CodexReviewAgent,
     CodexVibeTestAgent,
+    DirectPropertyAgent,
     EvidenceVerifierAgent,
 )
 from vibetest.baselines import (
@@ -914,6 +915,71 @@ def _run_vibetest(cases: list[SyntheticCase], args: argparse.Namespace) -> list[
                 tests,
                 usage=aggregate_usage_from_results(case_results),
                 method="AT",
+                method_model=agent.model_name,
+            )
+        )
+    return entries
+
+
+def _run_direct_property_agent(cases: list[SyntheticCase], args: argparse.Namespace) -> list[dict[str, Any]]:
+    print("=" * 80)
+    print("Running synthetic experiment with direct property agent baseline")
+    print("=" * 80)
+
+    all_test_cases: list[TestCase] = []
+    case_ranges: list[tuple[int, int]] = []
+
+    for case in cases:
+        start = len(all_test_cases)
+        prop_offset = max(0, int(getattr(args, "property_offset", 0) or 0))
+        prop_limit = max(0, int(getattr(args, "property_limit", 0) or 0))
+        selected_props = list(enumerate(case.properties))[prop_offset:]
+        if prop_limit:
+            selected_props = selected_props[:prop_limit]
+        for idx, prop in selected_props:
+            all_test_cases.append(
+                TestCase(
+                    name=_synthetic_property_sample_id(case, prop),
+                    description=prop.property_text,
+                    repo_path=case.repo_path,
+                    sandbox_path=_synthetic_sandbox_path(case),
+                    additional_data=_synthetic_additional_data(case),
+                    metadata={
+                        "property_id": prop.property_id,
+                        "property_index": idx,
+                        "source_sample_id": _synthetic_property_sample_id(case, prop),
+                    },
+                )
+            )
+        case_ranges.append((start, len(all_test_cases)))
+
+    agent = DirectPropertyAgent(
+        model=args.model or "openai/gpt-5-mini",
+        max_attempts=args.baseline_max_attempts,
+        static=not args.baseline_dynamic,
+        max_sandboxes=args.baseline_max_sandboxes,
+    )
+    all_results = agent.execute_tests(all_test_cases, sandbox=args.sandbox)
+
+    entries: list[dict[str, Any]] = []
+    for case, (start, end) in zip(cases, case_ranges):
+        case_results = all_results[start:end]
+        prop_offset = max(0, int(getattr(args, "property_offset", 0) or 0))
+        prop_limit = max(0, int(getattr(args, "property_limit", 0) or 0))
+        selected_props = case.properties[prop_offset:]
+        if prop_limit:
+            selected_props = selected_props[:prop_limit]
+        tests = [
+            _serialize_test_result(r, prop, idx)
+            for r, (idx, prop) in zip(case_results, enumerate(case.properties[prop_offset:], start=prop_offset))
+            if not prop_limit or idx < prop_offset + prop_limit
+        ]
+        entries.append(
+            _entry_from_tests(
+                case,
+                tests,
+                usage=aggregate_usage_from_results(case_results),
+                method="direct-property-agent",
                 method_model=agent.model_name,
             )
         )
@@ -2057,6 +2123,7 @@ def _infer_output_path(
         "vibetest-claude": "AT-claude",
         "codex": "codex",
         "baseline-reviewer": "baseline-reviewer",
+        "direct-property-agent": "direct-property-agent",
         "traincheck": "traincheck",
         "codeql": "codeql",
         "refchecker": "refchecker",
@@ -2121,6 +2188,9 @@ def _run(args: argparse.Namespace) -> None:
         method_model = args.model or "openai/gpt-5-mini"
     elif args.method == "baseline-reviewer":
         entries = _run_baseline_reviewer(cases, args)
+        method_model = args.model or "openai/gpt-5-mini"
+    elif args.method == "direct-property-agent":
+        entries = _run_direct_property_agent(cases, args)
         method_model = args.model or "openai/gpt-5-mini"
     elif args.method == "traincheck":
         entries = _run_traincheck(cases, args)
@@ -2207,6 +2277,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "codex-vibetest",
             "codex",
             "baseline-reviewer",
+            "direct-property-agent",
             "traincheck",
             "codeql",
             "refchecker",
@@ -2228,9 +2299,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--datasets", nargs="+", default=[], help="Optional dataset filters (e.g., kaggle_titanic).")
     parser.add_argument("--repo-limit", type=int, default=0, help="Optional max repositories to run.")
     parser.add_argument("--repo-offset", type=int, default=0, help="Optional repositories to skip before running.")
+    parser.add_argument("--property-limit", type=int, default=0, help="Optional max properties per repository for smoke tests.")
+    parser.add_argument("--property-offset", type=int, default=0, help="Optional properties to skip per repository before running.")
     parser.add_argument("--sandbox", type=str, default="docker", help="Inspect sandbox backend.")
 
-    parser.add_argument("--model", type=str, help="Model for vibetest/codex/baseline-reviewer methods.")
+    parser.add_argument("--model", type=str, help="Model for vibetest/codex/baseline-reviewer/direct-property-agent methods.")
     parser.add_argument("--dynamic", action="store_true", help="Use dynamic VibeTest agent mode.")
     parser.add_argument(
         "--correct-fail-examples",
@@ -2294,7 +2367,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--baseline-max-attempts",
         type=int,
         default=20,
-        help="Maximum ReAct attempts for --method baseline-reviewer.",
+        help="Maximum ReAct attempts for --method baseline-reviewer/direct-property-agent.",
     )
     parser.add_argument(
         "--baseline-static",
@@ -2305,7 +2378,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--baseline-dynamic",
         action="store_true",
         help=(
-            "Allow --method baseline-reviewer to run code/tests. By default the reviewer is static-only "
+            "Allow --method baseline-reviewer/direct-property-agent to run code/tests. By default these baselines are static-only "
             "and is told not to run repository code, notebooks, tests, training scripts, or user code."
         ),
     )
@@ -2313,7 +2386,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--baseline-max-sandboxes",
         type=int,
         default=10,
-        help="Maximum concurrent Inspect sandboxes for --method baseline-reviewer.",
+        help="Maximum concurrent Inspect sandboxes for --method baseline-reviewer/direct-property-agent.",
     )
     parser.add_argument(
         "--baseline-compute-mode",

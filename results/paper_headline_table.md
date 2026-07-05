@@ -1,0 +1,16 @@
+# Paper Headline Table
+
+Headline metrics use conservative labels. Full-context real Kaggle reaudit is excluded from the main table and reported only as sensitivity analysis.
+
+| Benchmark | Method | Examples | Tests | Coverage | Macro F1 | Audit basis | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Synthetic Kaggle | VibeTest static | 0 | 1125 | 0.773 | 0.802 | Raw synthetic ground truth | raw synthetic GT |
+| Synthetic Kaggle | VibeTest static | 10 | 1125 | 0.903 | 0.813 | Raw synthetic ground truth | raw synthetic GT |
+| Synthetic Kaggle | VibeTest static | 20 | 1125 | 0.798 | 0.837 | Raw synthetic ground truth | raw synthetic GT |
+| Synthetic Kaggle | Reviewer Mode 0 |  | 1125 | 0.264 | 0.669 | Raw synthetic ground truth | INCONCLUSIVE treated as PASS for baseline |
+| Synthetic Kaggle | Reviewer Mode 1 |  | 1125 | 0.321 | 0.722 | Raw synthetic ground truth | INCONCLUSIVE treated as PASS for baseline |
+| Synthetic Kaggle | Reviewer Mode 2 |  | 1125 | 0.308 | 0.711 | Raw synthetic ground truth | INCONCLUSIVE treated as PASS for baseline |
+| Synthetic Kaggle | TrainCheck |  | 1125 | 0.000 |  | Raw synthetic ground truth | all inconclusive in canonical files |
+| Real Kaggle | VibeTest static | 0 | 1920 | 0.822 | 0.931 | Conservative 15% fail audit | Full-context reaudit is sensitivity only |
+| Real Kaggle | VibeTest static | 10 | 1920 | 0.869 | 0.933 | Conservative 15% fail audit | Full-context reaudit is sensitivity only |
+| Real Kaggle | VibeTest static | 20 | 1920 | 0.871 | 0.938 | Conservative 15% fail audit | Full-context reaudit is sensitivity only |

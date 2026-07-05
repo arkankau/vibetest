@@ -10,7 +10,11 @@ from inspect_ai.scorer import includes
 from inspect_ai.tool import Tool, bash_session, python, text_editor
 
 from vibetest.testcases.base import TestCase, TestResult
-from vibetest.agent.react_agent import create_files_archive, cleanup_archive_temps
+from vibetest.agent.react_agent import (
+    _parse_submission_output,
+    cleanup_archive_temps,
+    create_files_archive,
+)
 from vibetest.usage import usage_payload_from_sample
 
 
@@ -58,6 +62,18 @@ class BaselineAgent:
         self.reviewer_reprompts = max(0, reviewer_reprompts)
         self.findings_json = findings_json
         self.tools = self._setup_tools(additional_tools)
+
+    def _model_extra_body(self) -> dict | None:
+        model_name = (self.model_name or "").lower()
+        if "qwen" in model_name:
+            return {"chat_template_kwargs": {"enable_thinking": False}}
+        return None
+
+    def _model_prompt_prefix(self) -> str:
+        model_name = (self.model_name or "").lower()
+        if "qwen" in model_name:
+            return "/no_think\n"
+        return ""
 
     def _setup_tools(self, additional_tools: list[Tool] | None = None) -> list[Tool]:
         """Setup tools available to the agent.
@@ -210,6 +226,7 @@ Repository: {repo_root}{context_block}"""
             results = eval(
                 tasks=task,
                 model=self.model_name,
+                extra_body=self._model_extra_body(),
                 log_dir="./logs",
                 retry_on_error=2,
                 fail_on_error=False,
@@ -306,5 +323,128 @@ Repository: {repo_root}{context_block}"""
                         "test_description": test_case.description
                     },
                 ))
+
+        return test_results
+
+
+class DirectPropertyAgent(BaselineAgent):
+    """Per-property tool-using baseline with no VibeTest calibration examples."""
+
+    def _create_solver(self):
+        analysis_instruction = (
+            "Use static inspection only. Do not run repository code, notebooks, tests, training scripts, or user code. "
+            "You may use shell/text tools only to list, search, and read files."
+            if self.static
+            else "Carefully analyze the repository with the available tools. You may run focused commands when useful."
+        )
+        instructions = f"""You are a direct property-testing agent. Evaluate exactly one natural-language property for one repository.
+
+{analysis_instruction}
+
+Return FAIL only when you find concrete repository evidence that the property is violated. Return PASS when the inspected repository satisfies the property, or when the property is conditional and the triggering condition is absent with no violation evidence. For example, if a property says "if there is model selection or hyperparameter tuning" and you find no model selection or hyperparameter tuning, that condition is not a reason for INCONCLUSIVE. Return INCONCLUSIVE only when the relevant repository code/data is missing, too weak, ambiguous, or not inspectable enough to judge the property.
+
+Evaluate only the current property. Repositories may violate nearby or related properties, but do not return FAIL unless the evidence directly violates the property above. If you find a bug that is better described by a different property, mention it only if it also directly violates the current property.
+
+case_score is a float between 0.0 and 1.0 representing your confidence that the repository violates the property. Higher means more confident the repository violates the property; lower means more confident the repository satisfies the property. If completely confident the verdict is PASS, use 0.0 to 0.2. Use 0.2 to 0.5 if it seems like PASS but the evidence is incomplete, so the verdict is probably INCONCLUSIVE. Use 0.5 to 0.8 if it seems like FAIL but the evidence is incomplete, so the verdict is probably INCONCLUSIVE. If sure the verdict is FAIL, use 0.8 to 1.0.
+
+When finished, call submit() with exactly this format:
+
+VERDICT: [PASS/FAIL/INCONCLUSIVE]
+CASE_SCORE: [0.00-1.00]
+EVIDENCE_STRENGTH: [0.00-1.00]
+REASON: [One to three concise sentences.]
+EVIDENCE: [Concrete file/function/cell/line references or commands inspected.]"""
+
+        return react(
+            prompt=instructions,
+            tools=self.tools,
+            attempts=self.max_attempts,
+            submit=True,
+        )
+
+    def _create_prompt(self, test_case: TestCase) -> str:
+        repo_root = f"{test_case.sandbox_path.rstrip('/')}/repo"
+        return self._model_prompt_prefix() + f"""Repository: {repo_root}
+
+Property to evaluate:
+{test_case.description.strip()}
+
+Inspect the repository and decide whether this one property is satisfied. Start by inspecting the exact repository path above, for example with `ls -la {repo_root}`; do not infer repository contents from the shell's current working directory."""
+
+    def _parse_results(self, results, id_to_test_case: dict[str, TestCase]) -> list[TestResult]:
+        sample_id_to_result = {}
+
+        if results and len(results) > 0:
+            eval_result = results[0]
+            if eval_result.samples:
+                for sample in eval_result.samples:
+                    sample_id = sample.id
+                    if sample_id not in id_to_test_case:
+                        continue
+
+                    test_case = id_to_test_case[sample_id]
+                    output = ""
+                    if sample.output and sample.output.completion:
+                        output = sample.output.completion
+                    if sample.messages:
+                        for msg in reversed(sample.messages):
+                            if hasattr(msg, "text") and msg.text:
+                                output = msg.text
+                                break
+
+                    verdict, case_score, evidence_strength, reason_text, evidence_text = (
+                        _parse_submission_output(output)
+                    )
+                    if not verdict:
+                        verdict = "INCONCLUSIVE"
+
+                    execution_log = ""
+                    if sample.messages:
+                        log_parts = []
+                        for msg in sample.messages:
+                            role = getattr(msg, "role", "unknown")
+                            content = getattr(msg, "text", "") or getattr(msg, "content", "")
+                            if content:
+                                log_parts.append(f"[{role}] {content[:200]}...")
+                        execution_log = "\n".join(log_parts)
+
+                    sample_id_to_result[sample_id] = TestResult(
+                        test_case=test_case,
+                        passed=verdict == "PASS",
+                        message=output,
+                        execution_log=execution_log,
+                        metadata={
+                            "model": self.model_name,
+                            "test_description": test_case.description,
+                            "verdict": verdict,
+                            "case_score": case_score,
+                            "fail_support_score": case_score,
+                            "evidence_strength": evidence_strength,
+                            "reason_text": reason_text,
+                            "evidence_text": evidence_text,
+                            "score": sample.score.value if sample.score else None,
+                            "total_time": getattr(sample, "total_time", None),
+                            "working_time": getattr(sample, "working_time", None),
+                            **usage_payload_from_sample(sample),
+                        },
+                    )
+
+        test_results = []
+        for sample_id, test_case in id_to_test_case.items():
+            if sample_id in sample_id_to_result:
+                test_results.append(sample_id_to_result[sample_id])
+            else:
+                test_results.append(
+                    TestResult(
+                        test_case=test_case,
+                        passed=False,
+                        message="Failed to execute test or parse results",
+                        metadata={
+                            "error": "Execution or parsing failure",
+                            "verdict": "INCONCLUSIVE",
+                            "test_description": test_case.description,
+                        },
+                    )
+                )
 
         return test_results
