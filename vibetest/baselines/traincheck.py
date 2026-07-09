@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import json
 import tempfile
 from pathlib import Path
@@ -1065,6 +1066,14 @@ def _run_cmd(
     )
 
 
+def _traincheck_module_cmd(module: str) -> list[str]:
+    return [sys.executable, "-m", module]
+
+
+def _traincheck_path(path: Path) -> str:
+    return str(path).replace("\\", "/")
+
+
 def _extract_violations(data: Any) -> list[str]:
     if isinstance(data, dict):
         for key in ("violations", "failed", "failures", "errors", "issues", "anomalies"):
@@ -1325,18 +1334,19 @@ def run_traincheck(
             "PYTHONIOENCODING": "UTF-8",
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
+            "KAGGLE_KERNEL_RUN_TYPE": "Interactive",
         }
     )
     if max_iters is not None and max_iters > 0:
         base_env["TRAINCHECK_MAX_ITERS"] = str(max_iters)
 
     collect_cmd = [
-        "traincheck-collect",
+        *_traincheck_module_cmd("traincheck.collect_trace"),
         "--pyscript",
-        str(script),
+        _traincheck_path(script),
         "--copy-all-files",
         "--output-dir",
-        str(trace_dir),
+        _traincheck_path(trace_dir),
     ]
     if model_var:
         collect_cmd.extend(["--models-to-track", model_var])
@@ -1393,7 +1403,13 @@ def run_traincheck(
         else (trace_dir / "invariants.json")
     )
     if not invariants_path:
-        infer_cmd = ["traincheck-infer", "-f", str(trace_dir), "-o", str(invariants)]
+        infer_cmd = [
+            *_traincheck_module_cmd("traincheck.infer_engine"),
+            "-f",
+            _traincheck_path(trace_dir),
+            "-o",
+            _traincheck_path(invariants),
+        ]
         if infer_relations:
             infer_cmd.extend(["--enable-relation", *infer_relations])
         try:
@@ -1445,11 +1461,11 @@ def run_traincheck(
             "script": str(script) if script else None,
         }
     check_cmd = [
-        "traincheck-check",
+        *_traincheck_module_cmd("traincheck.checker"),
         "--trace-folders",
-        str(trace_dir),
+        _traincheck_path(trace_dir),
         "--invariants",
-        str(invariants),
+        _traincheck_path(invariants),
     ]
     try:
         check = _run_cmd(check_cmd, cwd=trace_dir, timeout_s=timeout_s, env=base_env)
@@ -1544,21 +1560,12 @@ def prepare_reference_invariants(
     script_text = _move_future_imports_to_top(script_text)
     patched_script.write_text(script_text, encoding="utf-8")
 
-    # Create a shell script to pass safe runtime args (disable GPU)
-    sh_script = ref_dir / "run_reference.sh"
-    sh_script.write_text(
-        f"python {patched_script.name} --no-cuda --no-mps\n",
-        encoding="utf-8",
-    )
-
     collect_cmd = [
-        "traincheck-collect",
+        *_traincheck_module_cmd("traincheck.collect_trace"),
         "--pyscript",
-        str(patched_script),
-        "--shscript",
-        str(sh_script),
+        _traincheck_path(patched_script),
         "--output-dir",
-        str(trace_dir),
+        _traincheck_path(trace_dir),
     ]
     env = os.environ.copy()
     env.update(
@@ -1576,7 +1583,13 @@ def prepare_reference_invariants(
             f"{collect.stdout}\n{collect.stderr}"
         )
 
-    infer_cmd = ["traincheck-infer", "-f", str(trace_dir), "-o", str(invariants)]
+    infer_cmd = [
+        *_traincheck_module_cmd("traincheck.infer_engine"),
+        "-f",
+        _traincheck_path(trace_dir),
+        "-o",
+        _traincheck_path(invariants),
+    ]
     if infer_relations:
         infer_cmd.extend(["--enable-relation", *infer_relations])
     infer = _run_cmd(infer_cmd, cwd=trace_dir, timeout_s=timeout_s, env=env)

@@ -1,0 +1,463 @@
+%%%%%%%%%%%%%%%%%%%% VIBETEST QWEN KAGGLE -- EMNLP 2026 %%%%%%%%%%%%%%%%%%%%%
+%
+% Draft created from the current Qwen3.6 Kaggle benchmark package.
+% Compile from paper/ with:
+%   pdflatex vibetest_qwen_kaggle_emnlp2026
+%   bibtex vibetest_qwen_kaggle_emnlp2026
+%   pdflatex vibetest_qwen_kaggle_emnlp2026
+%   pdflatex vibetest_qwen_kaggle_emnlp2026
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\definecolor{darkblue}{rgb}{0, 0, 0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+\newcommand{\TODO}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\pass}{\textsc{pass}}
+\newcommand{\fail}{\textsc{fail}}
+\newcommand{\inconclusive}{\textsc{inconclusive}}
+\newcommand{\vibetest}{\textsc{VibeTest}}
+\newcommand{\qwen}{Qwen3.6}
+
+\title{\vibetest: Evidence-Backed Agentic Testing\\for Natural-Language ML Pipeline Properties}
+
+\author{Anonymous ACL submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Machine learning pipeline correctness is difficult to validate at repository scale because many important requirements are stated only in natural language: avoid train-test leakage, evaluate on the correct split, apply augmentation only to training data, and report metrics according to their claimed definitions.
+We study whether an LLM agent can test such properties directly from repository context, and what happens when the same natural-language property is operationalized differently by a benchmark label, a model, and an evidence-based verifier.
+We introduce \vibetest, an agentic testing framework that evaluates a repository against a natural-language property and returns a \pass, \fail, or \inconclusive{} verdict with supporting evidence and a continuous confidence score.
+We evaluate \vibetest{} with \qwen{} on synthetic and real Kaggle-style ML pipelines.
+On a synthetic Kaggle benchmark of 1,125 repository-property cases, \vibetest{} reaches best macro F1 of 0.802--0.837 across prompt-example settings, outperforming reviewer-style baselines.
+A cost-controlled matched-subset probe shows that direct-property prompting and generic Codex review have weaker failure recall than \vibetest{} with prompt examples.
+On 1,920 real Kaggle repository-property cases, a conservative sampled fail audit estimates macro F1 around 0.93 across prompt-example settings.
+A targeted audit of synthetic disagreements shows that raw synthetic F1 is useful but pessimistic: among 53 usable sampled disagreements, 29 are real model misses and 24 are property-operationalization mismatches between the synthetic label and the evidence standard used by \vibetest.
+These results suggest that agentic testing is a promising way to evaluate ML repositories against informal intent, but also that evaluation must distinguish model errors from ambiguity in how natural-language properties are converted into concrete pass/fail judgments.
+\end{abstract}
+
+\section{Introduction}
+
+The correctness of repository-scale software systems remains challenging to test even as AI coding agents make such systems easier to create.
+Checking correctness requires validating that developer intent is reflected in code, but this intent is often stated only informally in natural language~\citep{zeller2009why}.
+For machine learning pipelines, the gap is especially visible.
+A practitioner may ask that a notebook avoid train-test leakage, that augmentation be restricted to training data, that evaluation use a held-out split, or that a reported metric match its stated definition.
+These requirements are easy to state, but difficult for automated systems to test because they require interpreting informal language, locating relevant repository context, and producing evidence that another person can verify.
+
+At the same time, software engineering is being reshaped by highly capable AI agents~\citep{metr2025longtasks}.
+Benchmarks such as SWE-bench evaluate repository-scale issue resolution~\citep{jimenez2024swebench,swebench-verified}, and recent systems show that agentic workflows are increasingly effective at repository-level software tasks~\citep{xia2024agentless,guo2025repoaudit}.
+Commercial coding agents also support code review and repository-level development workflows~\citep{openai_codex}, making it important to evaluate whether their reported failures are grounded in checkable evidence.
+
+Existing approaches to software correctness provide complementary but incomplete coverage.
+Static analysis can provide strong guarantees relative to a formal semantics, but it requires explicit formal specifications and often must trade completeness for tractability~\citep{cousot1979systematic,nielson1999principles}.
+Query systems such as CodeQL are powerful when a property can be formalized, but the burden of formalization remains~\citep{codeql}.
+Domain-specific ML debugging tools surface important classes of pipeline errors, but depend on hand-designed checks or workflow assumptions~\citep{schoop2021umlaut,traincheck,kang2020assertions,naik2024torchql}.
+Together, these methods leave a gap for evaluating high-level intent without preexisting formal specifications.
+
+We study this gap as a natural-language problem.
+How can a system translate an informal property into an actionable repository-level audit, and how should we evaluate the answer when the property itself admits multiple operationalizations?
+Recent LLM agents create a new opportunity: using agents as property-directed testers for high-level repository intent.
+However, this setting also creates a central risk.
+A reported failure is useful only if the cited evidence actually shows a violation.
+If a notebook does not contain a randomized-label sanity check, that absence may mean the property is unverifiable, not that the model would fail the check.
+Thus, agentic testing needs both verdicts and evidence discipline.
+
+There is a second, subtler issue.
+Natural-language properties are not self-executing labels.
+The same sentence can be operationalized differently by the system that injects a synthetic bug, the benchmark label derived from that injection, the testing agent interpreting the repository, and the verifier auditing the evidence.
+For example, ``no frozen layers unless explicitly intended'' requires deciding what counts as explicit intent; ``avoid Python loops when matrix operations apply'' requires deciding whether file-path loops count; and ``the model should beat a baseline'' requires deciding whether absence of a baseline experiment is a failure or an inconclusive case.
+These disagreements are not merely annotation noise.
+They are a core evaluation challenge for natural-language repository testing.
+
+We study this problem through \vibetest, an agentic testing framework for ML repositories.
+Given a repository and a natural-language property, \vibetest{} inspects the code, gathers evidence, and returns one of three verdicts: \pass, \fail, or \inconclusive.
+It also emits a continuous \texttt{case\_score}, where low scores indicate confidence that the property is satisfied and high scores indicate confidence that the property is violated.
+This score lets us evaluate selective behavior by trading off coverage against macro F1.
+
+We evaluate \vibetest{} on two Kaggle-style settings.
+First, we use a synthetic benchmark with 75 notebooks across tabular, text, and image tasks, producing 1,125 labeled repository-property cases.
+Second, we evaluate 121 real Kaggle notebooks across Titanic, Disaster Tweets, and Diabetic Retinopathy, producing 1,920 repository-property cases.
+Because real Kaggle has no complete ground truth, we use a conservative sampled audit of predicted failures and report the full-context reaudit only as sensitivity analysis.
+
+Concretely, we ask three questions.
+\textbf{RQ1:} Can an agentic tester classify repository-property cases more accurately than reviewer-style and direct-property prompting baselines?
+\textbf{RQ2:} How reliable are the model's continuous scores for selective prediction?
+\textbf{RQ3:} When the model and synthetic label disagree, how often is the disagreement a model error versus a mismatch in how the natural-language property was operationalized?
+
+Our current results support four claims.
+First, \vibetest{} with \qwen{} outperforms reviewer-style baselines on synthetic Kaggle, and a sampled direct-property baseline suggests that simply giving an agent the repository and property is not enough to recover the same failure recall.
+Second, conservative real Kaggle audit results are strong, around 0.93 macro F1 across prompt-example settings.
+Third, the synthetic benchmark is useful but pessimistic: a sampled disagreement audit finds a near-even mix of real \qwen{} misses and property-operationalization mismatches.
+Fourth, these mismatches are empirically meaningful rather than incidental; they reveal where the injected intent, benchmark label, model verdict, and verifier standard disagree about what the natural-language property requires.
+
+Our contributions are:
+\begin{itemize}
+  \item We formulate agentic testing for ML pipelines as repository-level evaluation against natural-language properties with \pass/\fail/\inconclusive{} verdicts and evidence.
+  \item We evaluate \vibetest{} with \qwen{} on synthetic and real Kaggle benchmarks across prompt-example settings.
+  \item We identify and quantify property-operationalization mismatch as a major source of synthetic disagreement: 24 of 53 usable high-confidence disagreements are cases where the synthetic label and evidence-based interpretation diverge.
+  \item We provide a conservative real Kaggle audit and a full-context sensitivity analysis, showing why strong real results should still be reported carefully.
+\end{itemize}
+
+\section{Agentic Testing for ML Pipelines}
+\label{sec:method}
+
+We define a repository-property case as a pair $(R,p)$, where $R$ is a code repository and $p$ is a natural-language property about expected behavior.
+Examples include ``reported metrics use the correct split and exact definitions'' and ``data augmentation is only performed on the training dataset.''
+For each pair, \vibetest{} returns a verdict $y \in \{\pass,\fail,\inconclusive\}$ and an evidence report.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{agentic_testing_evidence_verification.png}
+  \caption{Overview of agentic testing with evidence verification. A natural-language property and repository enter the testing agent, which analyzes the repository, gathers evidence, and returns a \pass/\fail/\inconclusive{} verdict with a score. Evidence-aware audits then check whether reported failures are actually supported by the cited evidence.}
+  \label{fig:workflow}
+\end{figure}
+
+\paragraph{Workflow.}
+The testing agent first builds a high-level model of the repository to situate the property.
+It identifies key files, entry points, and artifacts such as notebooks, scripts, datasets, configuration files, split-construction code, transforms, training loops, and metric calls.
+It then gathers evidence by reading code and, when available, using execution or artifacts to validate behavior.
+Finally, it produces a verdict and cites the evidence needed for an independent auditor to reconstruct the decision.
+The workflow is summarized in \Cref{fig:workflow}.
+
+\paragraph{Verdicts.}
+\pass{} means the repository appears to satisfy the property with supporting evidence.
+\fail{} means the repository appears to violate the property with supporting evidence.
+\inconclusive{} means the repository does not provide enough evidence to confidently decide either way.
+This third class is important: many ML properties require a concrete experiment or code path, and missing evidence should not automatically become a failure.
+
+\paragraph{Scores.}
+Each case also receives a \texttt{case\_score} from 0.0 to 1.0.
+Lower values indicate stronger confidence that the repository satisfies the property, while higher values indicate stronger confidence that it violates the property.
+Scores near the middle represent lower confidence and can be abstained during selective evaluation.
+
+\paragraph{Prompt example conditions.}
+We compare three static-prompt settings.
+The \textbf{ex0} setting includes no representative examples.
+The \textbf{ex10} setting includes 10 representative failure examples.
+The \textbf{ex20} setting includes 20 representative failure examples.
+This comparison tests whether concrete examples help the model distinguish real property violations from weak or missing evidence.
+
+\paragraph{Selective evaluation.}
+Coverage is the fraction of repository-property cases receiving a non-\inconclusive{} decision.
+Macro F1 is computed over covered examples.
+For thresholded plots, \texttt{case\_score} is used to select confident predictions.
+We also consider dual-threshold analysis in which low scores predict \pass, high scores predict \fail, and middle scores abstain.
+
+\section{Benchmarks}
+\label{sec:benchmarks}
+
+\paragraph{Synthetic Kaggle.}
+The synthetic benchmark contains 75 Kaggle-style notebooks: 25 Titanic, 25 Disaster Tweets, and 25 Diabetic Retinopathy notebooks.
+Each notebook is evaluated against 15 ML-pipeline properties, yielding 1,125 repository-property cases.
+The benchmark provides labels from controlled bug injection, making it possible to compute macro F1 and coverage.
+
+\paragraph{Real Kaggle.}
+The real benchmark contains 121 public Kaggle notebooks: 50 Titanic, 50 Disaster Tweets, and 21 Diabetic Retinopathy notebooks~\citep{kaggle_titanic,kaggle_disaster_tweets,kaggle_diabetic_retinopathy}.
+Each notebook is evaluated against up to 16 properties, yielding 1,920 repository-property cases.
+Because real Kaggle does not have complete ground truth, we audit predicted failures.
+The headline real Kaggle results use a conservative 15\% sampled fail audit.
+A separate full-context reaudit of conservative false failures is reported only as sensitivity analysis.
+
+\paragraph{Baselines.}
+We compare against reviewer-style baselines on synthetic Kaggle.
+These baselines use a less evidence-structured review setup and are evaluated against the same canonical synthetic labels.
+We also run direct-property and Codex reviewer baselines on a cost-controlled subset.
+We treat the Qwen3.6 Flash direct-property run as the controlled prompt-only baseline: it uses a Qwen-family model, receives the same repository and one natural-language property at a time, has tool access to inspect files, and emits the same structured output fields, but uses a minimal decision prompt rather than the full \vibetest{} evidence rubric and example-calibration setup.
+We treat the GPT-4.1-mini direct-property and Codex-reviewer runs as practical probes rather than controlled model comparisons.
+Because 75 property checks took 25--36 minutes in this ReAct-style configuration depending on the model, we report these subset runs as sampled probes rather than full benchmarks.
+We also attempted TrainCheck~\citep{traincheck}.
+In the canonical files available in this workspace, TrainCheck returns all cases as \inconclusive, giving 0 coverage.
+We therefore report TrainCheck as an attempted execution-fragile baseline rather than a central competitor.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{llrrrrl}
+    \toprule
+    Benchmark & Method & Examples & Tests & Coverage & Macro F1 & Audit basis \\
+    \midrule
+    Synthetic Kaggle & \vibetest{} static & 0 & 1125 & 0.773 & 0.802 & Raw synthetic GT \\
+    Synthetic Kaggle & \vibetest{} static & 10 & 1125 & 0.903 & 0.813 & Raw synthetic GT \\
+    Synthetic Kaggle & \vibetest{} static & 20 & 1125 & 0.798 & 0.837 & Raw synthetic GT \\
+    Synthetic Kaggle & Reviewer mode 0 & -- & 1125 & 0.264 & 0.669 & Raw synthetic GT \\
+    Synthetic Kaggle & Reviewer mode 1 & -- & 1125 & 0.321 & 0.722 & Raw synthetic GT \\
+    Synthetic Kaggle & Reviewer mode 2 & -- & 1125 & 0.308 & 0.711 & Raw synthetic GT \\
+    Synthetic Kaggle & TrainCheck & -- & 1125 & 0.000 & -- & Raw synthetic GT \\
+    Real Kaggle & \vibetest{} static & 0 & 1920 & 0.822 & 0.931 & Conservative fail audit \\
+    Real Kaggle & \vibetest{} static & 10 & 1920 & 0.869 & 0.933 & Conservative fail audit \\
+    Real Kaggle & \vibetest{} static & 20 & 1920 & 0.871 & 0.938 & Conservative fail audit \\
+    \bottomrule
+  \end{tabular}
+  \caption{Headline benchmark results. Synthetic results use raw synthetic ground truth. Real Kaggle results use the conservative sampled fail audit; full-context adjusted values are treated as sensitivity analysis rather than headline metrics.}
+  \label{tab:headline}
+\end{table*}
+
+\section{Synthetic Kaggle Results}
+\label{sec:synthetic-results}
+
+On synthetic Kaggle, \vibetest{} with \qwen{} outperforms reviewer-style baselines under the current selective-evaluation setup.
+\Cref{tab:headline} shows that \vibetest{} reaches best macro F1 of 0.802 for ex0, 0.813 for ex10, and 0.837 for ex20.
+The reviewer baselines are lower, with macro F1 of 0.669, 0.722, and 0.711 for reviewer modes 0, 1, and 2.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{qwen_synthetic_f1_coverage.png}
+  \caption{Selective macro F1 versus coverage on synthetic Kaggle. \vibetest{} with \qwen{} outperforms reviewer-style baselines. Representative prompt examples improve the curve, with ex20 achieving the strongest macro F1 and ex10 achieving the strongest coverage among \vibetest{} settings.}
+  \label{fig:synthetic-f1}
+\end{figure}
+
+The example prompts do not produce a strictly monotonic pattern.
+The ex10 prompt gives the strongest coverage among \qwen{} example settings, while ex20 gives the strongest synthetic macro F1.
+This suggests that representative examples help, but more examples are not automatically better on every metric.
+
+\paragraph{Baseline probes on a matched subset.}
+To test whether the gains are simply due to giving an LLM agent a repository and one property, we ran direct-property baselines on the same first five Titanic synthetic repositories.
+The Qwen3.6 Flash direct baseline is the controlled prompt-only comparison: it keeps the model family close to the main \qwen{} runs while removing \vibetest{}'s evidence rubric and representative examples.
+The GPT-4.1-mini direct-property and Codex-reviewer runs are practical probes of common LLM-agent workflows, not controlled model-family comparisons.
+\Cref{tab:direct-baseline} shows that direct prompting misses many injected failures: Qwen3.6 Flash direct prompting reaches failure recall of 0.486, compared with 0.811 for \vibetest{} ex10 on the same subset.
+A practical Codex-reviewer probe using GPT-4.1-mini has still lower coverage and failure recall.
+This supports the interpretation that \vibetest{}'s structure and calibration are helping most on failure discovery, not merely on producing any answer or performing generic code review.
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lrrrr}
+    \toprule
+    Method & Coverage & Macro F1 & Fail P & Fail R \\
+    \midrule
+    Direct property Qwen3.6 Flash & 0.840 & 0.620 & 0.750 & 0.486 \\
+    Direct property GPT-4.1-mini & 0.973 & 0.610 & 0.824 & 0.378 \\
+    Codex reviewer GPT-4.1-mini & 0.440 & 0.349 & 0.625 & 0.135 \\
+    \vibetest{} ex0 & 0.840 & 0.681 & 0.840 & 0.568 \\
+    \vibetest{} ex10 & 0.920 & 0.791 & 0.833 & 0.811 \\
+    \vibetest{} ex20 & 0.893 & 0.775 & 0.794 & 0.730 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Cost-controlled baseline probes on the same five Titanic synthetic repositories (75 repository-property cases). Direct prompting and generic Codex review have weaker failure recall than \vibetest{} with representative examples.}
+  \label{tab:direct-baseline}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{qwen_synthetic_max_error_coverage.png}
+  \caption{Synthetic max selective error versus coverage. Lower values are better. Even at lower coverage, the remaining error is nontrivial, motivating the property-operationalization audit in \Cref{sec:synthetic-audit}.}
+  \label{fig:synthetic-error}
+\end{figure}
+
+\section{Synthetic Property-Operationalization Audit}
+\label{sec:synthetic-audit}
+
+The synthetic benchmark provides broad labeled coverage, but a natural-language label is itself an operationalization of an informal property.
+The injected failure, the recorded ground-truth label, the \vibetest{} prompt, and the verifier can therefore disagree about what counts as passable evidence for the same property.
+We audit this disagreement directly.
+We sampled high-confidence disagreements between \qwen{} predictions and synthetic labels.
+After excluding one parse error, 53 audited disagreements were usable.
+Of these, 29 were real \qwen{} misses and 24 were property-operationalization mismatches: cases where the benchmark label and the evidence-based interpretation diverged.
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lr}
+    \toprule
+    Audit outcome & Count \\
+    \midrule
+    Real \qwen{} miss & 29 \\
+    Property-operationalization mismatch & 24 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Synthetic high-confidence disagreement audit. Raw synthetic F1 mixes true model mistakes with property-operationalization mismatches, making it useful but pessimistic.}
+  \label{tab:synthetic-audit}
+\end{table}
+
+\Cref{tab:synthetic-examples} gives representative examples.
+In one real model miss, a notebook freezes every model parameter before an initial training call, but \vibetest{} treats later unfreezing as sufficient and predicts \pass.
+In contrast, some disagreements expose different operationalizations of the property.
+For example, a vectorization property labels harmless file-printing or path-construction loops as failures even though no elementwise numerical loop should be replaced by matrix operations.
+Another case marks validation augmentation as \pass{} even though the same stochastic transform is used for both train and validation dataloaders.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{llllp{6.2cm}}
+    \toprule
+    Type & Dataset & Repository & Property & Audit finding \\
+    \midrule
+    Real model miss & diabetic & \texttt{SYN-D1} & Parameters updated & All parameters are frozen before an initial \texttt{fit\_one\_cycle}; later unfreezing does not erase the earlier frozen training stage. \\
+    Operationalization mismatch & diabetic & \texttt{SYN-D1} & Avoid replaceable loops & The benchmark treats benign file/path loops as failures; the evidence-based interpretation restricts failure to active numerical loops replaceable by matrix operations. \\
+    Operationalization mismatch & diabetic & \texttt{SYN-D2} & Train-only augmentation & The benchmark label says \pass, but the evidence-based interpretation flags a violation because the same stochastic transform is used for train and validation loaders. \\
+    \bottomrule
+  \end{tabular}
+  \caption{Representative synthetic audit examples. The audit shows that synthetic errors contain both genuine model misses and property-operationalization mismatches.}
+  \label{tab:synthetic-examples}
+\end{table*}
+
+The main conclusion is that synthetic Kaggle remains useful, but its raw F1 should be interpreted as a conservative stress-test number rather than a clean estimate of model quality.
+For natural-language ML properties, disagreement is not always a simple model error; it can also reveal where the benchmark and the testing agent operationalize the property differently.
+This helps explain why real audited performance can appear higher than raw synthetic performance: the synthetic metric mixes genuine model mistakes with property-definition mismatches, while the real audit directly judges whether the surfaced evidence supports the property-level decision.
+This directly addresses the residual-error concern in \Cref{fig:synthetic-error}: the max-error curve remains nontrivial even at selective operating points not only because \qwen{} misses bugs, but also because a substantial share of high-confidence disagreements reflect mismatched property boundaries in the synthetic labels.
+
+\section{Real Kaggle Results}
+\label{sec:real-results}
+
+On real Kaggle repositories, the conservative sampled fail audit gives roughly 0.93 macro F1 across all prompt-example settings.
+The ex20 setting is slightly strongest, with 0.938 macro F1 at 0.871 coverage.
+The ex10 and ex20 settings both improve coverage over ex0 while preserving similar macro F1.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{qwen_real_conservative_f1_coverage.png}
+  \caption{Conservative macro F1 versus coverage on real Kaggle. \vibetest{} with \qwen{} reaches around 0.93 macro F1 across prompt-example settings under the conservative fail audit.}
+  \label{fig:real-f1}
+\end{figure}
+
+The real Kaggle headline uses conservative audit numbers.
+This is intentionally cautious.
+A full-context reaudit of conservative false failures suggests that some penalties were too harsh, but the full-context check is smaller and should be reported as sensitivity rather than the headline metric.
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lrr}
+    \toprule
+    Examples & Conservative F1 & Full-context adjusted F1 \\
+    \midrule
+    0 & 0.931 & 0.995 \\
+    10 & 0.933 & 1.000 \\
+    20 & 0.938 & 0.981 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Full-context sensitivity analysis for real Kaggle. Adjusted values are not used as headline metrics because the full-context reaudit is a smaller spot check.}
+  \label{tab:real-sensitivity}
+\end{table}
+
+\section{Real Audit Examples}
+\label{sec:real-audit}
+
+The conservative real Kaggle audit sampled predicted failures and labeled 122 as true failures and 30 as false failures.
+A full-context reaudit of the 30 conservative false failures found that 26 were accepted as true failures under full source context.
+This pattern shows why conservative metrics are safer as headline results and why context limitations matter for verifier-style audits.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{llllp{6.0cm}}
+    \toprule
+    Type & Dataset & Repository & Property & Audit finding \\
+    \midrule
+    True fail & Titanic & \texttt{REAL-T1} & Dataloader shuffling & Both training and validation dataloaders are constructed with \texttt{shuffle=True}. \\
+    True fail & Titanic & \texttt{REAL-T2} & Metric definitions & ROC-AUC is computed from hard class predictions rather than probabilities or continuous scores. \\
+    Context-flipped fail & Titanic & \texttt{REAL-T3} & Replaceable loops & The conservative audit lacked cited cells; full context shows a loop-based \texttt{predict} function despite an equivalent vectorized forward pass. \\
+    Context-flipped fail & Titanic & \texttt{REAL-T4} & Device placement & The conservative audit lacked cited cells; full context shows mixed \texttt{net.to(device)}, hardcoded \texttt{.cuda()}, \texttt{.cpu()}, and CPU tensor usage. \\
+    \bottomrule
+  \end{tabular}
+  \caption{Representative real Kaggle audit examples. True failures include direct evidence of incorrect loader shuffling and metric use. Context-flipped failures show cases where the conservative audit rejected a failure because the verifier lacked the relevant source cells.}
+  \label{tab:real-examples}
+\end{table*}
+
+\section{Score Distributions}
+\label{sec:scores}
+
+The \texttt{case\_score} distribution helps explain selective behavior.
+\Cref{fig:score-hists} shows that \qwen{} produces enough score spread to support thresholded evaluation, while still concentrating many outputs into a limited number of score regions.
+This motivates reporting curves rather than a single operating point.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.48\linewidth]{qwen_synthetic_score_histogram.png}
+  \hfill
+  \includegraphics[width=0.48\linewidth]{qwen_real_score_histogram.png}
+  \caption{Case-score distributions for synthetic Kaggle (left) and real Kaggle (right). The distributions support threshold-based selective evaluation, but also show that scores remain clustered in several regions.}
+  \label{fig:score-hists}
+\end{figure*}
+
+\section{Discussion}
+\label{sec:discussion}
+
+The current results support cautious optimism about agentic testing for ML pipelines.
+\vibetest{} is able to detect concrete repository-level issues and outperforms reviewer-style baselines on synthetic Kaggle.
+On real Kaggle, conservative audit estimates are strong, around 0.93 macro F1.
+At the same time, the synthetic audit shows that benchmark labels are not the only object being measured.
+The injected failure, ground-truth label, model verdict, and verifier judgment can operationalize the same natural-language property differently.
+The full-context sensitivity analysis shows a related issue on real data: verifier context strongly affects whether evidence is judged sufficient.
+
+These findings suggest three design lessons.
+First, the verdict schema matters.
+\inconclusive{} should be a first-class output whenever the repository lacks enough evidence to decide a property.
+Second, evaluation should audit both model predictions and benchmark labels, because natural-language properties have interpretation boundaries.
+Third, benchmark construction should document the operationalization of each property: what the injected failure was meant to change, what evidence should count as a violation, and when absence of evidence should become \inconclusive{} rather than \fail.
+
+\section{Related Work}
+
+\paragraph{Repository-level coding agents and audits.}
+SWE-bench and SWE-bench Verified evaluate whether models can resolve real repository issues~\citep{jimenez2024swebench,swebench-verified}.
+Agentless shows that simpler localization and repair pipelines can be competitive in this setting~\citep{xia2024agentless}.
+RepoAudit studies autonomous repository-level code auditing with LLM agents~\citep{guo2025repoaudit}, and BugScope studies learning bug-finding behavior from examples~\citep{liu2025bugscope}.
+Our setting differs in that the input is not an issue report or an open-ended request to find any bug.
+Instead, the agent is conditioned on a natural-language property and must decide whether that property is satisfied, violated, or unverifiable for a specific repository.
+
+\paragraph{Program analysis and ML debugging.}
+Classical program analysis provides a foundation for reasoning about program behavior under formal specifications~\citep{cousot1979systematic,nielson1999principles}.
+CodeQL represents another practical point in this design space: semantic queries can express many software properties, but they require the property to be formalized~\citep{codeql}.
+ML debugging systems such as UMLAUT, TrainCheck, model assertions, and TorchQL target important classes of ML failures with structured checks or constraints~\citep{schoop2021umlaut,traincheck,kang2020assertions,naik2024torchql}.
+\vibetest{} is complementary: it asks whether an agent can operationalize natural-language ML pipeline properties directly over messy repository context.
+
+\paragraph{Verification and judging.}
+LLM verifiers and judges have been studied for reasoning, self-improvement, and evaluation~\citep{cobbe2021verifier,lightman2024process,weng2023selfverification,madaan2023selfrefine,zheng2023judge,tan2025judgebench}.
+In our setting, verification is not used to prove a derivation step.
+It audits whether a reported \fail{} is supported by repository evidence and whether the predicted violation matches the tested property.
+This evidence-centered use of verification is central because absence of evidence, weak citations, or a best-practice concern should not become a \fail{} verdict.
+
+\section{Limitations}
+
+The synthetic operationalization audit covers a sampled subset of disagreements rather than all cases.
+It therefore estimates an important failure mode, but it does not produce a fully corrected synthetic benchmark.
+The real Kaggle audit is also sampled and focuses on predicted failures, so it does not establish complete recall over all real bugs.
+The full-context real Kaggle reaudit is useful as sensitivity analysis but too small to justify near-perfect headline claims.
+The direct-property and Codex reviewer baselines are sampled probes rather than full benchmarks because tool-using baselines are slow in this environment: 75 Titanic synthetic checks took 25--36 minutes for direct-property agents, while the Codex reviewer probe took 6 minutes and 53 seconds.
+Finally, TrainCheck did not produce usable coverage in the canonical files in this workspace; a cleaner Linux/container rerun would be needed for a stronger baseline comparison.
+
+\section{Conclusion}
+
+We presented \vibetest, an agentic testing framework for ML pipelines with natural-language properties.
+Across synthetic and real Kaggle benchmarks, \vibetest{} with \qwen{} achieves strong selective performance and outperforms reviewer-style baselines on synthetic Kaggle.
+The audits show that evidence-aware evaluation is essential: synthetic labels can encode a different operationalization of the property than the testing agent, conservative real audits can understate performance, and full-context source access can change verifier decisions.
+Agentic testing is therefore promising, but its evaluation should distinguish model mistakes from property-operationalization mismatch.
+
+\bibliography{vibetest}
+
+\appendix
+
+\section{Canonical Artifacts}
+
+The current result package is indexed in \texttt{docs/SUBMISSION\_PACKAGE.md}.
+Headline tables are generated from \texttt{results/benchmark\_summary.csv} using \texttt{scripts/make\_paper\_headline\_table.py}.
+The main audit files are:
+\begin{itemize}
+  \item \texttt{results/synthetic/openrouter\_synthetic\_gt\_disagreement\_audit\_15pct\_neutral.csv}
+  \item \texttt{results/openrouter\_fail\_human\_audit\_sample15\_gpt5mini.csv}
+  \item \texttt{results/openrouter\_false\_fail\_reaudit\_full\_context.csv}
+\end{itemize}
+
+\end{document}

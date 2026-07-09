@@ -664,7 +664,19 @@ def run_vibetest(
     print(f"{'=' * 80}")
 
 
-def run_codex_vibetest(subset: str, model: str):
+def run_codex_vibetest(
+    subset: str,
+    model: str,
+    *,
+    codex_cmd: str = "codex",
+    codex_model: str | None = "inspect",
+    codex_timeout_s: int = 1200,
+    repo_limit: int | None = None,
+    repo_offset: int | None = None,
+    output_path: str | None = None,
+    max_samples: int | None = None,
+    max_sandboxes: int | None = None,
+):
     """Run the Codex-backed VibeTest agent across all repositories."""
     print("=" * 80)
     print("Starting Kaggle Repository Tests - Codex VibeTest Method")
@@ -676,11 +688,16 @@ def run_codex_vibetest(subset: str, model: str):
     tests_per_repo = len(test_strs)
 
     total_repos = 0
+    limit = repo_limit if repo_limit and repo_limit > 0 else 50
+    offset = repo_offset if repo_offset and repo_offset > 0 else 0
     for repo_path in Path(f"./data/kaggle/kaggle-{subset}").iterdir():
-        if total_repos >= 50:
+        if total_repos >= limit:
             break
 
         if repo_path.is_dir():
+            if offset > 0:
+                offset -= 1
+                continue
             print(f"Queueing repository: {repo_path.name}")
             repo_paths.append(repo_path)
 
@@ -700,14 +717,25 @@ def run_codex_vibetest(subset: str, model: str):
     print("Executing all tests in parallel...")
     print(f"{'=' * 80}\n")
 
-    agent = CodexVibeTestAgent(model=model)
+    agent = CodexVibeTestAgent(
+        model=model or "openai/gpt-5-mini",
+        codex_cmd=codex_cmd,
+        codex_model=codex_model,
+        timeout_s=codex_timeout_s,
+        max_samples=max_samples,
+        max_sandboxes=max_sandboxes,
+    )
     all_results = agent.execute_tests(all_test_cases, sandbox="docker")
 
     dataset_name = f"kaggle_{subset}"
-    output_path = standardized_results_path(
-        dataset_name,
-        "AT-codex",
-        model_name=agent.model_name,
+    output_path = (
+        Path(output_path)
+        if output_path
+        else standardized_results_path(
+            dataset_name,
+            "AT-codex",
+            model_name=agent.model_name,
+        )
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -719,6 +747,20 @@ def run_codex_vibetest(subset: str, model: str):
             repo_total = len(repo_results)
             repo_passed = sum(1 for r in repo_results if r.passed)
             repo_failed = sum(1 for r in repo_results if (r.metadata or {}).get("verdict") == "FAIL")
+            test_rows = []
+            for prop_idx, r in enumerate(repo_results):
+                metadata = dict(r.metadata or {})
+                metadata.setdefault("property_index", prop_idx)
+                metadata.setdefault("property_text", test_strs[prop_idx])
+                test_rows.append(
+                    {
+                        "description": r.message,
+                        "passed": r.passed,
+                        "evidence": [e.model_dump() for e in r.evidence],
+                        "execution_log": r.execution_log,
+                        "metadata": metadata,
+                    }
+                )
 
             writer.write({
                 "repo": str(repo_path),
@@ -726,16 +768,7 @@ def run_codex_vibetest(subset: str, model: str):
                 "total_tests": repo_total,
                 "passed_tests": repo_passed,
                 "failed_tests": repo_failed,
-                "tests": [
-                    {
-                        "description": r.message,
-                        "passed": r.passed,
-                        "evidence": [e.model_dump() for e in r.evidence],
-                        "execution_log": r.execution_log,
-                        "metadata": r.metadata,
-                    }
-                    for r in repo_results
-                ],
+                "tests": test_rows,
                 "usage": aggregate_usage_from_results(repo_results),
             })
 
@@ -916,7 +949,18 @@ if __name__ == "__main__":
             output_path=args.output_path,
         )
     elif args.method == "codex-vibetest":
-        run_codex_vibetest(args.subset, args.model)
+        run_codex_vibetest(
+            args.subset,
+            args.model,
+            codex_cmd=args.codex_cmd,
+            codex_model=args.codex_model,
+            codex_timeout_s=args.codex_timeout,
+            repo_limit=args.repo_limit,
+            repo_offset=args.repo_offset,
+            output_path=args.output_path,
+            max_samples=args.max_samples,
+            max_sandboxes=args.max_sandboxes,
+        )
     else:
         run_vibetest(
             args.subset,

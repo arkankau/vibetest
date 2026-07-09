@@ -1,0 +1,842 @@
+%%%%%%%%%%%%%%%%%%%% VIBETEST QWEN KAGGLE -- CLEAN SUBMISSION DRAFT %%%%%%%%%
+%
+% This is the submission-facing draft. The ACL style file controls margins and
+% layout; do not add geometry/fullpage packages, since they will break the
+% conference margin requirements.
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\definecolor{darkblue}{rgb}{0,0,0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+% REVIEW-ONLY: flags spots still needing author input/decision. Renders in red.
+% Robust so it is safe inside captions and other moving arguments.
+% Before camera-ready, hide all of them with:
+%   \DeclareRobustCommand{\needsinput}[1]{}
+\DeclareRobustCommand{\needsinput}[1]{\textcolor{red}{\textbf{[INPUT NEEDED:}~#1\textbf{]}}}
+
+\newcommand{\pass}{\textsc{pass}}
+\newcommand{\fail}{\textsc{fail}}
+\newcommand{\inconclusive}{\textsc{inconclusive}}
+\newcommand{\vibetest}{\textsc{VibeTest}}
+\newcommand{\qwen}{Qwen3.6}
+
+\title{\vibetest: Evidence-Guided Agentic Testing\\for Natural-Language ML Pipeline Properties}
+
+\author{Anonymous ACL submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+ML repositories are governed by requirements that are easy to state but hard to
+test: avoid leakage, evaluate on held-out data, apply augmentation only to
+training examples, or compute metrics according to their definitions.
+These requirements are natural-language properties over messy repository
+context and are rarely written down as formal assertions.
+We propose \vibetest, an agentic testing framework that validates a repository
+against a natural-language ML-pipeline specification, without requiring a formal
+one, and returns a \pass, \fail, or \inconclusive{} verdict with an evidence
+report and a continuous confidence score.
+On 1,125 synthetic Kaggle (repository, property) pairs, \vibetest{} with \qwen{}
+achieves 0.802--0.837 selective macro F1 across prompt-example settings and
+outperforms reviewer-style baselines.
+On 1,920 real Kaggle cases, a conservative sampled fail audit estimates
+0.931--0.938 macro F1.
+The method also transfers across backbones: GPT-5-mini reaches comparable macro
+F1 at similar token cost.
+But the residual errors carry a second finding.
+When we hand-audit 53 high-confidence cases where the model and the benchmark
+disagree, only 29 are genuine model misses; the other 24 are cases where the
+injected label and the evidence disagree about what the property means.
+Selective F1 alone therefore conflates model quality with label
+operationalization, and we argue that natural-language repository testing should
+report both.
+\end{abstract}
+
+\section{Introduction}
+
+Modern ML systems are usually delivered as full repositories.
+Their behavior depends on choices scattered across notebooks, scripts, data
+loaders, training loops, and evaluation code.
+Many properties practitioners care about are straightforward to describe:
+use the held-out split, avoid train-test leakage, compute ROC-AUC from scores
+rather than hard labels, or ensure that intended parameters are updated during
+training.
+Yet these properties are hard to test automatically because they are expressed
+in natural language and must be grounded in repository evidence.
+
+This setting sits between code review and formal verification.
+Program analysis can provide strong guarantees once a property has been
+formalized~\citep{cousot1979systematic,nielson1999principles}, and query
+systems such as CodeQL are effective when developers can encode a semantic
+pattern~\citep{codeql}.
+ML debugging systems catch important training failures through structured
+checks~\citep{schoop2021umlaut,traincheck,kang2020assertions,naik2024torchql}.
+But many ML-pipeline requirements first appear as informal intent.
+For these cases, running the check is the easy part.
+The problem is deciding what evidence in a repository counts as satisfying or
+violating the property.
+
+LLM agents are a natural fit for this evidence-gathering step.
+They can inspect files, follow code paths, read notebooks, and explain their
+decisions.
+The same flexibility makes evaluation difficult.
+A model may report a failure because it found real evidence, because it noticed
+a best-practice concern, or because the repository lacks enough information to
+decide.
+These outcomes should not be collapsed.
+For example, the absence of a diagnostic sanity check is not proof that the
+repository violates a property; it may only make the property unverifiable.
+
+We introduce \vibetest, an agentic testing framework for natural-language
+ML-pipeline properties, as a way to close this gap.
+Given a repository $R$ and property $p$, \vibetest{} emits one of three
+verdicts: \pass, \fail, or \inconclusive{} (\Cref{fig:overview}).
+It also emits an evidence report and a continuous \texttt{case\_score}, where low
+values indicate confidence in \pass{} and high values indicate confidence in
+\fail.
+This score enables selective evaluation: high-confidence cases are accepted and
+ambiguous cases are abstained.
+
+Two findings emerge.
+Evidence-guided testing is already useful: on synthetic Kaggle-style
+repositories \vibetest{} outperforms reviewer-style baselines, and on real
+Kaggle notebooks a conservative sampled audit puts macro F1 near 0.93.
+More interesting is what the residual errors are made of.
+When we audit the high-confidence cases where \qwen{} and the synthetic label
+disagree, nearly half turn out to be disagreements about where a property's
+boundary lies: the injected change, the benchmark label, the prompt, and the
+auditor can each place it somewhere different.
+Testing a natural-language property, then, includes deciding what the property
+means.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.95\linewidth]{agentic_testing_evidence_verification.png}
+  \caption{Evidence-guided agentic testing. A repository and a natural-language
+  ML-pipeline specification are given to the testing agent. The agent gathers
+  repository evidence and emits a verdict, a confidence score, and an evidence
+  report. Downstream audits check whether predicted failures are supported by
+  the reported repository context.}
+  \label{fig:overview}
+\end{figure*}
+
+We make four contributions.
+First, we formulate natural-language ML-pipeline checking as evidence-guided
+repository testing with explicit \pass/\fail/\inconclusive{} verdicts.
+Second, we propose \vibetest, an agentic testing framework that produces these
+verdicts with cited evidence and a calibratable confidence score.
+Third, we evaluate \vibetest{} on synthetic and real Kaggle benchmarks with two
+backbones (\qwen{} and GPT-5-mini), comparing against reviewer-style baselines
+and direct-prompting probes, and measuring whether the cited evidence supports
+each verdict.
+Fourth, we audit synthetic disagreements and show that raw synthetic F1 mixes
+model misses with property-definition mismatches.
+
+\section{Problem Setting}
+\label{sec:problem}
+
+We evaluate a (repository, property) pair $(R,p)$, where $R$ is an ML repository
+and $p$ is a natural-language specification of expected behavior, such as ``no
+training on the test set.''
+The task is to return a decision $y \in \{\pass, \fail, \inconclusive\}$ together
+with an evidence report $E$ that identifies the files, executions, and outputs
+justifying $y$ and lets a reader verify it independently.
+This differs from generic code review, where any plausible defect may be
+reported, and from formal verification, where the property is already expressed
+in a formal language.
+
+\paragraph{Informal properties.}
+Natural-language properties have boundaries.
+``Avoid replaceable Python loops'' might target elementwise numerical loops in
+tensor code while excluding loops that only print file paths.
+``Do not freeze trainable parameters unless intended'' requires deciding what
+counts as explicit intent.
+The tester must operationalize the property before it can evaluate code.
+
+\paragraph{Incomplete evidence.}
+ML repositories often omit artifacts needed for a definitive judgment.
+A notebook may not run, external data may be unavailable, or a metric may be
+reported without the exact training artifact.
+In these cases, a forced binary decision can turn missing evidence into false
+failures.
+\inconclusive{} must therefore be a first-class outcome.
+
+\paragraph{Benchmark labels as operationalizations.}
+Synthetic labels come from injected changes, and an injected change is only one
+operationalization of the natural-language property.
+When a model and label disagree, either may be wrong, or they may be applying
+different but defensible property boundaries.
+Evidence audits are therefore part of the benchmark itself.
+
+\section{\vibetest}
+\label{sec:method}
+
+We design \vibetest{} as a repository-level testing agent for natural-language
+ML properties.
+Its guiding principle is evidence discipline: a \fail{} verdict must be supported
+by specific repository evidence, and weak or missing evidence yields
+\inconclusive{}.
+\vibetest{} operates on a sandboxed copy of the repository.
+It may run and modify code to probe a property, for example by adding logging or
+perturbing labels, but these changes do not persist to the original repository.
+
+\paragraph{Output schema.}
+For each case, \vibetest{} returns a verdict, a \texttt{case\_score}, and an
+evidence report: concise reasoning together with the cited files, outputs, and
+logs that justify the verdict.
+\pass{} means the repository appears to satisfy the property with supporting
+evidence.
+\fail{} means the repository appears to violate the property with supporting
+evidence.
+\inconclusive{} means the repository does not provide enough evidence to
+decide.
+\Cref{fig:worked-example} shows a representative report.
+
+\begin{figure*}[t]
+  \centering
+  \small
+  \fbox{\begin{minipage}{0.80\linewidth}
+  \textbf{Property.} Any data augmentation is applied only to the training data;
+  validation and test use deterministic preprocessing.\\[2pt]
+  \textbf{Verdict.}~\fail\qquad \texttt{case\_score}~$=0.95$\\[2pt]
+  \textbf{Reasoning.} Noise injection is applied to the full feature tensor in
+  Cell~45, \emph{before} the train/validation split in Cell~74, so the
+  validation split inherits the augmentation. Only the test set (Cell~114)
+  stays deterministic.\\[3pt]
+  \textbf{Cited evidence.}
+  \begin{itemize}\setlength{\itemsep}{1pt}\setlength{\topsep}{1pt}
+    \item Cell~45 adds noise to the whole tensor:\\
+      {\ttfamily\footnotesize t\_indep[:,jitter\_cols] = t\_indep[:,jitter\_cols]
+      + torch.randn\_like(\ldots)*0.02}
+    \item Cell~74 then splits the already-augmented tensor:\\
+      {\ttfamily\footnotesize trn\_indep, val\_indep = t\_indep[trn\_split],
+      t\_indep[val\_split]}
+    \item Cell~114 preprocesses the test set with deterministic operations only.
+  \end{itemize}
+  \end{minipage}}
+  \caption{A \vibetest{} report on a synthetic Titanic repository (\qwen).
+  The injected bug augments features before the train/validation
+  split, contaminating validation while leaving the test set clean; \vibetest{}
+  returns \fail{} with a high \texttt{case\_score} and cites the three cells that
+  establish the violation. Reasoning is lightly condensed for space.}
+  \label{fig:worked-example}
+\end{figure*}
+
+\paragraph{Selective scoring.}
+The \texttt{case\_score} lies in $[0,1]$.
+Scores near 0 indicate confidence that the property is satisfied, while scores
+near 1 indicate confidence that the property is violated.
+For two-sided thresholding, a threshold $t$ accepts \pass{} when
+\texttt{case\_score} $\leq 1-t$, accepts \fail{} when
+\texttt{case\_score} $\geq t$, and abstains otherwise.
+Coverage is the fraction of cases accepted as \pass{} or \fail.
+
+\paragraph{Prompt-example settings.}
+We evaluate three static prompt settings.
+\textbf{ex0} uses no representative examples.
+\textbf{ex10} includes ten concise examples of representative failure cases.
+\textbf{ex20} includes twenty such examples.
+The examples are intended to calibrate the evidence standard; they do not
+provide answers for the evaluated (repository, property) pairs.
+
+\paragraph{Connection to structured reasoning.}
+Prior work on verifiers, process supervision, and self-refinement shows that
+intermediate structure can make model outputs more reliable
+~\citep{cobbe2021verifier,lightman2024process,madaan2023selfrefine,weng2023selfverification}.
+PIPS applies this idea to per-instance program synthesis by using structural
+feedback~\citep{stein2025pips}.
+\vibetest{} applies the same high-level lesson to repository testing: the
+intermediate object is an evidence-backed verdict that can be audited.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Synthetic Kaggle.}
+The synthetic benchmark contains 75 Kaggle-style notebooks across three
+competitions of different modalities: Titanic (tabular), Disaster Tweets (text),
+and Diabetic Retinopathy (image).
+Each notebook is evaluated against 15 ML-pipeline properties, yielding 1,125
+(repository, property) pairs.
+Labels come from controlled bug injection and are treated as the canonical
+synthetic ground truth before audit.
+
+\paragraph{Real Kaggle.}
+The real benchmark contains 121 public Kaggle notebooks: 50 Titanic, 50
+Disaster Tweets, and 21 Diabetic Retinopathy notebooks
+~\citep{kaggle_titanic,kaggle_disaster_tweets,kaggle_diabetic_retinopathy}.
+Each notebook is evaluated against up to 16 properties, yielding 1,920 cases.
+Because exhaustive real ground truth is unavailable, headline real results use
+a conservative sampled audit of predicted failures.
+A smaller full-context reaudit is reported only as sensitivity analysis.
+
+\paragraph{Baselines and probes.}
+We compare against reviewer-style baselines and a Codex reviewer on the full
+synthetic benchmark, evaluated against the same synthetic labels.
+Codex is included as an execution/format-fragile baseline: at scale it emits a
+parseable committed verdict on only 5.5\% of cases (\Cref{tab:headline}).
+We additionally report matched direct-property and Codex-style probes on a
+five-repository Titanic subset (\Cref{tab:probe}).
+These probes help separate the value of the evidence rubric from simply asking
+a model about the property.
+To isolate the value of evidence-guided testing from the underlying model, we
+also run a \emph{same-checkpoint} probe: on the five-repository Titanic subset we
+compare direct-property prompting and \vibetest{} on an identical
+Qwen3.6-35B-A3B checkpoint served through OpenRouter (2026-04-15).
+Direct prompting sees the notebook and the property and answers directly, with
+no evidence rubric, tools, or execution.
+On this matched checkpoint, \vibetest{} reaches 0.811 macro F1 and 0.784 failure
+recall versus 0.704 and 0.667 for direct prompting, so the gain is attributable
+to the evidence-guided procedure.
+A full-benchmark same-checkpoint run remains future work.
+On real Kaggle we do not report Codex or direct-property numbers, because our
+real ground truth comes from fail audits of \vibetest{}'s own predictions and no
+comparable audit exists for these baselines.
+\needsinput{confirm this framing is acceptable, or run a matched real-Kaggle fail
+audit for Codex/direct so they can appear in the real results.}
+
+\paragraph{Metrics.}
+For synthetic data, where we have injected ground truth, we report selective
+macro F1 over covered cases together with coverage.
+Real data has no exhaustive ground truth, so the real macro F1 is only partly
+audited: we verify the \fail{} class by sampling predicted failures and checking
+whether the cited evidence supports them, but the \pass{} class is taken from
+the model's own verdicts.
+The estimate therefore leans on failure precision and does not establish recall
+over real defects the model missed; we treat it conservatively for that reason,
+and read it alongside coverage from the full model outputs.
+We also report score histograms and worst-class selective error, defined as the
+maximum of the accepted-fail false discovery rate and accepted-pass false
+omission rate.
+For selective macro F1 we report 95\% confidence intervals from a case-level
+bootstrap that resamples the covered (repository, property) pairs with
+replacement (20{,}000 replicates); for audited proportions we report Wilson
+score intervals.
+
+\paragraph{Audit protocol.}
+Both audits are adjudicated by an LLM verifier.
+The verifier is a different model family from the tester: the tester is
+\qwen{}, while the verifier is GPT-5.4-mini for the synthetic evidence checks
+and GPT-5-mini for the real fail audit, both distinct from the tester.
+It is shown the property, the tester's verdict, and the cited evidence, and it
+decides whether the evidence supports the verdict.
+The same verifier provides the per-verdict evidence-support signal we report as
+evidence quality (RQ4).
+Using a separate model to adjudicate gives a measure of cross-model
+independence: a disagreement flagged as a property-operationalization mismatch
+is one where the injected label conflicts with an evidence-based reading from a
+third model, separate from both the label injector and the tester.
+The verifier is itself an LLM and applies the same evidence standard as the
+tester; we return to this in \Cref{sec:limitations}.
+
+\section{Results}
+\label{sec:results}
+
+\paragraph{RQ1: Does evidence-guided testing improve synthetic performance?}
+Yes, and by a clear margin.
+At the selective-F1-optimal operating point (\Cref{tab:headline}; the apex of
+each risk--coverage curve in \Cref{fig:synthetic-f1}), \vibetest{} reaches
+0.802 macro F1 for ex0, 0.813 for ex10, and 0.837 for ex20, against 0.669--0.722
+for the reviewer baselines (95\% bootstrap CIs in \Cref{tab:headline}).
+The ex10 and ex20 intervals sit clearly above the reviewer intervals, while
+ex0's margin over the best reviewer is small.
+These are case-level intervals; a repository-level bootstrap would be wider
+(\Cref{sec:limitations}), so we read the gain over reviewers as clear for the
+example settings but not decisive for ex0.
+The ex0, ex10, and ex20 intervals overlap one another, so we do not treat the
+example count as a reliable ranking.
+This gap is not an artifact of \vibetest{} abstaining more: because the
+reviewers emit no abstention score, \Cref{fig:synthetic-f1} charitably folds
+their \inconclusive{} verdicts into \pass{} and sweeps a pseudo-score, yet even
+under this generous treatment they never reach \vibetest{}, and \vibetest{}
+dominates across the shared coverage region.
+Left to its native verdicts, a reviewer commits to a \pass{} or \fail{} on only
+0.26--0.32 of cases, so the folding credits it with many unjudged passes.
+Codex reviewer and TrainCheck are execution/format-fragile at scale: on the full
+1{,}125-case synthetic benchmark Codex emits a parseable committed verdict on
+only 5.5\% of cases (macro F1 0.419 on that sliver, mostly by predicting \fail),
+and TrainCheck produced no usable coverage in our canonical execution.
+We report both at their native operating points (\Cref{tab:headline},
+\Cref{fig:synthetic-f1}).
+These numbers reflect execution fragility in our setting; either tool may
+perform better with cleaner integration.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{llrrrr c l}
+    \toprule
+    Benchmark & Method & Examples & Tests & Coverage & Macro F1 & 95\% CI & Label source \\
+    \midrule
+    Synthetic & \vibetest{} static & 0 & 1125 & 0.560 & 0.802 & {\scriptsize[0.77, 0.83]} & Synthetic GT \\
+    Synthetic & \vibetest{} static & 10 & 1125 & 0.643 & 0.813 & {\scriptsize[0.78, 0.84]} & Synthetic GT \\
+    Synthetic & \vibetest{} static & 20 & 1125 & 0.562 & 0.837 & {\scriptsize[0.81, 0.87]} & Synthetic GT \\
+    Synthetic & Reviewer mode 0 & -- & 1125 & 0.973 & 0.669 & {\scriptsize[0.64, 0.70]} & Synthetic GT \\
+    Synthetic & Reviewer mode 1 & -- & 1125 & 0.963 & 0.722 & {\scriptsize[0.69, 0.75]} & Synthetic GT \\
+    Synthetic & Reviewer mode 2 & -- & 1125 & 0.982 & 0.711 & {\scriptsize[0.68, 0.74]} & Synthetic GT \\
+    Synthetic & Codex reviewer & -- & 1125 & 0.055 & 0.419 & {\scriptsize[0.33, 0.54]} & Synthetic GT \\
+    Synthetic & TrainCheck & -- & 1125 & 0.000 & -- & -- & Synthetic GT \\
+    Real & \vibetest{} static & 0 & 1920 & 0.822 & 0.931 & -- & Conservative audit \\
+    Real & \vibetest{} static & 10 & 1920 & 0.869 & 0.933 & -- & Conservative audit \\
+    Real & \vibetest{} static & 20 & 1920 & 0.871 & 0.938 & -- & Conservative audit \\
+    \bottomrule
+  \end{tabular}
+  \caption{Headline results. For synthetic rows, coverage and macro F1 are
+  reported at a single operating point (the apex of each method's
+  risk--coverage curve in \Cref{fig:synthetic-f1}), so the two columns describe
+  the same threshold. \vibetest{} peaks at 0.56--0.64 coverage; its full-output
+  coverage without extra thresholding is 0.77--0.90. Reviewer baselines emit no
+  abstention score, so \Cref{fig:synthetic-f1} folds their \inconclusive{}
+  verdicts into \pass{} and sweeps a pseudo-score (charitable to the baseline,
+  which is then credited with unjudged passes); their native
+  non-\inconclusive{} rate is only 0.26--0.32. Codex reviewer and TrainCheck are
+  execution/format-fragile at scale: on the full benchmark they emit a parseable
+  committed verdict on only 5.5\% and 0\% of cases respectively, so they are
+  reported at their native committed operating point without folding. (On the
+  small five-repository probe of \Cref{tab:probe}, Codex was scored with the
+  reviewer folding and so appears at higher coverage there.
+  \needsinput{Codex is 0.055 coverage here vs 0.44 in the probe table; decide
+  whether to keep both with this reconciling note or drop the probe Codex column
+  to avoid the apparent conflict.}) Real rows report the
+  conservative sampled fail audit; real coverage is the non-\inconclusive{} rate
+  over all 1{,}920 outputs, which uses a different sample than the audit
+  (\Cref{sec:setup}). The 95\% CI is a case-level bootstrap over covered
+  (repository, property) pairs; real rows are audit estimates without a
+  comparable interval (their auditable fail precision is 0.80 [0.73, 0.86],
+  \Cref{sec:real-examples}).}
+  \label{tab:headline}
+\end{table*}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{paper_synthetic_selective_f1_coverage.pdf}
+  \caption{Selective macro F1 versus coverage on synthetic Kaggle. \vibetest{}
+  occupies the higher-F1 region and dominates the reviewer baselines wherever
+  their coverage overlaps. Reviewer baselines have no abstention score, so their
+  \inconclusive{} verdicts are folded into \pass{} before sweeping a pseudo-score;
+  this inflates their coverage and is charitable to the baseline. Codex reviewer
+  (full run) is a single point at the bottom left: it commits on only 5.5\% of
+  cases at scale. TrainCheck has zero usable coverage and appears only in
+  \Cref{tab:headline}.}
+  \label{fig:synthetic-f1}
+\end{figure}
+
+\paragraph{Prompt-only probes.}
+\Cref{tab:probe} compares \vibetest{} to direct-property and Codex-style probes
+on the same five Titanic synthetic repositories.
+The Qwen-family direct-property probe reaches 0.486 failure recall, while
+\vibetest{} ex10 reaches 0.811 on the same subset.
+This suggests that representative examples and the evidence rubric improve
+failure discovery beyond making the model more verbose.
+
+\begin{table}[t]
+  \centering
+  \scriptsize
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.42\linewidth}rrrr@{}}
+    \toprule
+    Method & Cov. & F1 & P & R \\
+    \midrule
+    Direct Qwen Flash & 0.840 & 0.620 & 0.750 & 0.486 \\
+    Direct GPT-4.1 mini & 0.973 & 0.610 & 0.824 & 0.378 \\
+    Codex reviewer & 0.440 & 0.349 & 0.625 & 0.135 \\
+    \vibetest{} ex0 & 0.840 & 0.681 & 0.840 & 0.568 \\
+    \vibetest{} ex10 & 0.920 & 0.791 & 0.833 & 0.811 \\
+    \vibetest{} ex20 & 0.893 & 0.775 & 0.794 & 0.730 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Matched five-repository Titanic probe with 75 cases. P/R denote
+  failure precision and recall. Direct prompting and generic review have weaker
+  failure recall than \vibetest{} with prompt examples.}
+  \label{tab:probe}
+\end{table}
+
+\paragraph{RQ2: Are scores useful for selective prediction?}
+The score supports useful selective curves, but it is not perfectly calibrated.
+\Cref{fig:synthetic-error} shows that worst-class selective error remains
+nontrivial even when abstention removes many cases, and
+\Cref{fig:score-hists} shows the underlying score distributions: the model
+concentrates mass near the confident \pass{} and \fail{} ends but still places
+appreciable mass in the ambiguous middle.
+This motivates auditing the disagreements directly, which we do in
+\Cref{sec:audit}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{paper_synthetic_max_error_coverage.pdf}
+  \caption{Synthetic worst-class selective error versus coverage on a linear
+  scale. Lower is better. Residual error remains visible after abstention,
+  motivating the disagreement audit in \Cref{sec:audit}. Coverage below 0.15 is
+  omitted: with so few accepted cases, a single misclassification swings the
+  worst-class rate and the estimate is not meaningful.}
+  \label{fig:synthetic-error}
+\end{figure}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{paper_case_score_ecdf.pdf}
+  \caption{Empirical case-score distributions for synthetic Kaggle (left) and
+  real Kaggle (right). Steep segments indicate score clusters; flatter segments
+  indicate score ranges the model uses less often. The curves show score spread
+  without letting high-count bins dominate the visualization.}
+  \label{fig:score-hists}
+\end{figure*}
+
+\paragraph{RQ3: Does the pattern transfer to real Kaggle?}
+Conservative real-audit estimates are strong across example settings.
+\Cref{fig:real-f1} shows estimated macro F1 around 0.93, with ex20 slightly
+strongest in the headline table.
+Full-context reaudit suggests that some conservative false-fail penalties were
+too harsh; we treat that analysis only as a sensitivity check and keep the
+conservative values as the headline.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{paper_real_conservative_f1_coverage.pdf}
+  \caption{Conservative macro F1 versus coverage on real Kaggle. The sampled
+  fail audit estimates roughly 0.93 macro F1 across prompt-example settings over
+  the reported coverage range. Coverage below 0.30 is omitted because too few
+  accepted failures enter the audit estimate there for it to be stable; the
+  headline uses the high-coverage region.}
+  \label{fig:real-f1}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lr}
+    \toprule
+    Examples & Conservative macro F1 \\
+    \midrule
+    0 & 0.931 \\
+    10 & 0.933 \\
+    20 & 0.938 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Real Kaggle headline (conservative sampled fail audit). As a
+  one-sided sensitivity check, re-auditing the conservative false failures with
+  full source context accepts 26 of 30 as supported, which would push macro F1
+  into the 0.98--0.99 range. We treat that only as an optimistic upper bound,
+  not an independent estimate, and keep the conservative values as the headline.}
+  \label{tab:real-sensitivity}
+\end{table}
+
+\paragraph{Does the result depend on the model or the dataset?}
+To check that evidence-guided testing is not specific to \qwen{}, we also run
+the tester with GPT-5-mini.
+GPT-5-mini emits verdicts but no \texttt{case\_score}, so we compare both models
+at their native operating point (covered cases are the non-\inconclusive{}
+verdicts), which is why the \qwen{} macro F1 here is below its selective peak in
+\Cref{tab:headline}.
+\Cref{tab:models} shows the two backbones are close in macro F1 (mean 0.769 for
+\qwen{}, 0.746 for GPT-5-mini) at comparable coverage and output-token cost
+(about 3k tokens per property each).
+Both models are weakest on Diabetic Retinopathy (image) and strongest on
+Disaster Tweets (text), so difficulty tracks the dataset more than the backbone.
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{llrrr}
+    \toprule
+    Dataset & Model & Cov. & Macro F1 & Tok/prop \\
+    \midrule
+    \multirow{2}{*}{Titanic} & \qwen{} & 0.720 & 0.762 & 2.8k \\
+     & GPT-5-mini & 0.795 & 0.765 & 3.5k \\
+    \midrule
+    \multirow{2}{*}{Disaster Tweets} & \qwen{} & 0.835 & 0.795 & 3.1k \\
+     & GPT-5-mini & 0.731 & 0.756 & 3.1k \\
+    \midrule
+    \multirow{2}{*}{Diabetic} & \qwen{} & 0.765 & 0.749 & 3.0k \\
+     & GPT-5-mini & 0.704 & 0.718 & 3.1k \\
+    \midrule
+    \multirow{2}{*}{Mean} & \qwen{} & 0.773 & 0.769 & 2.9k \\
+     & GPT-5-mini & 0.743 & 0.746 & 3.2k \\
+    \bottomrule
+  \end{tabular}
+  \caption{Cross-model and per-dataset breakdown at the native operating point
+  (covered = non-\inconclusive{} verdicts, no score thresholding). GPT-5-mini has
+  no \texttt{case\_score}, so this is the common ground for comparison; \qwen{}'s
+  selective peak (\Cref{tab:headline}) is higher. Tok/prop is output tokens per
+  (repository, property), a cost proxy. \qwen{} rows are from the headline FP8
+  run (\Cref{tab:headline}); GPT-5-mini from a matched run.}
+  \label{tab:models}
+\end{table}
+
+\paragraph{RQ4: Is the cited evidence trustworthy?}
+Verdict accuracy says nothing about whether the cited evidence is sound, so we
+check it directly with the independent verifier (\Cref{sec:setup}).
+Across the synthetic benchmark, the verifier confirms that the cited evidence
+supports the verdict for 91.3\% of the \fail{} verdicts that cite checkable
+evidence (306 of 335; 95\% Wilson CI [0.88, 0.94]).
+Requiring supported evidence lowers fail precision only modestly, from 0.79 to
+0.73, so \vibetest{} rarely reaches a correct \fail{} for the wrong reason.
+The weaker point is evidence coverage: 87 of 422 \fail{} verdicts (21\%) cite no
+checkable evidence, and we count these against \vibetest{} in the 0.73 figure.
+This matters because the citation is what lets a reader confirm each verdict.
+The evidence verifier was run as a separate FP8 pass over the same benchmark and
+model (the headline run does not store per-verdict evidence checks), so these
+numbers reflect the same tester on the same cases with the verifier enabled.
+
+\section{Auditing Synthetic Disagreements}
+\label{sec:audit}
+
+Real Kaggle appears stronger than synthetic Kaggle under the headline metrics.
+One explanation is that the synthetic labels are stricter or noisier than the
+evidence standard used by \vibetest{} and the verifier.
+We test this directly with the LLM verifier (\Cref{sec:setup}), which
+re-examines high-confidence disagreements between \qwen{} predictions and
+synthetic labels and labels each as a model miss or a mismatch.
+After excluding one parse error, 53 sampled disagreements were usable.
+Of these, 29 were real \qwen{} misses and 24 were
+property-operationalization mismatches: cases where the injected label and the
+evidence-based judgment apply different but individually defensible property
+boundaries.
+The mismatch share is 45\% (95\% Wilson CI [33\%, 59\%]); the interval is wide
+because the audit is small, but even its lower bound puts property-boundary
+disagreement at roughly a third of the sampled errors.
+\Cref{tab:synthetic-examples} gives representative cases of each type.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabularx}{\textwidth}{@{}p{2.0cm}p{1.4cm}p{2.15cm}p{2.25cm}X@{}}
+    \toprule
+    Type & Dataset & Repository & Property & Audit finding \\
+    \midrule
+    Model miss & Diabetic & \texttt{SYN-D1} & Parameters updated &
+    All parameters are frozen before an initial training call; later unfreezing
+    does not erase the earlier frozen training stage. \\
+    Operationalization mismatch & Diabetic & \texttt{SYN-D1} & Replaceable loops &
+    The synthetic label treats benign file/path loops as failures; the evidence
+    rubric restricts the property to active numerical loops replaceable by
+    vectorized operations. \\
+    Operationalization mismatch & Diabetic & \texttt{SYN-D2} & Train-only augmentation &
+    The synthetic label says \pass, but the evidence rubric flags stochastic
+    transforms reused for train and validation loaders. \\
+    \bottomrule
+  \end{tabularx}
+  \caption{Representative synthetic audit examples. Some disagreements are
+  model misses, while others expose different interpretations of the property.}
+  \label{tab:synthetic-examples}
+\end{table*}
+
+This audit changes how we interpret synthetic performance.
+Synthetic Kaggle is valuable because it provides broad labeled coverage and
+exposes real model misses.
+But raw synthetic F1 is pessimistic as a model-quality estimate because it also
+penalizes cases where the benchmark label and evidence standard disagree about
+the property boundary.
+This is especially important for natural-language ML properties, where defining
+what counts as a failure is part of the task.
+
+\section{Real-Kaggle Fail Audit}
+\label{sec:real-examples}
+
+The conservative real Kaggle audit sampled 152 predicted failures and labeled 122
+as true failures and 30 as false failures, a fail precision of 0.80 (95\% Wilson
+CI [0.73, 0.86]).
+A full-context reaudit of those 30 conservative false failures accepted 26 as
+true failures once the verifier was given relevant source context.
+This supports our choice to headline conservative results while treating
+full-context adjusted values as sensitivity analysis (\Cref{tab:real-sensitivity}).
+Representative true failures and context-flipped cases are shown in
+\Cref{tab:real-audit-examples} in the appendix: they illustrate that full source
+context can change whether a predicted failure is judged supported, so
+context-limited verifier results should be read conservatively.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\vibetest{} turns a natural-language ML-pipeline property into an
+evidence-backed repository test.
+It answers one narrow question: given a single property, does the repository
+satisfy it, and what evidence shows that.
+The method rests on three choices.
+Because many properties are only partially observable, the three-verdict schema
+keeps \inconclusive{} distinct from \fail{}.
+The score allows selective prediction.
+And the audit reflects a simple fact: a benchmark label encodes one
+interpretation of a property, and other defensible interpretations exist.
+
+We therefore treat the synthetic disagreement audit as a result in its own
+right.
+If nearly half of the high-confidence disagreements are property-boundary
+mismatches, the benchmark is measuring two things at once: model behavior and
+label operationalization.
+This explains why synthetic raw F1 can look lower than real audited F1 without
+implying that the real benchmark is simply easier.
+The two settings use different standards: synthetic labels come from injected
+changes, while real results come from evidence audits.
+The trajectory is a familiar one.
+SWE-bench's \emph{Verified} re-annotation showed that automatically generated
+task labels had to be human-audited before they could be trusted
+~\citep{swebench-verified}; once a property is only stated in natural language,
+its labels warrant the same scrutiny.
+
+\paragraph{Baseline interpretation.}
+The baseline evidence should be read in tiers.
+Reviewer modes are the strongest full-benchmark comparison because they run on
+all synthetic cases; they show that less structured review prompts lag behind
+\vibetest{} in selective F1.
+Codex reviewer and TrainCheck are execution/format-fragile in this setting: on
+the full benchmark they emit parseable committed verdicts on only 5.5\% and 0\%
+of cases, so they enter \Cref{tab:headline} as native low-coverage points rather
+than as selective curves.
+Their fragility at scale is itself informative: producing an auditable verdict
+on messy repositories is a nontrivial part of the task.
+Direct prompting tests whether the gain comes from simply asking an LLM about
+the property.
+In the five-repository Titanic probe \vibetest{} has substantially higher
+failure recall than both direct prompting and Codex review (\Cref{tab:probe}),
+and on the same-checkpoint probe (\Cref{sec:setup}), where \vibetest{} and
+direct prompting share one Qwen3.6-35B checkpoint, \vibetest{} still leads by
+0.11 macro F1 and 0.12 failure recall.
+The advantage therefore comes from the evidence-guided procedure.
+
+\section{Related Work}
+
+\paragraph{Repository-level agents.}
+SWE-bench and SWE-bench Verified evaluate repository-scale issue resolution
+~\citep{jimenez2024swebench,swebench-verified}, while Agentless shows that
+carefully designed non-agentic workflows can be competitive on repair tasks
+~\citep{xia2024agentless}.
+RepoAudit studies autonomous repository-level code auditing
+~\citep{guo2025repoaudit}.
+Our setting is narrower and more evidence-driven: the agent receives a specific
+natural-language property and must decide whether the repository satisfies,
+violates, or fails to establish it.
+
+\paragraph{Program analysis and ML debugging.}
+Classical static analysis provides formal guarantees under explicit
+specifications~\citep{cousot1979systematic,nielson1999principles}.
+ML debugging systems such as UMLAUT, TrainCheck, model assertions, and TorchQL
+catch important failure classes through structured checks or constraints
+~\citep{schoop2021umlaut,traincheck,kang2020assertions,naik2024torchql}.
+\vibetest{} is complementary because it targets properties that have not yet
+been formalized.
+
+\paragraph{Reasoning and verification with language models.}
+Work on verifiers, process supervision, self-refinement, and LLM-as-judge
+evaluation shows that model outputs improve when intermediate reasoning or
+feedback is made explicit
+~\citep{cobbe2021verifier,lightman2024process,madaan2023selfrefine,weng2023selfverification,zheng2023judge,tan2025judgebench}.
+\vibetest{} applies this lesson to repository testing: the intermediate object
+is an evidence-backed verdict that can itself be audited.
+Our audits use a verifier in this sense, but for a different purpose than
+scoring answers: a separate LLM verifier adjudicates whether a benchmark label
+and an evidence-based judgment operationalize a property the same way.
+
+\section{Limitations}
+\label{sec:limitations}
+
+The synthetic disagreement audit covers a sample of disagreements.
+It estimates a major source of residual error but does not produce a corrected
+synthetic benchmark.
+Our confidence intervals also resample (repository, property) pairs
+independently; because the properties within one repository are correlated, a
+cluster bootstrap over repositories would be more conservative, and all results
+come from a single \qwen{} run.
+The audits are adjudicated by an LLM verifier.
+Using a different model family from the tester gives cross-model independence,
+but the verifier shares the tester's evidence standard and the general failure
+modes of LLM judges; a human adjudication of the mismatch cases would be a
+stronger check on the operationalization finding.
+The real Kaggle audit is also sampled and focuses on predicted failures, so it
+does not establish complete recall over all real defects.
+\needsinput{a small pass-side audit (sample predicted \pass{} cases and check
+for missed real violations) would bound the false-negative rate that the real
+macro F1 currently cannot, and is the single result most likely to be
+challenged.}
+The same-checkpoint direct-property comparison is a five-repository probe on a
+public OpenRouter checkpoint; scaling it to all 1{,}125 cases remains future
+work.
+Codex reviewer and TrainCheck run on the full synthetic benchmark but produce
+almost no committed verdicts there; a cleaner containerized execution could
+raise their coverage.
+On real Kaggle we report no Codex or direct-property numbers, because our real
+ground truth comes from audits of \vibetest{}'s own predicted failures and no
+comparable audit was run for the baselines.
+
+\section{Conclusion}
+
+We presented \vibetest, an evidence-guided agentic tester for natural-language
+ML-pipeline properties.
+On synthetic Kaggle, \vibetest{} with \qwen{} outperforms reviewer-style
+baselines.
+On real Kaggle, conservative sampled audits estimate macro F1 around 0.93.
+The main evaluation lesson is that natural-language repository testing requires
+auditing both model predictions and benchmark-label operationalizations.
+For ML repositories, the hard part is deciding whether repository evidence
+truly establishes a violation of the property being tested.
+
+\bibliography{vibetest}
+
+\appendix
+
+\section{Real Audit Examples}
+
+\begin{table*}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabularx}{\textwidth}{@{}p{2.0cm}p{1.4cm}p{2.15cm}p{2.25cm}X@{}}
+    \toprule
+    Type & Dataset & Repository & Property & Audit finding \\
+    \midrule
+    True fail & Titanic & \texttt{REAL-T1} & Dataloader shuffling &
+    Training and validation dataloaders are both constructed with
+    \texttt{shuffle=True}. \\
+    True fail & Titanic & \texttt{REAL-T2} & Metric definitions &
+    ROC-AUC is computed from hard class predictions rather than probabilities
+    or continuous scores. \\
+    Context-flipped fail & Titanic & \texttt{REAL-T3} & Replaceable loops &
+    The conservative audit lacked cited cells; full context shows a loop-based
+    \texttt{predict} function despite an equivalent vectorized forward pass. \\
+    Context-flipped fail & Titanic & \texttt{REAL-T4} & Device placement &
+    The conservative audit lacked cited cells; full context shows mixed
+    \texttt{net.to(device)}, hardcoded \texttt{.cuda()}, \texttt{.cpu()}, and
+    CPU tensor usage. \\
+    \bottomrule
+  \end{tabularx}
+  \caption{Representative real Kaggle audit examples. Full source context can
+  change whether a predicted failure is judged supported, so context-limited
+  verifier results should be interpreted conservatively.}
+  \label{tab:real-audit-examples}
+\end{table*}
+
+\section{Artifact Map}
+
+The current package is indexed in \texttt{supporting\_docs/}.
+The main supporting files are:
+\begin{itemize}
+  \item \texttt{PAPER\_CLAIMS\_AND\_RESULTS.md}: frozen claims and headline numbers.
+  \item \texttt{PAPER\_FIGURE\_INVENTORY.md}: figure provenance and intended use.
+  \item \texttt{PAPER\_ERROR\_ANALYSIS.md}: synthetic and real audit interpretation.
+  \item \texttt{PAPER\_APPENDIX\_MATERIALS.md}: prompt, threshold, and baseline checklist.
+\end{itemize}
+
+\end{document}

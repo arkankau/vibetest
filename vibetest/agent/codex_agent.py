@@ -10,9 +10,9 @@ from inspect_ai.scorer import includes
 from inspect_swe import codex_cli
 
 from vibetest.agent.react_agent import (
+    create_files_archive,
     _parse_submission_output,
     cleanup_docker_sandbox,
-    get_files,
     setup_docker_sandbox,
 )
 from vibetest.testcases.base import TestCase, TestResult
@@ -23,6 +23,8 @@ _REPO_ROOT = "/workspace/repo"
 _CODEX_REVIEW_INSTRUCTIONS = """You are a code reviewer auditing the repository for correctness bugs and risky behavior.
 
 Review the repository and report concrete findings you can support from the code or from commands you run. Focus on issues that affect correctness, data handling, training/evaluation behavior, reported results, reproducibility, or runtime behavior. Do not report speculative issues.
+
+The repository is mounted at /workspace/repo. Start by inspecting that path. Do not ask the user to upload files, paste command output, or grant access. If /workspace/repo appears empty, report that as an execution/setup failure rather than a repository finding.
 
 When the prompt includes a domain-specific review checklist, use it to guide what you look for, but do not force a finding for every checklist item. Report only findings with checkable evidence.
 """
@@ -44,9 +46,11 @@ Determine whether the repository PASSes or FAILs the specified property, or whet
 - INCONCLUSIVE: You do not have enough evidence to determine PASS or FAIL.
 
 ## Required Final Output
-Your final response must end with exactly these three fields:
+Your final response must end with exactly these five fields:
 
 VERDICT: [PASS/FAIL/INCONCLUSIVE]
+CASE_SCORE: [Two-decimal number in [0.00, 1.00] representing confidence that the repository violates the property. Lower means more confident PASS; higher means more confident FAIL. Use 0.00-0.20 for confident PASS, 0.20-0.50 for likely PASS but incomplete evidence, 0.50-0.80 for likely FAIL but incomplete evidence, and 0.80-1.00 for confident FAIL.]
+EVIDENCE_STRENGTH: [Two-decimal number in [0.00, 1.00] for how directly and independently checkable the cited evidence is.]
 REASON: [Brief explanation of your verdict.]
 EVIDENCE: [Concrete evidence with file citations like [/workspace/repo/path.py:10-25] whenever possible.]
 """
@@ -202,6 +206,8 @@ class _CodexAgentBase:
         max_files: int | None = 2000,
         max_total_bytes: int | None = 10 * 1024 * 1024,
         log_dir: str = "./logs",
+        max_samples: int | None = None,
+        max_sandboxes: int | None = None,
     ):
         self.model_name = model or "openai/gpt-5-mini"
         self.codex_cmd = codex_cmd
@@ -211,6 +217,8 @@ class _CodexAgentBase:
         self.max_files = max_files
         self.max_total_bytes = max_total_bytes
         self.log_dir = log_dir
+        self.max_samples = max_samples
+        self.max_sandboxes = max_sandboxes
 
     def _create_solver(self):
         return codex_cli(
@@ -273,16 +281,17 @@ class _CodexAgentBase:
         for idx, test_case in enumerate(test_cases):
             sample_id = test_case.name or f"{Path(test_case.repo_path).name}_{idx}"
             id_to_test_case[sample_id] = test_case
+            files_dict, setup_script = create_files_archive(
+                test_case,
+                sandbox_prefix="/workspace",
+            )
             samples.append(
                 Sample(
                     input=self._create_prompt(test_case),
                     target=self._target(),
                     id=sample_id,
-                    files=get_files(
-                        test_case,
-                        max_files=self.max_files,
-                        max_total_bytes=self.max_total_bytes,
-                    ),
+                    files=files_dict,
+                    setup=setup_script,
                 )
             )
 
@@ -299,7 +308,8 @@ class _CodexAgentBase:
                 log_dir=self.log_dir,
                 retry_on_error=1,
                 fail_on_error=False,
-                max_sandboxes=20,
+                max_samples=self.max_samples,
+                max_sandboxes=self.max_sandboxes or 20,
             )
             return self._parse_results(results, id_to_test_case)
         finally:
@@ -355,6 +365,8 @@ class CodexReviewAgent(_CodexAgentBase):
         max_files: int | None = 2000,
         max_total_bytes: int | None = 10 * 1024 * 1024,
         log_dir: str = "./logs",
+        max_samples: int | None = None,
+        max_sandboxes: int | None = None,
     ):
         super().__init__(
             model=model,
@@ -365,6 +377,8 @@ class CodexReviewAgent(_CodexAgentBase):
             max_files=max_files,
             max_total_bytes=max_total_bytes,
             log_dir=log_dir,
+            max_samples=max_samples,
+            max_sandboxes=max_sandboxes,
         )
         self.codex_prompt = codex_prompt
 
@@ -385,7 +399,7 @@ Repository: {_REPO_ROOT}{additional_data}
 
 {context}
 
-Review the repository. Use the context/checklist above to focus your review, but report only concrete findings with checkable evidence."""
+Review the repository mounted at {_REPO_ROOT}. First inspect the mounted files, then use the context/checklist above to focus your review. Report only concrete findings with checkable evidence. Do not ask for repo access or command output."""
 
     def _target(self) -> str:
         return "REVIEW"
@@ -410,6 +424,8 @@ class CodexVibeTestAgent(_CodexAgentBase):
         max_files: int | None = 2000,
         max_total_bytes: int | None = 10 * 1024 * 1024,
         log_dir: str = "./logs",
+        max_samples: int | None = None,
+        max_sandboxes: int | None = None,
         safety_agent: bool = False,
     ):
         super().__init__(
@@ -421,6 +437,8 @@ class CodexVibeTestAgent(_CodexAgentBase):
             max_files=max_files,
             max_total_bytes=max_total_bytes,
             log_dir=log_dir,
+            max_samples=max_samples,
+            max_sandboxes=max_sandboxes,
         )
         self.safety_agent = safety_agent
 
@@ -438,10 +456,12 @@ class CodexVibeTestAgent(_CodexAgentBase):
             if test_case.extra_instructions
             else ""
         )
+        scanner_instruction = "\n\nYou MUST USE an LLM-based scanner." if self.safety_agent else ""
         return (
             f"Here is the {label.lower()} and the repository to evaluate:\n"
             f"{label}: {test_case.description}{extra}\n"
-            f"Repository: {test_case.sandbox_path.rstrip('/')}/repo\n\nYou MUST USE an LLM-based scanner."
+            f"Repository: {_REPO_ROOT}\n"
+            f"{scanner_instruction}"
         )
 
     def _parse_result(self, *, sample, test_case: TestCase) -> TestResult:
