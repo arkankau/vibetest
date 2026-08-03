@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from inspect_ai import Task, eval
 from inspect_ai.agent import react
@@ -21,11 +21,7 @@ from vibetest.agent.react_agent import (
 )
 from vibetest.testcases.base import TestCase, TestResult
 from vibetest.usage import usage_payload_from_sample
-
-
-_SCORE_RE = re.compile(r"SCORE:\s*(1(?:\.0+)?|0(?:\.\d+)?|\.\d+)\b", re.IGNORECASE)
-_REASON_RE = re.compile(r"REASON:\s*(.*?)(?:\nEVIDENCE_ASSESSMENT:|\Z)", re.IGNORECASE | re.DOTALL)
-_ASSESSMENT_RE = re.compile(r"EVIDENCE_ASSESSMENT:\s*(.*)\Z", re.IGNORECASE | re.DOTALL)
+from vibetest.verifier.rubric import parse_verifier_fields, structured_state_to_score
 
 
 _VERIFIER_INSTRUCTIONS = """You are an independent evidence verifier.
@@ -55,21 +51,59 @@ property failure in this repository.
 Use the repository only to check the cited evidence and the local context needed
 to understand it. Prefer direct file inspection over speculation.
 
-Score rubric:
-- 1.0: the evidence is concrete, cited or otherwise directly checkable, and
-  clearly establishes the claimed property failure.
-- 0.7: the evidence mostly supports the failure, but has minor gaps or weak
-  citations.
-- 0.4: the evidence is suggestive but incomplete, indirect, or only partially
-  supports the failure.
-- 0.1: the evidence is mostly unsupported, vague, miscited, absence-only,
-  best-practice-only, or does not address the property.
-- 0.0: the evidence is absent or contradicts the claimed failure.
+Scoring guidance:
+- Output a single continuous score in [0.0, 1.0] reflecting how strongly the
+  original reason and evidence support the claimed property failure.
+- Higher scores: concrete, cited or directly checkable evidence that clearly
+  establishes the failure described in the original verdict.
+- Lower scores: weak, vague, miscited, absence-only, best-practice-only, or
+  otherwise insufficient support; 0.0 when evidence is absent or contradicts
+  the claimed failure.
+- Use fine-grained values (e.g. 0.83, 0.62) when they fit the evidence quality;
+  do not default to round numbers such as 0.0, 0.5, or 1.0 unless they are
+  truly appropriate.
 
 Required final output. End your answer with exactly these fields:
 
 SCORE: [single number from 0.0 to 1.0]
 REASON: [brief explanation of why the evidence does or does not support the FAIL verdict]
+EVIDENCE_ASSESSMENT: [specific notes about the cited evidence, including any checked files/lines when relevant]
+"""
+
+_VERIFIER_INSTRUCTIONS_STRUCTURED = """You are an independent evidence verifier for VibeTest FAIL verdicts.
+
+You will receive:
+- a repository,
+- a natural-language property,
+- the original VibeTest FAIL verdict,
+- the original reason and evidence claimed to support that FAIL verdict.
+
+Your job is NOT to re-audit the whole repository from scratch. Judge only whether the
+original FAIL is justified by the cited evidence under the strict rubric below.
+
+Strict rubric (match human re-audit):
+1. FAIL — The cited evidence identifies a concrete operation that is PRESENT in the
+   repository and that operation VIOLATES the property. There must be positive,
+   checkable evidence of violation (code, logs, outputs), not mere absence of a check.
+2. INCONCLUSIVE — The property requires an experiment or operation that is ABSENT or
+   not demonstrated in the cited evidence (e.g., no randomized-label run, no baseline
+   comparison, no training-loss log). Missing evidence is NOT evidence of failure.
+   Also use INCONCLUSIVE when evidence is too vague, miscited, or unverifiable.
+3. PASS — The cited evidence actually shows the property is SATISFIED, or the original
+   FAIL reasoning is incorrect / misinterprets the code.
+
+Critical rules:
+- Absence of an optional best practice is INCONCLUSIVE, not FAIL.
+- Experiment-required properties (randomized labels, baseline comparison, training-loss
+  behavior, tiny-batch overfit) require a present experiment with violating results
+  for FAIL; if the experiment is missing, choose INCONCLUSIVE.
+- Use the repository only to verify citations and local context. Do not hunt for new bugs.
+
+Required final output. End your answer with exactly these fields:
+
+EVIDENCE_STATE: [FAIL | INCONCLUSIVE | PASS]
+SCORE: [single number from 0.0 to 1.0; use 0.95 for FAIL, 0.15 for INCONCLUSIVE, 0.05 for PASS unless fine-tuning within that band]
+REASON: [brief explanation tied to the rubric category]
 EVIDENCE_ASSESSMENT: [specific notes about the cited evidence, including any checked files/lines when relevant]
 """
 
@@ -94,17 +128,22 @@ def _extract_text_from_message(msg: Any) -> str:
     return str(content or "")
 
 
+def _output_is_complete(text: str) -> bool:
+    upper = (text or "").upper()
+    return "SCORE:" in upper or "EVIDENCE_STATE:" in upper
+
+
 def _extract_output(sample: Any) -> str:
     output = ""
     if sample.output and sample.output.completion:
         output = str(sample.output.completion)
-        if "SCORE:" in output.upper():
+        if _output_is_complete(output):
             return output
 
     if sample.messages:
         for msg in reversed(sample.messages):
             text = _extract_text_from_message(msg)
-            if text and "SCORE:" in text.upper():
+            if text and _output_is_complete(text):
                 return text
 
     return output
@@ -112,19 +151,7 @@ def _extract_output(sample: Any) -> str:
 
 def parse_verifier_output(output: str) -> tuple[float | None, str, str]:
     """Parse verifier score, reason, and assessment from final output."""
-    text = output or ""
-    score: float | None = None
-    match = _SCORE_RE.search(text)
-    if match:
-        try:
-            score = max(0.0, min(1.0, float(match.group(1))))
-        except Exception:
-            score = None
-
-    reason_match = _REASON_RE.search(text)
-    reason = reason_match.group(1).strip() if reason_match else ""
-    assessment_match = _ASSESSMENT_RE.search(text)
-    assessment = assessment_match.group(1).strip() if assessment_match else ""
+    score, reason, assessment, _state = parse_verifier_fields(output)
     return score, reason, assessment
 
 
@@ -150,17 +177,24 @@ class EvidenceVerifierAgent:
         *,
         static: bool = False,
         log_dir: str = "./logs",
+        rubric: Literal["continuous", "structured"] = "continuous",
     ):
         self.model_name = model or "openai/gpt-5-mini"
         self.static = static
         self.log_dir = log_dir
+        self.rubric = rubric
 
     def _create_solver(self):
         tools = [bash(timeout=120), text_editor(), update_plan()]
         if not self.static:
             tools.insert(1, python(timeout=120))
+        prompt = (
+            _VERIFIER_INSTRUCTIONS_STRUCTURED
+            if self.rubric == "structured"
+            else _VERIFIER_INSTRUCTIONS
+        )
         return react(
-            prompt=_VERIFIER_INSTRUCTIONS,
+            prompt=prompt,
             tools=tools,
             submit=True,
             compaction=CompactionAuto(),
@@ -266,7 +300,9 @@ context. Do not search for unrelated new failures.
                     if sample_id not in id_to_test_case:
                         continue
                     output = _extract_output(sample)
-                    score, reason, assessment = parse_verifier_output(output)
+                    score, reason, assessment, evidence_state = parse_verifier_fields(output)
+                    if evidence_state is not None and score is None:
+                        score = structured_state_to_score(evidence_state)
                     sample_id_to_result[sample_id] = TestResult(
                         test_case=id_to_test_case[sample_id],
                         passed=score is not None,
@@ -274,7 +310,11 @@ context. Do not search for unrelated new failures.
                         execution_log=_build_execution_log(sample),
                         metadata={
                             "verifier_model": self.model_name,
+                            "verifier_rubric": self.rubric,
                             "evidence_support_score": score,
+                            "evidence_state": (
+                                evidence_state.value if evidence_state is not None else None
+                            ),
                             "reason_text": reason,
                             "evidence_assessment": assessment,
                             "score": sample.score.value if sample.score else None,
@@ -296,7 +336,9 @@ context. Do not search for unrelated new failures.
                         message="Evidence verifier failed to execute or parse SCORE.",
                         metadata={
                             "verifier_model": self.model_name,
+                            "verifier_rubric": self.rubric,
                             "evidence_support_score": None,
+                            "evidence_state": None,
                             "error": "Execution or parsing failure",
                         },
                     )
